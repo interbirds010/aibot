@@ -66,9 +66,17 @@ jobs:
             set -Eeuo pipefail
             cd /var/www/aibot
 
-            test -x ./venv/bin/python
-            test -f ./.env
             mkdir -p data logs
+
+            if [[ ! -x ./venv/bin/python ]]; then
+              echo "Existing venv not found; creating /var/www/aibot/venv"
+              python3 -m venv venv
+            fi
+
+            if [[ ! -f ./.env ]]; then
+              echo "ERROR: /var/www/aibot/.env is missing; deployment cannot start safely." >&2
+              exit 1
+            fi
 
             PIP_NO_CACHE_DIR=1 ./venv/bin/python -m pip install \
               --disable-pip-version-check \
