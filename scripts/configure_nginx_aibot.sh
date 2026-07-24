@@ -11,31 +11,48 @@ if [[ "$(id -u)" -ne 0 ]]; then
 fi
 
 mapfile -t enabled_matches < <(
-  grep -lER --include='*' \
-    "server_name[[:space:]][^;]*${DOMAIN//./\\.}" \
-    /etc/nginx/sites-enabled 2>/dev/null || true
+  {
+    grep -lER --include='*' \
+      "server_name[[:space:]][^;]*${DOMAIN//./\\.}" \
+      /etc/nginx/sites-enabled 2>/dev/null || true
+    grep -lER --include='*' \
+      "listen[[:space:]]+([^;[:space:]]*:)?80[[:space:]][^;]*default_server" \
+      /etc/nginx/sites-enabled 2>/dev/null || true
+  } | sort -u
 )
 
-if [[ "${#enabled_matches[@]}" -ne 1 ]]; then
-  echo "ERROR: expected exactly one enabled Nginx site for $DOMAIN; found ${#enabled_matches[@]}." >&2
+if [[ "${#enabled_matches[@]}" -lt 1 ]]; then
+  echo "ERROR: no enabled Nginx site was found for $DOMAIN or the HTTP default server." >&2
   printf 'Candidate: %s\n' "${enabled_matches[@]}" >&2
   exit 1
 fi
 
-SITE_FILE="$(readlink -f "${enabled_matches[0]}")"
-test -f "$SITE_FILE"
+declare -a site_files=()
+declare -A seen_files=()
+for enabled_file in "${enabled_matches[@]}"; do
+  resolved="$(readlink -f "$enabled_file")"
+  test -f "$resolved"
+  if [[ -z "${seen_files[$resolved]:-}" ]]; then
+    site_files+=("$resolved")
+    seen_files["$resolved"]=1
+  fi
+done
 
-site_backup="$(mktemp /tmp/aibot-nginx-site.XXXXXX)"
+backup_dir="$(mktemp -d /tmp/aibot-nginx-sites.XXXXXX)"
 snippet_backup="$(mktemp /tmp/aibot-nginx-snippet.XXXXXX)"
 snippet_existed=0
-cp -a "$SITE_FILE" "$site_backup"
+for index in "${!site_files[@]}"; do
+  cp -a "${site_files[$index]}" "$backup_dir/site-$index"
+done
 if [[ -f "$SNIPPET" ]]; then
   cp -a "$SNIPPET" "$snippet_backup"
   snippet_existed=1
 fi
 
 rollback() {
-  cp -a "$site_backup" "$SITE_FILE"
+  for index in "${!site_files[@]}"; do
+    cp -a "$backup_dir/site-$index" "${site_files[$index]}"
+  done
   if [[ "$snippet_existed" -eq 1 ]]; then
     cp -a "$snippet_backup" "$SNIPPET"
   else
@@ -45,7 +62,8 @@ rollback() {
 }
 
 cleanup() {
-  rm -f "$site_backup" "$snippet_backup"
+  rm -r -- "$backup_dir"
+  rm -f "$snippet_backup"
 }
 
 trap cleanup EXIT
@@ -76,7 +94,8 @@ location /ai-bot/ {
 NGINX
 chmod 644 "$SNIPPET"
 
-python3 - "$SITE_FILE" "$DOMAIN" "$INCLUDE_LINE" <<'PY'
+for site_file in "${site_files[@]}"; do
+python3 - "$site_file" "$DOMAIN" "$INCLUDE_LINE" <<'PY'
 from __future__ import annotations
 
 import re
@@ -143,35 +162,23 @@ for start_match in server_starts:
     ):
         default_http_matches.append((start_match.start(), closing, block))
 
-if not domain_matches:
-    raise SystemExit(
-        f"no server block for {domain} was found in {path}"
-    )
-
-def listens_on_http(block: str) -> bool:
-    listens = re.findall(r"\blisten\s+([^;]+);", block)
-    if not listens:
-        return True
-    return any(
-        re.search(r"(?:^|:|\s)80(?:\s|$)", directive)
-        for directive in listens
-    )
-
 selected = [(start, closing) for start, closing, _ in domain_matches]
-if not any(listens_on_http(block) for _, _, block in domain_matches):
-    selected.extend(
-        (start, closing) for start, closing, _ in default_http_matches
-    )
+selected.extend(
+    (start, closing) for start, closing, _ in default_http_matches
+)
 
 selected = sorted(set(selected), key=lambda item: item[1], reverse=True)
 if not selected:
-    raise SystemExit(f"no HTTP-serving block was found for {domain} in {path}")
+    raise SystemExit(
+        f"no {domain} or HTTP default server block was found in {path}"
+    )
 
 updated = text
 for _, closing in selected:
     updated = updated[:closing] + include_line + "\n" + updated[closing:]
 path.write_text(updated, encoding="utf-8")
 PY
+done
 
 if ! nginx -t; then
   echo "ERROR: Nginx syntax test failed; restoring previous configuration." >&2
@@ -192,4 +199,5 @@ if [[ "$status" != "200" ]]; then
   exit 1
 fi
 
-echo "Nginx /ai-bot proxy configured in $SITE_FILE (HTTP $status)."
+printf 'Nginx /ai-bot proxy configured in %s\n' "${site_files[@]}"
+echo "Local proxy verification: HTTP $status."
