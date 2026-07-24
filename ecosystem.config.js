@@ -1,0 +1,50 @@
+module.exports = {
+  apps: [
+    {
+      name: "aibot-monitor",
+      cwd: "/var/www/aibot",
+      script: "src/monitor.py",
+      interpreter: "/var/www/aibot/venv/bin/python",
+      instances: 1,
+      autorestart: true,
+      restart_delay: 5000,
+      max_memory_restart: "260M",
+      kill_timeout: 10000,
+      env: {
+        PYTHONUNBUFFERED: "1",
+        PYTHONDONTWRITEBYTECODE: "1",
+      },
+    },
+    {
+      name: "aibot-risk-manager",
+      cwd: "/var/www/aibot",
+      script: "src/risk_manager.py",
+      interpreter: "/var/www/aibot/venv/bin/python",
+      instances: 1,
+      autorestart: true,
+      restart_delay: 5000,
+      max_memory_restart: "180M",
+      kill_timeout: 10000,
+      env: {
+        PYTHONUNBUFFERED: "1",
+        PYTHONDONTWRITEBYTECODE: "1",
+      },
+    },
+    {
+      name: "aibot-dashboard",
+      cwd: "/var/www/aibot",
+      script: "/var/www/aibot/venv/bin/streamlit",
+      args: "run src/dashboard.py --server.port 8501 --server.address 0.0.0.0 --server.headless true --browser.gatherUsageStats false",
+      interpreter: "none",
+      instances: 1,
+      autorestart: true,
+      restart_delay: 5000,
+      max_memory_restart: "260M",
+      kill_timeout: 10000,
+      env: {
+        PYTHONUNBUFFERED: "1",
+        PYTHONDONTWRITEBYTECODE: "1",
+      },
+    },
+  ],
+};

@@ -1,0 +1,20 @@
+# Solana RPC client and high-performance data types
+solana>=0.36,<1.0
+solders>=0.26,<1.0
+
+# Async WebSocket transport (Helius RPC subscriptions)
+websockets>=13,<16
+aiohttp>=3.10,<4.0
+
+# Optional Helius/Yellowstone-compatible gRPC transport
+grpcio>=1.66,<2.0
+grpcio-tools>=1.66,<2.0
+protobuf>=5,<7
+
+# Secrets and environment configuration
+python-dotenv>=1.0,<2.0
+cryptography>=43,<47
+streamlit>=1.41,<2.0
+streamlit-cookies-controller==0.0.4
+
+# NOTE: asyncio is included with Python 3.10+ and must not be installed from PyPI.
