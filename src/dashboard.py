@@ -18,6 +18,7 @@ import streamlit as st
 import streamlit.components.v1 as components
 from dotenv import load_dotenv
 from streamlit_cookies_controller import CookieController
+from src.service_health import service_is_fresh as monitor_service_is_fresh
 from src.wallet_performance import MAX_RETURN_PERCENT, capped_return_percent
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -303,11 +304,7 @@ def format_token_price(value: int | float) -> str:
 
 
 def service_is_fresh() -> bool:
-    try:
-        age = datetime.now(timezone.utc).timestamp() - SERVICE_LOG_PATH.stat().st_mtime
-        return age < 180
-    except OSError:
-        return False
+    return monitor_service_is_fresh(SERVICE_LOG_PATH)
 
 
 def format_kst(value: Any) -> str:
