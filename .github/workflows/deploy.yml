@@ -27,16 +27,12 @@ jobs:
         shell: bash
         env:
           SSH_KEY: ${{ secrets.SSH_KEY }}
-          SSH_KNOWN_HOSTS: ${{ secrets.SSH_KNOWN_HOSTS }}
         run: |
           set -Eeuo pipefail
           install -m 700 -d ~/.ssh
           printf '%s\n' "$SSH_KEY" > ~/.ssh/deploy_key
           chmod 600 ~/.ssh/deploy_key
-          printf '%s\n' "$SSH_KNOWN_HOSTS" > ~/.ssh/known_hosts
-          chmod 600 ~/.ssh/known_hosts
           ssh-keygen -y -f ~/.ssh/deploy_key >/dev/null
-          ssh-keygen -F '${{ secrets.SSH_HOST }}' -f ~/.ssh/known_hosts >/dev/null
 
       - name: Synchronize application source
         shell: bash
@@ -55,7 +51,7 @@ jobs:
             --exclude='data/' \
             --exclude='logs/' \
             --exclude='*.lock' \
-            -e 'ssh -i ~/.ssh/deploy_key -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes' \
+            -e 'ssh -i ~/.ssh/deploy_key -o IdentitiesOnly=yes -o StrictHostKeyChecking=no' \
             ./ "${SSH_USERNAME}@${SSH_HOST}:/var/www/aibot/"
 
       - name: Install, validate, and reload PM2 services
@@ -67,7 +63,7 @@ jobs:
           set -Eeuo pipefail
           ssh -i ~/.ssh/deploy_key \
             -o IdentitiesOnly=yes \
-            -o StrictHostKeyChecking=yes \
+            -o StrictHostKeyChecking=no \
             "${SSH_USERNAME}@${SSH_HOST}" 'bash -se' <<'REMOTE'
           set -Eeuo pipefail
           cd /var/www/aibot
