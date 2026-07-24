@@ -36,7 +36,7 @@ module.exports = {
       name: "aibot-dashboard",
       cwd: "/var/www/aibot",
       script: "/var/www/aibot/venv/bin/streamlit",
-      args: "run src/dashboard.py --server.port 8501 --server.address 0.0.0.0 --server.headless true --browser.gatherUsageStats false",
+      args: "run src/dashboard.py --server.port 8501 --server.address 127.0.0.1 --server.baseUrlPath ai-bot --server.headless true --browser.gatherUsageStats false",
       interpreter: "none",
       instances: 1,
       autorestart: true,

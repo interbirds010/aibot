@@ -135,6 +135,8 @@ jobs:
 
             test "$verification_failed" -eq 0
 
+            sudo bash ./scripts/configure_nginx_aibot.sh
+
             pm2 reset aibot-monitor
             pm2 reset aibot-risk-manager
             pm2 reset aibot-dashboard
