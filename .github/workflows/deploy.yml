@@ -146,3 +146,35 @@ jobs:
             pm2 reset aibot-dashboard
             pm2 save
             pm2 status
+
+            echo "Recent aibot-risk-manager logs:"
+            pm2 logs aibot-risk-manager --lines 20 --nostream
+
+            ./venv/bin/python - <<'PY'
+            import json
+            from pathlib import Path
+
+            ledger_path = Path("data/paper_trades.json")
+            ledger = (
+                json.loads(ledger_path.read_text(encoding="utf-8"))
+                if ledger_path.exists()
+                else {"positions": {}}
+            )
+            unhealthy = []
+            for mint, position in ledger.get("positions", {}).items():
+                state = str(position.get("risk_state", "NORMAL"))
+                failures = int(position.get("consecutive_quote_failures", 0) or 0)
+                last_success = str(position.get("last_quote_success_at", ""))
+                print(
+                    "POSITION_HEALTH "
+                    f"mint={mint[:8]}... state={state} "
+                    f"failures={failures} last_success={last_success}"
+                )
+                if state in {"DEGRADED", "NO_ROUTE"}:
+                    unhealthy.append(mint)
+            if unhealthy:
+                raise SystemExit(
+                    f"unhealthy Jupiter quote state remains for {len(unhealthy)} position(s)"
+                )
+            print("JUPITER_POSITION_HEALTH=OK")
+            PY
