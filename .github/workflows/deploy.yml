@@ -135,6 +135,10 @@ jobs:
 
             test "$verification_failed" -eq 0
 
+            upstream_status="$(curl --silent --show-error --output /dev/null \
+              --write-out '%{http_code}' http://127.0.0.1:8501/ai-bot/)"
+            test "$upstream_status" = "200"
+
             sudo bash ./scripts/configure_nginx_aibot.sh
 
             pm2 reset aibot-monitor

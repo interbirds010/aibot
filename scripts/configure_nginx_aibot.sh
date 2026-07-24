@@ -92,7 +92,8 @@ if include_line.strip() in text:
     raise SystemExit(0)
 
 server_starts = list(re.finditer(r"\bserver\s*\{", text))
-matches: list[tuple[int, int]] = []
+domain_matches: list[tuple[int, int, str]] = []
+default_http_matches: list[tuple[int, int, str]] = []
 
 for start_match in server_starts:
     opening = text.find("{", start_match.start())
@@ -135,15 +136,40 @@ for start_match in server_starts:
         rf"\bserver_name\s+[^;]*\b{re.escape(domain)}\b[^;]*;",
         block,
     ):
-        matches.append((start_match.start(), closing))
+        domain_matches.append((start_match.start(), closing, block))
+    if re.search(
+        r"\blisten\s+(?:\[[^\]]+\]:)?80\b[^;]*\bdefault_server\b[^;]*;",
+        block,
+    ):
+        default_http_matches.append((start_match.start(), closing, block))
 
-if len(matches) != 1:
+if not domain_matches:
     raise SystemExit(
-        f"expected one server block for {domain} in {path}; found {len(matches)}"
+        f"no server block for {domain} was found in {path}"
     )
 
-_, closing = matches[0]
-updated = text[:closing] + include_line + "\n" + text[closing:]
+def listens_on_http(block: str) -> bool:
+    listens = re.findall(r"\blisten\s+([^;]+);", block)
+    if not listens:
+        return True
+    return any(
+        re.search(r"(?:^|:|\s)80(?:\s|$)", directive)
+        for directive in listens
+    )
+
+selected = [(start, closing) for start, closing, _ in domain_matches]
+if not any(listens_on_http(block) for _, _, block in domain_matches):
+    selected.extend(
+        (start, closing) for start, closing, _ in default_http_matches
+    )
+
+selected = sorted(set(selected), key=lambda item: item[1], reverse=True)
+if not selected:
+    raise SystemExit(f"no HTTP-serving block was found for {domain} in {path}")
+
+updated = text
+for _, closing in selected:
+    updated = updated[:closing] + include_line + "\n" + updated[closing:]
 path.write_text(updated, encoding="utf-8")
 PY
 
