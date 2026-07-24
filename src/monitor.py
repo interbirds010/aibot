@@ -634,9 +634,10 @@ async def run_forever(settings: MonitorSettings) -> None:
 async def run_service() -> None:
     from src.wallet_performance import performance_loop
 
-    async with asyncio.TaskGroup() as tasks:
-        tasks.create_task(run_forever(MonitorSettings.from_env()), name="wallet-monitor")
-        tasks.create_task(performance_loop(), name="wallet-performance")
+    await asyncio.gather(
+        run_forever(MonitorSettings.from_env()),
+        performance_loop(),
+    )
 
 
 def main() -> None:
