@@ -25,25 +25,38 @@ jobs:
 
       # No fingerprint input is supplied: appleboy connects without pinning the
       # server host key, as required for this password-only deployment.
-      - name: Prepare deployment directory
+      - name: Remove root PM2 leftovers and prepare deploy ownership
         uses: appleboy/ssh-action@v1
+        env:
+          SUDO_PASSWORD: ${{ secrets.SSH_PASSWORD }}
         with:
           host: ${{ secrets.SSH_HOST }}
-          username: ${{ secrets.SSH_USERNAME }}
+          username: deploy
           password: ${{ secrets.SSH_PASSWORD }}
           port: 22
           timeout: 30s
           command_timeout: 2m
+          envs: SUDO_PASSWORD
           script: |
             set -Eeuo pipefail
-            mkdir -p /var/www/aibot
+
+            printf '%s\n' "$SUDO_PASSWORD" | sudo -S -p '' true
+
+            if sudo test -d /root/.pm2; then
+              sudo env PM2_HOME=/root/.pm2 pm2 delete \
+                aibot-monitor aibot-risk-manager aibot-dashboard || true
+              sudo env PM2_HOME=/root/.pm2 pm2 save --force || true
+            fi
+
+            sudo mkdir -p /var/www/aibot
+            sudo chown -R deploy:deploy /var/www/aibot
             test -w /var/www/aibot
 
       - name: Upload application source
         uses: appleboy/scp-action@v1
         with:
           host: ${{ secrets.SSH_HOST }}
-          username: ${{ secrets.SSH_USERNAME }}
+          username: deploy
           password: ${{ secrets.SSH_PASSWORD }}
           port: 22
           timeout: 30s
@@ -55,15 +68,22 @@ jobs:
 
       - name: Install, validate, and reload PM2 services
         uses: appleboy/ssh-action@v1
+        env:
+          SUDO_PASSWORD: ${{ secrets.SSH_PASSWORD }}
         with:
           host: ${{ secrets.SSH_HOST }}
-          username: ${{ secrets.SSH_USERNAME }}
+          username: deploy
           password: ${{ secrets.SSH_PASSWORD }}
           port: 22
           timeout: 30s
           command_timeout: 10m
+          envs: SUDO_PASSWORD
           script: |
             set -Eeuo pipefail
+
+            printf '%s\n' "$SUDO_PASSWORD" | sudo -S -p '' true
+            sudo chown -R deploy:deploy /var/www/aibot
+
             cd /var/www/aibot
 
             mkdir -p data logs
@@ -87,10 +107,22 @@ jobs:
             ./venv/bin/python -c \
               "import fcntl; from src.state_store import exclusive_file_lock; print('fcntl/state_store: OK')"
 
+            export PM2_HOME=/home/deploy/.pm2
             pm2 startOrReload ecosystem.config.js --update-env
             pm2 save
 
             pm2 describe aibot-monitor >/dev/null
             pm2 describe aibot-risk-manager >/dev/null
             pm2 describe aibot-dashboard >/dev/null
+
+            test -z "$(find /var/www/aibot -xdev \
+              \( ! -user deploy -o ! -group deploy \) -print -quit)"
+
+            for app in aibot-monitor aibot-risk-manager aibot-dashboard; do
+              pid="$(pm2 pid "$app")"
+              test -n "$pid"
+              test "$pid" != "0"
+              test "$(ps -o user= -p "$pid" | xargs)" = "deploy"
+            done
+
             pm2 status
