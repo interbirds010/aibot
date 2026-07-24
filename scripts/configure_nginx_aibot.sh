@@ -194,6 +194,10 @@ status="$(curl --silent --show-error --output /dev/null \
   http://127.0.0.1/ai-bot/)"
 if [[ "$status" != "200" ]]; then
   echo "ERROR: local Nginx proxy check returned HTTP $status; restoring configuration." >&2
+  echo "Active Nginx server mapping:" >&2
+  nginx -T 2>&1 | grep -E \
+    '^# configuration file |^[[:space:]]*listen[[:space:]]|^[[:space:]]*server_name[[:space:]]' \
+    >&2 || true
   rollback
   systemctl reload nginx
   exit 1
