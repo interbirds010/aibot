@@ -632,12 +632,10 @@ async def run_forever(settings: MonitorSettings) -> None:
 
 
 async def run_service() -> None:
-    from src.risk_manager import run_risk_loop
     from src.wallet_performance import performance_loop
 
     async with asyncio.TaskGroup() as tasks:
         tasks.create_task(run_forever(MonitorSettings.from_env()), name="wallet-monitor")
-        tasks.create_task(run_risk_loop(paper_trading=True), name="paper-risk-manager")
         tasks.create_task(performance_loop(), name="wallet-performance")
 
 
