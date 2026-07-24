@@ -188,10 +188,17 @@ fi
 
 systemctl reload nginx
 
-status="$(curl --silent --show-error --output /dev/null \
-  --write-out '%{http_code}' \
-  --header "Host: $DOMAIN" \
-  http://127.0.0.1/ai-bot/)"
+status="000"
+for _ in {1..20}; do
+  status="$(curl --silent --show-error --output /dev/null \
+    --write-out '%{http_code}' \
+    --header "Host: $DOMAIN" \
+    http://127.0.0.1/ai-bot/ || true)"
+  if [[ "$status" == "200" ]]; then
+    break
+  fi
+  sleep 0.5
+done
 if [[ "$status" != "200" ]]; then
   echo "ERROR: local Nginx proxy check returned HTTP $status; restoring configuration." >&2
   echo "Active Nginx server mapping:" >&2
