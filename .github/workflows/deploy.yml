@@ -115,14 +115,24 @@ jobs:
             pm2 describe aibot-risk-manager >/dev/null
             pm2 describe aibot-dashboard >/dev/null
 
-            test -z "$(find /var/www/aibot -xdev \
+            ownership_mismatch="$(find /var/www/aibot -xdev \
               \( ! -user deploy -o ! -group deploy \) -print -quit)"
+            if [[ -n "$ownership_mismatch" ]]; then
+              echo "ERROR: ownership mismatch remains at $ownership_mismatch" >&2
+              exit 1
+            fi
 
+            sleep 10
+            verification_failed=0
             for app in aibot-monitor aibot-risk-manager aibot-dashboard; do
               pid="$(pm2 pid "$app")"
-              test -n "$pid"
-              test "$pid" != "0"
-              test "$(ps -o user= -p "$pid" | xargs)" = "deploy"
+              owner="$(ps -o user= -p "$pid" 2>/dev/null | xargs || true)"
+              if [[ -z "$pid" || "$pid" == "0" || "$owner" != "deploy" ]]; then
+                echo "ERROR: $app failed verification (pid=$pid owner=$owner)" >&2
+                pm2 logs "$app" --lines 30 --nostream || true
+                verification_failed=1
+              fi
             done
 
             pm2 status
+            test "$verification_failed" -eq 0
