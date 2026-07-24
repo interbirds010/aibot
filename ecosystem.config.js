@@ -13,6 +13,7 @@ module.exports = {
       env: {
         PYTHONUNBUFFERED: "1",
         PYTHONDONTWRITEBYTECODE: "1",
+        PYTHONPATH: "/var/www/aibot",
       },
     },
     {
@@ -28,6 +29,7 @@ module.exports = {
       env: {
         PYTHONUNBUFFERED: "1",
         PYTHONDONTWRITEBYTECODE: "1",
+        PYTHONPATH: "/var/www/aibot",
       },
     },
     {
@@ -44,6 +46,7 @@ module.exports = {
       env: {
         PYTHONUNBUFFERED: "1",
         PYTHONDONTWRITEBYTECODE: "1",
+        PYTHONPATH: "/var/www/aibot",
       },
     },
   ],
