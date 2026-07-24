@@ -1,0 +1,95 @@
+name: Deploy aibot
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-aibot-production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Deploy to Ubuntu
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out main
+        uses: actions/checkout@v4
+
+      - name: Configure SSH
+        shell: bash
+        env:
+          SSH_KEY: ${{ secrets.SSH_KEY }}
+          SSH_KNOWN_HOSTS: ${{ secrets.SSH_KNOWN_HOSTS }}
+        run: |
+          set -Eeuo pipefail
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          printf '%s\n' "$SSH_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+          ssh-keygen -y -f ~/.ssh/deploy_key >/dev/null
+          ssh-keygen -F '${{ secrets.SSH_HOST }}' -f ~/.ssh/known_hosts >/dev/null
+
+      - name: Synchronize application source
+        shell: bash
+        env:
+          SSH_HOST: ${{ secrets.SSH_HOST }}
+          SSH_USERNAME: ${{ secrets.SSH_USERNAME }}
+        run: |
+          set -Eeuo pipefail
+          rsync -az --delete-delay --delay-updates \
+            --exclude='.git/' \
+            --exclude='.github/' \
+            --exclude='.env' \
+            --exclude='.env.*' \
+            --exclude='venv/' \
+            --exclude='.venv/' \
+            --exclude='data/' \
+            --exclude='logs/' \
+            --exclude='*.lock' \
+            -e 'ssh -i ~/.ssh/deploy_key -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes' \
+            ./ "${SSH_USERNAME}@${SSH_HOST}:/var/www/aibot/"
+
+      - name: Install, validate, and reload PM2 services
+        shell: bash
+        env:
+          SSH_HOST: ${{ secrets.SSH_HOST }}
+          SSH_USERNAME: ${{ secrets.SSH_USERNAME }}
+        run: |
+          set -Eeuo pipefail
+          ssh -i ~/.ssh/deploy_key \
+            -o IdentitiesOnly=yes \
+            -o StrictHostKeyChecking=yes \
+            "${SSH_USERNAME}@${SSH_HOST}" 'bash -se' <<'REMOTE'
+          set -Eeuo pipefail
+          cd /var/www/aibot
+
+          test -x ./venv/bin/python
+          test -f ./.env
+          mkdir -p data logs
+
+          PIP_NO_CACHE_DIR=1 ./venv/bin/python -m pip install \
+            --disable-pip-version-check \
+            --only-binary=:all: \
+            -r requirements.txt
+
+          ./venv/bin/python -m compileall -q src
+          ./venv/bin/python -c \
+            "import fcntl; from src.state_store import exclusive_file_lock; print('fcntl/state_store: OK')"
+
+          pm2 startOrReload ecosystem.config.js --update-env
+          pm2 save
+
+          pm2 describe aibot-monitor >/dev/null
+          pm2 describe aibot-risk-manager >/dev/null
+          pm2 describe aibot-dashboard >/dev/null
+          pm2 status
+          REMOTE
