@@ -10,9 +10,11 @@ import logging
 import math
 import os
 import struct
+import time
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
+from pathlib import Path
 from typing import Any
 
 import aiohttp
@@ -25,6 +27,7 @@ from solders.pubkey import Pubkey
 from solders.transaction import VersionedTransaction
 
 from src.analyzer import should_enter_token
+from src.state_store import atomic_write_json, exclusive_file_lock, read_json
 
 WSOL_MINT = "So11111111111111111111111111111111111111112"
 LIVE_BUY_PERCENT = 1  # Live execution remains capped at 1% of current SOL.
@@ -43,9 +46,16 @@ COMPUTE_BUDGET_PROGRAM = Pubkey.from_string(
 MIN_FEE_RESERVE_LAMPORTS = 2_000_000
 JUPITER_BASE = "https://api.jup.ag/swap/v1"
 WALLETS_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data", "wallets.json")
-_quote_lock = asyncio.Lock()
-_last_quote_at = 0.0
-_QUOTE_INTERVAL_SECONDS = 1.05  # Stay below the default 60 requests/minute tier.
+JUPITER_RATE_LIMIT_PATH = (
+    Path(__file__).resolve().parents[1] / "data" / "jupiter_rate_limit.json"
+)
+JUPITER_RATE_LIMIT_FALLBACK = {
+    "last_request_at_epoch": 0.0,
+    "not_before_epoch": 0.0,
+}
+_QUOTE_INTERVAL_SECONDS = 1.05
+_JUPITER_MAX_QUOTE_ATTEMPTS = 5
+_JUPITER_MAX_RESET_WAIT_SECONDS = 60.0
 MAX_ENTRY_PRICE_IMPACT_PCT = 1.5
 logger = logging.getLogger("executor")
 _last_successful_tip_lamports: int | None = None
@@ -203,6 +213,54 @@ async def sol_balance(session: aiohttp.ClientSession, rpc_url: str, owner: str) 
     return int((result or {}).get("value", 0))
 
 
+def _wait_for_jupiter_slot_sync(
+    interval_seconds: float = _QUOTE_INTERVAL_SECONDS,
+) -> float:
+    """Reserve one organisation-wide Jupiter request slot across PM2 processes."""
+    with exclusive_file_lock(JUPITER_RATE_LIMIT_PATH, timeout_seconds=180.0):
+        state = read_json(JUPITER_RATE_LIMIT_PATH, JUPITER_RATE_LIMIT_FALLBACK)
+        now = time.time()
+        last_request = float(state.get("last_request_at_epoch", 0.0) or 0.0)
+        not_before = float(state.get("not_before_epoch", 0.0) or 0.0)
+        target = max(now, last_request + interval_seconds, not_before)
+        delay = max(0.0, target - now)
+        if delay:
+            time.sleep(delay)
+        request_at = time.time()
+        state["last_request_at_epoch"] = request_at
+        if not_before <= request_at:
+            state["not_before_epoch"] = 0.0
+        atomic_write_json(JUPITER_RATE_LIMIT_PATH, state)
+        return delay
+
+
+async def _wait_for_global_jupiter_slot() -> None:
+    await asyncio.to_thread(_wait_for_jupiter_slot_sync)
+
+
+def _defer_jupiter_until_sync(not_before_epoch: float) -> None:
+    """Publish a Jupiter cooldown so every local PM2 process observes it."""
+    with exclusive_file_lock(JUPITER_RATE_LIMIT_PATH, timeout_seconds=180.0):
+        state = read_json(JUPITER_RATE_LIMIT_PATH, JUPITER_RATE_LIMIT_FALLBACK)
+        current = float(state.get("not_before_epoch", 0.0) or 0.0)
+        state["not_before_epoch"] = max(current, not_before_epoch)
+        atomic_write_json(JUPITER_RATE_LIMIT_PATH, state)
+
+
+def _jupiter_backoff_seconds(
+    reset_header: str | None, attempt_index: int, now_epoch: float
+) -> tuple[float, str]:
+    if reset_header:
+        try:
+            reset_epoch = float(reset_header)
+        except (TypeError, ValueError):
+            pass
+        else:
+            delay = max(0.05, reset_epoch - now_epoch + 0.05)
+            return min(delay, _JUPITER_MAX_RESET_WAIT_SECONDS), "rate-limit-reset"
+    return min(float(2**attempt_index), 30.0), "exponential-fallback"
+
+
 async def jupiter_quote(
     session: aiohttp.ClientSession,
     api_key: str,
@@ -210,7 +268,6 @@ async def jupiter_quote(
     output_mint: str,
     amount: int,
 ) -> dict[str, Any]:
-    global _last_quote_at
     headers = {"x-api-key": api_key}
     params = {
         "inputMint": input_mint,
@@ -219,19 +276,41 @@ async def jupiter_quote(
         "slippageBps": "100",
         "restrictIntermediateTokens": "true",
     }
-    async with _quote_lock:
-        now = asyncio.get_running_loop().time()
-        await asyncio.sleep(max(0.0, _QUOTE_INTERVAL_SECONDS - (now - _last_quote_at)))
-        try:
-            async with session.get(
-                f"{JUPITER_BASE}/quote", params=params, headers=headers
-            ) as response:
-                response.raise_for_status()
-                quote = await response.json()
-        finally:
-            # Failed requests consume provider quota too. Counting only successful
-            # calls causes a legacy backlog to hammer Jupiter after the first 4xx.
-            _last_quote_at = asyncio.get_running_loop().time()
+    quote: dict[str, Any] | None = None
+    for attempt_index in range(_JUPITER_MAX_QUOTE_ATTEMPTS):
+        await _wait_for_global_jupiter_slot()
+        async with session.get(
+            f"{JUPITER_BASE}/quote", params=params, headers=headers
+        ) as response:
+            if response.status == 429:
+                now_epoch = time.time()
+                delay, source = _jupiter_backoff_seconds(
+                    response.headers.get("x-ratelimit-reset"),
+                    attempt_index,
+                    now_epoch,
+                )
+                await asyncio.to_thread(
+                    _defer_jupiter_until_sync, now_epoch + delay
+                )
+                logger.warning(
+                    "Jupiter rate limited; waiting %.2fs via %s "
+                    "(attempt %d/%d)",
+                    delay,
+                    source,
+                    attempt_index + 1,
+                    _JUPITER_MAX_QUOTE_ATTEMPTS,
+                )
+                if attempt_index + 1 >= _JUPITER_MAX_QUOTE_ATTEMPTS:
+                    raise RuntimeError(
+                        "Jupiter quote rate limit persisted after safe retries"
+                    ) from None
+                await asyncio.sleep(delay)
+                continue
+            response.raise_for_status()
+            quote = await response.json()
+            break
+    if quote is None:
+        raise RuntimeError("Jupiter quote failed without a response") from None
     if not quote.get("routePlan") or int(quote.get("outAmount", "0")) <= 0:
         raise RuntimeError("Jupiter returned no executable route")
     return quote
