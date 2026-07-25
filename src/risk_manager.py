@@ -18,7 +18,12 @@ from src.executor import (
     execute_sell,
     jupiter_quote,
 )
-from src.state_store import migrate_json, read_json, update_json
+from src.state_store import (
+    migrate_json,
+    normalized_route_metadata,
+    read_json,
+    update_json,
+)
 
 logger = logging.getLogger("risk-manager")
 
@@ -92,6 +97,7 @@ def _normalize_position(
         "consecutive_quote_failures": int(position.get("consecutive_quote_failures", 0) or 0),
         "risk_state": str(position.get("risk_state") or "NORMAL"),
         "route_type": str(position.get("route_type") or "A"),
+        "dex_momentum_score": float(position.get("dex_momentum_score", 0) or 0),
         "take_profit_done": bool(position.get("take_profit_done", False)),
         "second_take_profit_done": bool(position.get("second_take_profit_done", False)),
         "stop_loss_ratio": float(
@@ -112,7 +118,28 @@ def _normalize_position(
 def migrate_ledger_document(document: dict[str, Any]) -> bool:
     """Idempotently assign v2 event and position identities to legacy data."""
     if int(document.get("schema_version", 1) or 1) >= 2:
-        return False
+        changed = False
+        for position in document.get("positions", {}).values():
+            if not isinstance(position, dict):
+                continue
+            if "route_type" not in position:
+                position["route_type"] = "A"
+                changed = True
+            if "dex_momentum_score" not in position:
+                position["dex_momentum_score"] = 0.0
+                changed = True
+        for event in document.get("events", []):
+            if not isinstance(event, dict) or event.get("type") != "BUY":
+                continue
+            if "route_type" not in event:
+                event["route_type"] = "A"
+                changed = True
+            if "dex_momentum_score" not in event:
+                event["dex_momentum_score"] = 0.0
+                changed = True
+        if changed:
+            document["updated_at"] = utc_now()
+        return changed
     document.setdefault("cash_lamports", INITIAL_PAPER_LAMPORTS)
     document.setdefault("positions", {})
     document.setdefault("events", [])
@@ -194,6 +221,7 @@ async def record_paper_buy(
     copy_price_gap_pct: float = 0.0,
     entry_latency_ms: int = 0,
     route_type: str = "A",
+    dex_momentum_score: float = 0.0,
 ) -> str:
     if cost_lamports <= 0 or token_amount_raw <= 0:
         raise ValueError("paper buy amounts must be positive")
@@ -206,8 +234,7 @@ async def record_paper_buy(
             f"{MAX_ENTRY_PRICE_IMPACT_PCT:.2f}%. Position not created."
         )
     ensure_ledger_migrated()
-    if route_type not in {"A", "B"}:
-        raise ValueError("route_type must be A or B")
+    route_metadata = normalized_route_metadata(route_type, dex_momentum_score)
 
     def mutate(ledger: dict[str, Any]) -> str:
         if mint in ledger.setdefault("positions", {}):
@@ -249,7 +276,7 @@ async def record_paper_buy(
             "whale_reference_price": float(whale_reference_price),
             "copy_price_gap_pct": float(copy_price_gap_pct),
             "entry_latency_ms": int(entry_latency_ms),
-            "route_type": route_type,
+            **route_metadata,
         }
         ledger["cash_lamports"] = int(ledger["cash_lamports"]) - cost_lamports
         ledger["positions"][mint] = {
@@ -267,7 +294,9 @@ async def record_paper_buy(
             "take_profit_done": False,
             "second_take_profit_done": False,
             "stop_loss_ratio": (
-                ROUTE_B_STOP_LOSS_RATIO if route_type == "B" else STOP_LOSS_RATIO
+                ROUTE_B_STOP_LOSS_RATIO
+                if route_metadata["route_type"] == "B"
+                else STOP_LOSS_RATIO
             ),
             "break_even_floor_active": False,
             "version": 1,

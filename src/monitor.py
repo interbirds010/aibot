@@ -31,6 +31,19 @@ SINGLE_STRENGTH_LAMPORTS = 1_500_000_000
 MIN_ACCUMULATION_TRADE_LAMPORTS = 1_000_000_000
 ACCUMULATION_TARGET_LAMPORTS = 5_000_000_000
 ACCUMULATION_WINDOW_SECONDS = 180.0
+DEX_SCREENER_POLL_SECONDS = 5.0
+DEX_SCREENER_SEARCH_URL = "https://api.dexscreener.com/latest/dex/search"
+DEX_SCREENER_PROFILES_URL = "https://api.dexscreener.com/token-profiles/latest/v1"
+DEX_SCREENER_BOOSTS_URL = "https://api.dexscreener.com/token-boosts/top/v1"
+DEX_SCREENER_TOKENS_URL = "https://api.dexscreener.com/tokens/v1/solana"
+MOMENTUM_MIN_VOLUME_M5_USD = 10_000.0
+MOMENTUM_MIN_NET_BUYS_M5 = 10
+MOMENTUM_MIN_LIQUIDITY_USD = 5_000.0
+MOMENTUM_MAX_DISCOVERY_TOKENS = 30
+MOMENTUM_MAX_CANDIDATES = 8
+MOMENTUM_ENTRY_COOLDOWN_SECONDS = 600.0
+UNKNOWN_WHALE_MIN_COUNT = 3
+UNKNOWN_WHALE_SIGNATURE_LIMIT = 12
 
 # On-chain feeder output is verified; fail closed if an old unverified row remains.
 TEST_ALLOW_UNVERIFIED_WALLETS = False
@@ -38,6 +51,7 @@ _analysis_limit = asyncio.Semaphore(2)
 _signal_tasks: set[asyncio.Task[None]] = set()
 _whale_buy_history: dict[tuple[str, str], deque[tuple[float, int]]] = {}
 _last_history_cleanup_at = 0.0
+_market_entry_cooldowns: dict[str, float] = {}
 
 # Canonical mainnet program IDs. Keep this list reviewed before production use.
 DEX_PROGRAMS = {
@@ -69,6 +83,26 @@ class MonitorSettings:
             raise RuntimeError("Helius API key, WSS URL and HTTP URL must be set in .env")
         reload_seconds = max(1.0, float(os.getenv("WALLET_RELOAD_SECONDS", "5")))
         return cls(ws_url=ws_url, http_url=http_url, wallet_reload_seconds=reload_seconds)
+
+
+@dataclass(frozen=True, slots=True)
+class MomentumCandidate:
+    mint: str
+    pair_address: str
+    volume_m5_usd: float
+    buys_m5: int
+    sells_m5: int
+    liquidity_usd: float
+    momentum_score: float
+
+
+@dataclass(frozen=True, slots=True)
+class UnknownWhaleBuy:
+    wallet: str
+    signature: str
+    paid_lamports: int
+    token_amount_raw: int
+    token_decimals: int
 
 
 def load_wallets(path: Path) -> tuple[str, ...]:
@@ -280,6 +314,15 @@ def signature_of(result: dict[str, Any]) -> str:
     return str(signatures[0]) if signatures else "unknown"
 
 
+def route_report_allowed(requested_route: str, analyzed_route: str | None) -> bool:
+    """Keep whale Route A strict while allowing safe market candidates on B."""
+    if requested_route == "A":
+        return analyzed_route == "A"
+    if requested_route == "B":
+        return analyzed_route in {"A", "B"}
+    return False
+
+
 async def process_paper_signal(
     mint: str,
     whale_token_amount_raw: int,
@@ -288,6 +331,8 @@ async def process_paper_signal(
     wallet: str,
     signature: str,
     signal_detected_at: str,
+    requested_route: str = "A",
+    dex_momentum_score: float = 0.0,
 ) -> None:
     """Run the rug gate, then record an executable Jupiter paper-buy quote."""
     async with _analysis_limit:
@@ -302,9 +347,11 @@ async def process_paper_signal(
 
             report = await analyze_token(mint)
             analysis_completed_at = datetime.now(timezone.utc).isoformat()
-            if not report.should_enter:
-                from src.wallet_performance import reject_unsafe_buy
-                await reject_unsafe_buy(wallet, mint, report.reasons, signature)
+            route_allowed = route_report_allowed(requested_route, report.route_type)
+            if not route_allowed:
+                if requested_route == "A":
+                    from src.wallet_performance import reject_unsafe_buy
+                    await reject_unsafe_buy(wallet, mint, report.reasons, signature)
                 await record_paper_rejection(
                     mint, report.safety_score, report.reasons, wallet, signature
                 )
@@ -316,7 +363,7 @@ async def process_paper_signal(
             cash = await paper_cash_balance()
             base_paper_cost = cash * PAPER_BUY_BASIS_POINTS // 10_000
             from src.executor import route_sized_amount
-            paper_cost = route_sized_amount(base_paper_cost, str(report.route_type))
+            paper_cost = route_sized_amount(base_paper_cost, requested_route)
             if paper_cost <= 0:
                 logger.warning("paper signal has unusable observed price: %s", signature)
                 return
@@ -352,7 +399,11 @@ async def process_paper_signal(
                 source_wallet=wallet,
                 source_signature=signature,
                 safety_score=int(report.safety_score),
-                entry_reason="analyzer_approved",
+                entry_reason=(
+                    "whale_route_a"
+                    if requested_route == "A"
+                    else "dex_momentum_unknown_whales"
+                ),
                 signal_detected_at=signal_detected_at,
                 analysis_completed_at=analysis_completed_at,
                 entry_quote_at=entry_quote_at,
@@ -361,13 +412,17 @@ async def process_paper_signal(
                 whale_reference_price=whale_reference_price,
                 copy_price_gap_pct=copy_price_gap_pct,
                 entry_latency_ms=entry_latency_ms,
-                route_type=str(report.route_type),
+                route_type=requested_route,
+                dex_momentum_score=dex_momentum_score,
             )
-            from src.wallet_performance import record_paper_buy_success
-            await record_paper_buy_success(wallet, mint, signature)
+            if requested_route == "A":
+                from src.wallet_performance import record_paper_buy_success
+                await record_paper_buy_success(wallet, mint, signature)
             logger.info(
-                "paper buy recorded: mint=%s route=%s cost=%s score=%s source_wallet=%s signature=%s",
-                mint, report.route_type, paper_cost, report.safety_score, wallet, signature,
+                "paper buy recorded: mint=%s route=%s momentum=%.2f cost=%s "
+                "score=%s source_wallet=%s signature=%s",
+                mint, requested_route, dex_momentum_score, paper_cost,
+                report.safety_score, wallet, signature,
             )
         except RuntimeError as exc:
             reason = str(exc)
@@ -392,6 +447,8 @@ def schedule_paper_signal(
         process_paper_signal(
             mint, acquired_raw, token_decimals, paid_lamports, wallet, signature,
             signal_detected_at,
+            "A",
+            0.0,
         )
     )
     _signal_tasks.add(task)
@@ -472,6 +529,289 @@ def print_buys(result: dict[str, Any], dex_name: str, watched_wallets: set[str])
                 schedule_paper_signal(
                     mint, raw, decimals, paid_lamports, wallet, signature
                 )
+
+
+def momentum_score(volume_m5_usd: float, buys_m5: int, sells_m5: int) -> float:
+    """Score bounded five-minute activity without retaining a time-series."""
+    volume_points = min(60.0, max(0.0, volume_m5_usd) / 500.0)
+    net_buys = max(0, buys_m5 - sells_m5)
+    imbalance_points = min(40.0, net_buys * 2.0)
+    return round(volume_points + imbalance_points, 4)
+
+
+def momentum_candidate_from_pair(pair: dict[str, Any]) -> MomentumCandidate | None:
+    if pair.get("chainId") != "solana":
+        return None
+    base = pair.get("baseToken") or {}
+    mint = str(base.get("address") or "")
+    pair_address = str(pair.get("pairAddress") or "")
+    if not mint or not pair_address or mint in {WSOL_MINT, USDC_MINT}:
+        return None
+    txns_m5 = (pair.get("txns") or {}).get("m5") or {}
+    volume_m5 = float((pair.get("volume") or {}).get("m5") or 0)
+    buys_m5 = int(txns_m5.get("buys") or 0)
+    sells_m5 = int(txns_m5.get("sells") or 0)
+    liquidity = float((pair.get("liquidity") or {}).get("usd") or 0)
+    net_buys = buys_m5 - sells_m5
+    has_volume_burst = volume_m5 >= MOMENTUM_MIN_VOLUME_M5_USD
+    has_buy_burst = (
+        net_buys >= MOMENTUM_MIN_NET_BUYS_M5
+        and buys_m5 >= max(1, sells_m5) * 1.5
+    )
+    if liquidity < MOMENTUM_MIN_LIQUIDITY_USD or not (
+        has_volume_burst or has_buy_burst
+    ):
+        return None
+    return MomentumCandidate(
+        mint=mint,
+        pair_address=pair_address,
+        volume_m5_usd=volume_m5,
+        buys_m5=buys_m5,
+        sells_m5=sells_m5,
+        liquidity_usd=liquidity,
+        momentum_score=momentum_score(volume_m5, buys_m5, sells_m5),
+    )
+
+
+async def _dexscreener_json(
+    session: aiohttp.ClientSession, url: str, **params: str
+) -> Any:
+    async with session.get(
+        url,
+        params=params or None,
+        headers={"accept": "application/json"},
+    ) as response:
+        response.raise_for_status()
+        return await response.json()
+
+
+async def fetch_momentum_candidates(
+    session: aiohttp.ClientSession,
+) -> list[MomentumCandidate]:
+    """Discover and rank a bounded Solana market snapshot via public endpoints."""
+    search, profiles, boosts = await asyncio.gather(
+        _dexscreener_json(session, DEX_SCREENER_SEARCH_URL, q="solana"),
+        _dexscreener_json(session, DEX_SCREENER_PROFILES_URL),
+        _dexscreener_json(session, DEX_SCREENER_BOOSTS_URL),
+    )
+    pairs: list[dict[str, Any]] = [
+        pair
+        for pair in (search.get("pairs") or [])
+        if isinstance(pair, dict)
+    ] if isinstance(search, dict) else []
+    discovered_mints: list[str] = []
+    for payload in (profiles, boosts):
+        rows = payload if isinstance(payload, list) else [payload]
+        for row in rows:
+            if not isinstance(row, dict) or row.get("chainId") != "solana":
+                continue
+            mint = str(row.get("tokenAddress") or "")
+            if mint and mint not in discovered_mints:
+                discovered_mints.append(mint)
+            if len(discovered_mints) >= MOMENTUM_MAX_DISCOVERY_TOKENS:
+                break
+    if discovered_mints:
+        token_pairs = await _dexscreener_json(
+            session,
+            f"{DEX_SCREENER_TOKENS_URL}/{','.join(discovered_mints)}",
+        )
+        if isinstance(token_pairs, list):
+            pairs.extend(pair for pair in token_pairs if isinstance(pair, dict))
+
+    best_by_mint: dict[str, MomentumCandidate] = {}
+    for pair in pairs:
+        candidate = momentum_candidate_from_pair(pair)
+        if candidate is None:
+            continue
+        incumbent = best_by_mint.get(candidate.mint)
+        if incumbent is None or candidate.momentum_score > incumbent.momentum_score:
+            best_by_mint[candidate.mint] = candidate
+    return sorted(
+        best_by_mint.values(),
+        key=lambda item: (
+            item.momentum_score,
+            item.volume_m5_usd,
+            item.buys_m5 - item.sells_m5,
+        ),
+        reverse=True,
+    )[:MOMENTUM_MAX_CANDIDATES]
+
+
+async def _solana_rpc(
+    session: aiohttp.ClientSession,
+    http_url: str,
+    method: str,
+    params: list[Any],
+) -> Any:
+    request = {"jsonrpc": "2.0", "id": method, "method": method, "params": params}
+    async with session.post(http_url, json=request) as response:
+        response.raise_for_status()
+        payload = await response.json()
+    if payload.get("error"):
+        raise RuntimeError(f"{method} failed: {payload['error']}")
+    return payload.get("result")
+
+
+def unknown_whale_buy_from_transaction(
+    transaction: dict[str, Any],
+    mint: str,
+    watched_wallets: set[str],
+) -> list[UnknownWhaleBuy]:
+    message = ((transaction.get("transaction") or {}).get("message") or {})
+    meta = transaction.get("meta") or {}
+    keys = account_keys(message)
+    key_rows = message.get("accountKeys") or []
+    signature = signature_of(transaction)
+    results: list[UnknownWhaleBuy] = []
+    for index, row in enumerate(key_rows):
+        wallet = str(row.get("pubkey") or "") if isinstance(row, dict) else str(row)
+        is_signer = bool(row.get("signer")) if isinstance(row, dict) else index == 0
+        if not is_signer or not wallet or wallet in watched_wallets:
+            continue
+        token_deltas = wallet_token_deltas(meta, wallet)
+        token_delta, decimals = token_deltas.get(mint, (0, 0))
+        if token_delta <= 0:
+            continue
+        pre = meta.get("preBalances") or []
+        post = meta.get("postBalances") or []
+        if index >= len(pre) or index >= len(post):
+            continue
+        fee = int(meta.get("fee", 0) or 0) if index == 0 else 0
+        native_paid = int(pre[index]) - int(post[index]) - fee
+        wsol_delta, wsol_decimals = token_deltas.get(WSOL_MINT, (0, 9))
+        wsol_paid = -wsol_delta if wsol_delta < 0 and wsol_decimals == 9 else 0
+        paid_lamports = max(native_paid, wsol_paid)
+        if paid_lamports < SINGLE_STRENGTH_LAMPORTS:
+            continue
+        results.append(
+            UnknownWhaleBuy(
+                wallet=wallet,
+                signature=signature,
+                paid_lamports=paid_lamports,
+                token_amount_raw=token_delta,
+                token_decimals=decimals,
+            )
+        )
+    return results
+
+
+async def confirm_unknown_whales(
+    session: aiohttp.ClientSession,
+    http_url: str,
+    candidate: MomentumCandidate,
+    watched_wallets: set[str],
+) -> list[UnknownWhaleBuy]:
+    signatures = await _solana_rpc(
+        session,
+        http_url,
+        "getSignaturesForAddress",
+        [
+            candidate.pair_address,
+            {"limit": UNKNOWN_WHALE_SIGNATURE_LIMIT, "commitment": "confirmed"},
+        ],
+    )
+    transaction_signatures = [
+        str(row.get("signature"))
+        for row in (signatures or [])
+        if isinstance(row, dict) and row.get("signature") and row.get("err") is None
+    ]
+    if not transaction_signatures:
+        return []
+    by_wallet: dict[str, UnknownWhaleBuy] = {}
+    # Helius rejects JSON-RPC batch getTransaction on some plans. Sequential,
+    # early-exit reads keep peak memory flat and stop as soon as 3 whales exist.
+    for signature in transaction_signatures:
+        transaction = await _solana_rpc(
+            session,
+            http_url,
+            "getTransaction",
+            [
+                signature,
+                {
+                    "commitment": "confirmed",
+                    "encoding": "jsonParsed",
+                    "maxSupportedTransactionVersion": 0,
+                },
+            ],
+        )
+        if not isinstance(transaction, dict):
+            continue
+        for buy in unknown_whale_buy_from_transaction(
+            transaction, candidate.mint, watched_wallets
+        ):
+            incumbent = by_wallet.get(buy.wallet)
+            if incumbent is None or buy.paid_lamports > incumbent.paid_lamports:
+                by_wallet[buy.wallet] = buy
+        if len(by_wallet) >= UNKNOWN_WHALE_MIN_COUNT:
+            break
+    return sorted(
+        by_wallet.values(), key=lambda buy: buy.paid_lamports, reverse=True
+    )
+
+
+async def run_market_momentum_route(settings: MonitorSettings) -> None:
+    """Lean Route B loop: one bounded snapshot and one candidate scan per tick."""
+    timeout = aiohttp.ClientTimeout(total=12)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        while True:
+            started = time.monotonic()
+            try:
+                wallets = set(load_wallets(settings.wallets_path))
+                candidates = await fetch_momentum_candidates(session)
+                now = time.monotonic()
+                for mint, expires_at in list(_market_entry_cooldowns.items()):
+                    if expires_at <= now:
+                        _market_entry_cooldowns.pop(mint, None)
+                candidate = next(
+                    (
+                        item
+                        for item in candidates
+                        if item.mint not in _market_entry_cooldowns
+                    ),
+                    None,
+                )
+                if candidate is not None:
+                    whales = await confirm_unknown_whales(
+                        session, settings.http_url, candidate, wallets
+                    )
+                    if len(whales) >= UNKNOWN_WHALE_MIN_COUNT:
+                        strongest = whales[0]
+                        _market_entry_cooldowns[candidate.mint] = (
+                            now + MOMENTUM_ENTRY_COOLDOWN_SECONDS
+                        )
+                        signal_signature = (
+                            f"dexscreener:{candidate.pair_address}:"
+                            f"{int(time.time())}"
+                        )
+                        logger.info(
+                            "[ROUTE_B] momentum confirmed mint=%s score=%.2f "
+                            "volume_m5=$%.2f unknown_whales=%d",
+                            candidate.mint,
+                            candidate.momentum_score,
+                            candidate.volume_m5_usd,
+                            len(whales),
+                        )
+                        task = asyncio.create_task(
+                            process_paper_signal(
+                                candidate.mint,
+                                strongest.token_amount_raw,
+                                strongest.token_decimals,
+                                strongest.paid_lamports,
+                                strongest.wallet,
+                                signal_signature,
+                                datetime.now(timezone.utc).isoformat(),
+                                "B",
+                                candidate.momentum_score,
+                            )
+                        )
+                        _signal_tasks.add(task)
+                        task.add_done_callback(_signal_tasks.discard)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("Route B market momentum poll failed")
+            elapsed = time.monotonic() - started
+            await asyncio.sleep(max(0.0, DEX_SCREENER_POLL_SECONDS - elapsed))
 
 
 async def keepalive(socket: ClientConnection) -> None:
@@ -646,9 +986,11 @@ async def run_forever(settings: MonitorSettings) -> None:
 async def run_service() -> None:
     from src.wallet_performance import performance_loop
 
+    settings = MonitorSettings.from_env()
     await asyncio.gather(
-        run_forever(MonitorSettings.from_env()),
+        run_forever(settings),
         performance_loop(),
+        run_market_momentum_route(settings),
     )
 
 

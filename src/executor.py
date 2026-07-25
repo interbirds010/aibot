@@ -27,7 +27,12 @@ from solders.pubkey import Pubkey
 from solders.transaction import VersionedTransaction
 
 from src.analyzer import analyze_token
-from src.state_store import atomic_write_json, exclusive_file_lock, read_json
+from src.state_store import (
+    atomic_write_json,
+    exclusive_file_lock,
+    normalized_route_metadata,
+    read_json,
+)
 
 WSOL_MINT = "So11111111111111111111111111111111111111112"
 LIVE_BUY_PERCENT = 1  # Live execution remains capped at 1% of current SOL.
@@ -619,7 +624,8 @@ async def execute_live_swap(
 
 
 def route_sized_amount(base_amount: int, route_type: str) -> int:
-    if route_type == "B":
+    route = str(normalized_route_metadata(route_type)["route_type"])
+    if route == "B":
         return int(Decimal(base_amount) * ROUTE_B_SIZE_MULTIPLIER)
     return base_amount
 

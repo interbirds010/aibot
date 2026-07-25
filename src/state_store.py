@@ -22,6 +22,7 @@ else:  # pragma: no cover - exercised by the Linux deployment.
 
 T = TypeVar("T")
 Mutator = Callable[[dict[str, Any]], T]
+VALID_ROUTE_TYPES = frozenset({"A", "B"})
 
 
 class VersionConflict(RuntimeError):
@@ -30,6 +31,22 @@ class VersionConflict(RuntimeError):
 
 class StateLockTimeout(TimeoutError):
     """Raised when another process holds a state lock beyond the deadline."""
+
+
+def normalized_route_metadata(
+    route_type: str, dex_momentum_score: float = 0.0
+) -> dict[str, str | float]:
+    """Return compact, schema-safe route fields shared by position/event writes."""
+    normalized_route = str(route_type).upper()
+    if normalized_route not in VALID_ROUTE_TYPES:
+        raise ValueError("route_type must be A or B")
+    score = float(dex_momentum_score)
+    if not 0.0 <= score <= 100.0:
+        raise ValueError("dex_momentum_score must be between 0 and 100")
+    return {
+        "route_type": normalized_route,
+        "dex_momentum_score": round(score, 4),
+    }
 
 
 def read_json(path: Path, fallback: dict[str, Any]) -> dict[str, Any]:
@@ -91,7 +108,14 @@ def atomic_write_json(path: Path, document: dict[str, Any]) -> None:
         with tempfile.NamedTemporaryFile(
             "w", encoding="utf-8", dir=path.parent, delete=False
         ) as file:
-            json.dump(document, file, ensure_ascii=False, indent=2)
+            # Compact encoding shortens fsync and therefore the cross-process
+            # lock hold time on the 1 GB production VPS.
+            json.dump(
+                document,
+                file,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
             file.write("\n")
             file.flush()
             os.fsync(file.fileno())
