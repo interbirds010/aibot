@@ -297,6 +297,7 @@ async def process_paper_signal(
                 paper_cash_balance,
                 record_paper_buy,
                 record_paper_rejection,
+                record_rpc_skip,
             )
 
             report = await analyze_token(mint)
@@ -313,7 +314,9 @@ async def process_paper_signal(
                 )
                 return
             cash = await paper_cash_balance()
-            paper_cost = cash * PAPER_BUY_BASIS_POINTS // 10_000
+            base_paper_cost = cash * PAPER_BUY_BASIS_POINTS // 10_000
+            from src.executor import route_sized_amount
+            paper_cost = route_sized_amount(base_paper_cost, str(report.route_type))
             if paper_cost <= 0:
                 logger.warning("paper signal has unusable observed price: %s", signature)
                 return
@@ -358,14 +361,23 @@ async def process_paper_signal(
                 whale_reference_price=whale_reference_price,
                 copy_price_gap_pct=copy_price_gap_pct,
                 entry_latency_ms=entry_latency_ms,
+                route_type=str(report.route_type),
             )
             from src.wallet_performance import record_paper_buy_success
             await record_paper_buy_success(wallet, mint, signature)
             logger.info(
-                "paper buy recorded: mint=%s cost=%s score=%s source_wallet=%s signature=%s",
-                mint, paper_cost, report.safety_score, wallet, signature,
+                "paper buy recorded: mint=%s route=%s cost=%s score=%s source_wallet=%s signature=%s",
+                mint, report.route_type, paper_cost, report.safety_score, wallet, signature,
             )
         except RuntimeError as exc:
+            reason = str(exc)
+            if (
+                "failed after 3 attempts" in reason
+                or "getTokenSupply failed" in reason
+                or "could not find account" in reason
+            ):
+                from src.risk_manager import record_rpc_skip
+                await record_rpc_skip(mint, wallet, signature, reason)
             logger.info("paper signal skipped: mint=%s reason=%s", mint, exc)
         except Exception:
             logger.exception("paper signal processing failed: mint=%s", mint)

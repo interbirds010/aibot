@@ -26,12 +26,13 @@ from solders.message import Message, MessageV0
 from solders.pubkey import Pubkey
 from solders.transaction import VersionedTransaction
 
-from src.analyzer import should_enter_token
+from src.analyzer import analyze_token
 from src.state_store import atomic_write_json, exclusive_file_lock, read_json
 
 WSOL_MINT = "So11111111111111111111111111111111111111112"
 LIVE_BUY_PERCENT = 1  # Live execution remains capped at 1% of current SOL.
 PAPER_BUY_BASIS_POINTS = 50  # 0.5% of currently available virtual cash.
+ROUTE_B_SIZE_MULTIPLIER = Decimal("0.15")
 LAMPORTS_PER_SOL = 1_000_000_000
 JITO_FALLBACK_TIP_LAMPORTS = 2_000_000  # 0.002 SOL
 JITO_MIN_TIP_LAMPORTS = 1_000
@@ -53,8 +54,8 @@ JUPITER_RATE_LIMIT_FALLBACK = {
     "last_request_at_epoch": 0.0,
     "not_before_epoch": 0.0,
 }
-_QUOTE_INTERVAL_SECONDS = 1.05
-_JUPITER_MAX_QUOTE_ATTEMPTS = 5
+_QUOTE_INTERVAL_SECONDS = 1.25
+_JUPITER_MAX_QUOTE_ATTEMPTS = 3
 _JUPITER_MAX_RESET_WAIT_SECONDS = 60.0
 MAX_ENTRY_PRICE_IMPACT_PCT = 1.5
 logger = logging.getLogger("executor")
@@ -256,7 +257,11 @@ def _jupiter_backoff_seconds(
         except (TypeError, ValueError):
             pass
         else:
-            delay = max(0.05, reset_epoch - now_epoch + 0.05)
+            delay = (
+                reset_epoch - now_epoch + 0.05
+                if reset_epoch > now_epoch
+                else max(0.05, reset_epoch)
+            )
             return min(delay, _JUPITER_MAX_RESET_WAIT_SECONDS), "rate-limit-reset"
     return min(float(2**attempt_index), 30.0), "exponential-fallback"
 
@@ -277,15 +282,21 @@ async def jupiter_quote(
         "restrictIntermediateTokens": "true",
     }
     quote: dict[str, Any] | None = None
+    last_error: Exception | None = None
     for attempt_index in range(_JUPITER_MAX_QUOTE_ATTEMPTS):
-        await _wait_for_global_jupiter_slot()
-        async with session.get(
-            f"{JUPITER_BASE}/quote", params=params, headers=headers
-        ) as response:
-            if response.status == 429:
+        try:
+            await _wait_for_global_jupiter_slot()
+            async with session.get(
+                f"{JUPITER_BASE}/quote", params=params, headers=headers
+            ) as response:
+                if response.status != 429 and response.status < 500:
+                    response.raise_for_status()
+                    quote = await response.json()
+                    break
                 now_epoch = time.time()
                 delay, source = _jupiter_backoff_seconds(
-                    response.headers.get("x-ratelimit-reset"),
+                    response.headers.get("x-ratelimit-reset")
+                    or response.headers.get("Retry-After"),
                     attempt_index,
                     now_epoch,
                 )
@@ -293,8 +304,9 @@ async def jupiter_quote(
                     _defer_jupiter_until_sync, now_epoch + delay
                 )
                 logger.warning(
-                    "Jupiter rate limited; waiting %.2fs via %s "
+                    "Jupiter transient failure status=%d; waiting %.2fs via %s "
                     "(attempt %d/%d)",
+                    response.status,
                     delay,
                     source,
                     attempt_index + 1,
@@ -302,15 +314,26 @@ async def jupiter_quote(
                 )
                 if attempt_index + 1 >= _JUPITER_MAX_QUOTE_ATTEMPTS:
                     raise RuntimeError(
-                        "Jupiter quote rate limit persisted after safe retries"
+                        "Jupiter quote failed after 3 attempts"
                     ) from None
                 await asyncio.sleep(delay)
-                continue
-            response.raise_for_status()
-            quote = await response.json()
-            break
+        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+            last_error = exc
+            if attempt_index + 1 >= _JUPITER_MAX_QUOTE_ATTEMPTS:
+                break
+            delay = min(float(2**attempt_index), 30.0)
+            logger.warning(
+                "Jupiter transport retry: attempt=%d/%d delay=%.2fs error=%s",
+                attempt_index + 1,
+                _JUPITER_MAX_QUOTE_ATTEMPTS,
+                delay,
+                type(exc).__name__,
+            )
+            await asyncio.sleep(delay)
     if quote is None:
-        raise RuntimeError("Jupiter quote failed without a response") from None
+        raise RuntimeError(
+            f"Jupiter quote failed after 3 attempts: {last_error or 'no response'}"
+        ) from last_error
     if not quote.get("routePlan") or int(quote.get("outAmount", "0")) <= 0:
         raise RuntimeError("Jupiter returned no executable route")
     return quote
@@ -595,6 +618,12 @@ async def execute_live_swap(
         )
 
 
+def route_sized_amount(base_amount: int, route_type: str) -> int:
+    if route_type == "B":
+        return int(Decimal(base_amount) * ROUTE_B_SIZE_MULTIPLIER)
+    return base_amount
+
+
 async def execute_buy(mint: str, settings: ExecutionSettings | None = None) -> ExecutionResult:
     """Analyze, size, sign and submit a single safety-gated buy."""
     settings = settings or ExecutionSettings.from_env()
@@ -603,7 +632,8 @@ async def execute_buy(mint: str, settings: ExecutionSettings | None = None) -> E
     except ValueError as exc:
         raise ValueError(f"invalid output mint: {mint}") from exc
 
-    if not await should_enter_token(mint):
+    report = await analyze_token(mint)
+    if not report.should_enter or report.route_type not in {"A", "B"}:
         return ExecutionResult(False, False, mint, 0, status="analyzer_rejected")
     if settings.trading_mode != "live":
         if not settings.jupiter_api_key:
@@ -611,7 +641,8 @@ async def execute_buy(mint: str, settings: ExecutionSettings | None = None) -> E
         from src.risk_manager import paper_cash_balance, record_paper_buy
 
         balance = await paper_cash_balance()
-        amount = balance * PAPER_BUY_BASIS_POINTS // 10_000
+        base_amount = balance * PAPER_BUY_BASIS_POINTS // 10_000
+        amount = route_sized_amount(base_amount, report.route_type)
         timeout = aiohttp.ClientTimeout(total=30)
         async with aiohttp.ClientSession(timeout=timeout) as session:
             quote = await jupiter_quote(
@@ -623,6 +654,7 @@ async def execute_buy(mint: str, settings: ExecutionSettings | None = None) -> E
             amount,
             int(quote["outAmount"]),
             entry_price_impact_pct=impact,
+            route_type=report.route_type,
         )
         return ExecutionResult(False, False, mint, amount, status="paper_buy_recorded")
     if not settings.jupiter_api_key:
@@ -634,7 +666,8 @@ async def execute_buy(mint: str, settings: ExecutionSettings | None = None) -> E
     timeout = aiohttp.ClientTimeout(total=30)
     async with aiohttp.ClientSession(timeout=timeout) as session:
         balance = await sol_balance(session, settings.rpc_url, owner)
-        amount = balance * LIVE_BUY_PERCENT // 100
+        base_amount = balance * LIVE_BUY_PERCENT // 100
+        amount = route_sized_amount(base_amount, report.route_type)
         if amount <= 0 or balance - amount < MIN_FEE_RESERVE_LAMPORTS:
             raise RuntimeError("insufficient SOL balance after the fixed 1% buy and fee reserve")
         quote = await jupiter_quote(

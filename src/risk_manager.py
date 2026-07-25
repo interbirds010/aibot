@@ -27,6 +27,8 @@ INITIAL_PAPER_LAMPORTS = 10_000_000_000
 TAKE_PROFIT_RATIO = 1.50
 SECOND_TAKE_PROFIT_RATIO = 2.00
 STOP_LOSS_RATIO = 0.85
+ROUTE_B_TAKE_PROFIT_RATIO = 1.30
+ROUTE_B_STOP_LOSS_RATIO = 0.90
 BREAK_EVEN_STOP_RATIO = 1.00
 PRICE_POLL_SECONDS = 1.0
 QUOTE_FAILURE_WARNING_COUNT = 3
@@ -89,6 +91,7 @@ def _normalize_position(
         "last_quote_success_at": str(position.get("last_quote_success_at") or opened_at),
         "consecutive_quote_failures": int(position.get("consecutive_quote_failures", 0) or 0),
         "risk_state": str(position.get("risk_state") or "NORMAL"),
+        "route_type": str(position.get("route_type") or "A"),
         "take_profit_done": bool(position.get("take_profit_done", False)),
         "second_take_profit_done": bool(position.get("second_take_profit_done", False)),
         "stop_loss_ratio": float(
@@ -190,6 +193,7 @@ async def record_paper_buy(
     whale_reference_price: float = 0.0,
     copy_price_gap_pct: float = 0.0,
     entry_latency_ms: int = 0,
+    route_type: str = "A",
 ) -> str:
     if cost_lamports <= 0 or token_amount_raw <= 0:
         raise ValueError("paper buy amounts must be positive")
@@ -202,6 +206,8 @@ async def record_paper_buy(
             f"{MAX_ENTRY_PRICE_IMPACT_PCT:.2f}%. Position not created."
         )
     ensure_ledger_migrated()
+    if route_type not in {"A", "B"}:
+        raise ValueError("route_type must be A or B")
 
     def mutate(ledger: dict[str, Any]) -> str:
         if mint in ledger.setdefault("positions", {}):
@@ -243,6 +249,7 @@ async def record_paper_buy(
             "whale_reference_price": float(whale_reference_price),
             "copy_price_gap_pct": float(copy_price_gap_pct),
             "entry_latency_ms": int(entry_latency_ms),
+            "route_type": route_type,
         }
         ledger["cash_lamports"] = int(ledger["cash_lamports"]) - cost_lamports
         ledger["positions"][mint] = {
@@ -259,7 +266,9 @@ async def record_paper_buy(
             "risk_state": "NORMAL",
             "take_profit_done": False,
             "second_take_profit_done": False,
-            "stop_loss_ratio": STOP_LOSS_RATIO,
+            "stop_loss_ratio": (
+                ROUTE_B_STOP_LOSS_RATIO if route_type == "B" else STOP_LOSS_RATIO
+            ),
             "break_even_floor_active": False,
             "version": 1,
             **metadata,
@@ -294,6 +303,35 @@ async def record_paper_rejection(
             "type": "SIGNAL_REJECTED", "mint": mint, "safety_score": score,
             "reason": "; ".join(reasons), "source_wallet": wallet,
             "signature": signature, "at": utc_now(),
+        }))
+        ledger["events"] = ledger["events"][-2_000:]
+        ledger["updated_at"] = utc_now()
+
+    update_json(LEDGER_PATH, empty_ledger(), mutate)
+
+
+async def record_rpc_skip(
+    mint: str, wallet: str, signature: str, reason: str
+) -> None:
+    """Persist a fail-safe skip without reserving paper cash or a position."""
+    ensure_ledger_migrated()
+
+    def mutate(ledger: dict[str, Any]) -> None:
+        if any(
+            isinstance(event, dict)
+            and event.get("type") == "SKIPPED_BY_RPC_ERROR"
+            and event.get("signature") == signature
+            and event.get("mint") == mint
+            for event in ledger.setdefault("events", [])
+        ):
+            return
+        ledger["events"].append(_next_event(ledger, {
+            "type": "SKIPPED_BY_RPC_ERROR",
+            "mint": mint,
+            "source_wallet": wallet,
+            "signature": signature,
+            "reason": reason[:500],
+            "at": utc_now(),
         }))
         ledger["events"] = ledger["events"][-2_000:]
         ledger["updated_at"] = utc_now()
@@ -381,7 +419,11 @@ async def record_paper_sell(
         position["risk_state"] = "NORMAL"
         position["version"] = int(position.get("version", 0)) + 1
         ledger["cash_lamports"] = int(ledger.get("cash_lamports", 0)) + proceeds_lamports
-        if reason in {"TAKE_PROFIT_50", "LIVE_TAKE_PROFIT_50"}:
+        if reason in {
+            "TAKE_PROFIT_50",
+            "LIVE_TAKE_PROFIT_50",
+            "ROUTE_B_TAKE_PROFIT_30",
+        }:
             position["take_profit_done"] = True
             position["stop_loss_ratio"] = BREAK_EVEN_STOP_RATIO
             position["break_even_floor_active"] = True
@@ -579,7 +621,7 @@ async def _execute_paper_exit(
     exit_id, current_amount = claim
     amount = (
         current_amount
-        if reason in {"STOP_LOSS_15", "TP_BREAK_EVEN"}
+        if reason in {"STOP_LOSS_15", "ROUTE_B_STOP_LOSS_10", "TP_BREAK_EVEN"}
         else current_amount // 2
     )
     if amount <= 0:
@@ -619,6 +661,7 @@ async def evaluate_paper_position(
     ratio = current_value / cost
     trigger_roi = (ratio - 1) * 100
     await record_position_mark(mint, position_id, current_value)
+    route_type = str(position.get("route_type") or "A")
     break_even_active = bool(position.get("take_profit_done"))
     stop_loss_ratio = (
         max(
@@ -626,7 +669,9 @@ async def evaluate_paper_position(
             float(position.get("stop_loss_ratio", BREAK_EVEN_STOP_RATIO) or 0),
         )
         if break_even_active
-        else STOP_LOSS_RATIO
+        else (
+            ROUTE_B_STOP_LOSS_RATIO if route_type == "B" else STOP_LOSS_RATIO
+        )
     )
     if break_even_active and await ensure_break_even_floor(mint, position_id):
         logger.info(
@@ -636,7 +681,11 @@ async def evaluate_paper_position(
             (stop_loss_ratio - 1) * 100,
         )
     if ratio <= stop_loss_ratio:
-        reason = "TP_BREAK_EVEN" if break_even_active else "STOP_LOSS_15"
+        reason = (
+            "TP_BREAK_EVEN"
+            if break_even_active
+            else ("ROUTE_B_STOP_LOSS_10" if route_type == "B" else "STOP_LOSS_15")
+        )
         if await _execute_paper_exit(
             session, api_key, position, reason, trigger_roi
         ):
@@ -646,6 +695,17 @@ async def evaluate_paper_position(
                 reason,
                 trigger_roi,
                 (stop_loss_ratio - 1) * 100,
+            )
+    elif route_type == "B" and ratio >= ROUTE_B_TAKE_PROFIT_RATIO and not position.get(
+        "take_profit_done"
+    ):
+        if await _execute_paper_exit(
+            session, api_key, position, "ROUTE_B_TAKE_PROFIT_30", trigger_roi
+        ):
+            logger.info(
+                "Route B take-profit: %s return=%.2f%%; break-even floor armed",
+                mint,
+                trigger_roi,
             )
     elif (
         ratio >= SECOND_TAKE_PROFIT_RATIO

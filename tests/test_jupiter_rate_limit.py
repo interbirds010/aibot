@@ -94,6 +94,10 @@ class JupiterRateLimitTests(unittest.TestCase):
         self.assertAlmostEqual(delay, 5.05)
         self.assertEqual(source, "rate-limit-reset")
 
+        delay, source = executor._jupiter_backoff_seconds("2", 0, now)
+        self.assertEqual(delay, 2.0)
+        self.assertEqual(source, "rate-limit-reset")
+
         delay, source = executor._jupiter_backoff_seconds(None, 3, now)
         self.assertEqual(delay, 8.0)
         self.assertEqual(source, "exponential-fallback")

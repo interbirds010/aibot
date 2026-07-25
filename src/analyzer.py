@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import logging
 import os
 from dataclasses import asdict, dataclass, field
 from decimal import Decimal, InvalidOperation
@@ -15,6 +16,9 @@ from dotenv import load_dotenv
 from solders.pubkey import Pubkey
 
 RUGCHECK_BASE = "https://api.rugcheck.xyz/v1/tokens"
+ROUTE_B_MINIMUM_LIQUIDITY_USD = Decimal("5000")
+RPC_MAX_ATTEMPTS = 3
+logger = logging.getLogger("analyzer")
 
 
 @dataclass(frozen=True, slots=True)
@@ -41,6 +45,7 @@ class SafetyReport:
     mint: str
     safety_score: int = 0
     should_enter: bool = False
+    route_type: str | None = None
     developer_wallet: str | None = None
     developer_supply_percent: str | None = None
     developer_below_ten_percent: bool = False
@@ -57,12 +62,32 @@ async def rpc_call(
     session: aiohttp.ClientSession, url: str, method: str, params: list[Any]
 ) -> Any:
     request = {"jsonrpc": "2.0", "id": method, "method": method, "params": params}
-    async with session.post(url, json=request) as response:
-        response.raise_for_status()
-        payload = await response.json()
-    if payload.get("error"):
-        raise RuntimeError(f"{method} failed: {payload['error']}")
-    return payload.get("result")
+    last_error: Exception | None = None
+    for attempt_index in range(RPC_MAX_ATTEMPTS):
+        try:
+            async with session.post(url, json=request) as response:
+                response.raise_for_status()
+                payload = await response.json()
+            if payload.get("error"):
+                raise RuntimeError(f"{method} failed: {payload['error']}")
+            return payload.get("result")
+        except (aiohttp.ClientError, asyncio.TimeoutError, RuntimeError) as exc:
+            last_error = exc
+            if attempt_index + 1 >= RPC_MAX_ATTEMPTS:
+                break
+            delay = float(2**attempt_index)
+            logger.warning(
+                "Solana RPC retry: method=%s attempt=%d/%d delay=%.1fs error=%s",
+                method,
+                attempt_index + 1,
+                RPC_MAX_ATTEMPTS,
+                delay,
+                str(exc)[:300],
+            )
+            await asyncio.sleep(delay)
+    raise RuntimeError(
+        f"{method} failed after {RPC_MAX_ATTEMPTS} attempts: {last_error}"
+    ) from last_error
 
 
 async def rugcheck_get(
@@ -188,6 +213,43 @@ def liquidity_usd(report: dict[str, Any] | None) -> Decimal | None:
     return sum(values, Decimal(0)) if values else None
 
 
+def select_route_type(
+    *,
+    safety_score: int,
+    developer_below_ten_percent: bool,
+    mint_authority_renounced: bool,
+    lp_locked_percent: Decimal | None,
+    liquidity: Decimal | None,
+    settings: AnalyzerSettings,
+) -> str | None:
+    """Select one fail-closed execution route from verified safety inputs."""
+    route_a = (
+        safety_score >= settings.minimum_safety_score
+        and developer_below_ten_percent
+        and mint_authority_renounced
+        and lp_locked_percent is not None
+        and lp_locked_percent >= settings.minimum_lp_locked_percent
+        and liquidity is not None
+        and liquidity >= settings.minimum_liquidity_usd
+    )
+    route_b = (
+        developer_below_ten_percent
+        and mint_authority_renounced
+        and lp_locked_percent is not None
+        and liquidity is not None
+        and liquidity >= ROUTE_B_MINIMUM_LIQUIDITY_USD
+        and (
+            lp_locked_percent < settings.minimum_lp_locked_percent
+            or liquidity < settings.minimum_liquidity_usd
+        )
+    )
+    if route_a:
+        return "A"
+    if route_b:
+        return "B"
+    return None
+
+
 async def analyze_token(
     mint: str, settings: AnalyzerSettings | None = None
 ) -> SafetyReport:
@@ -254,13 +316,15 @@ async def analyze_token(
 
     if rug_report is not None or rug_summary is not None:
         result.sources.append("rugcheck")
-    result.should_enter = (
-        result.safety_score >= settings.minimum_safety_score
-        and result.developer_below_ten_percent
-        and result.mint_authority_renounced
-        and result.lp_locked
-        and result.liquidity_above_minimum
+    result.route_type = select_route_type(
+        safety_score=result.safety_score,
+        developer_below_ten_percent=result.developer_below_ten_percent,
+        mint_authority_renounced=result.mint_authority_renounced,
+        lp_locked_percent=lp_pct,
+        liquidity=liquidity,
+        settings=settings,
     )
+    result.should_enter = result.route_type is not None
     return result
 
 
