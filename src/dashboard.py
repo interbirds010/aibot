@@ -45,52 +45,423 @@ st.set_page_config(
 st.markdown(
     """
     <style>
-      .stApp { background: #07110f; color: #e7f7ef; }
-      [data-testid="stHeader"] { background: transparent; }
-      .block-container {
-          width: 100%; max-width: none; padding: 2rem 2.25rem 1.5rem;
+      :root {
+          --ops-bg: #07100f;
+          --ops-surface: #0c1816;
+          --ops-surface-raised: #10201d;
+          --ops-border: #203a34;
+          --ops-border-soft: #172c27;
+          --ops-text: #edf8f4;
+          --ops-muted: #91aaa2;
+          --ops-accent: #42d392;
+          --ops-accent-soft: rgba(66, 211, 146, .12);
+          --ops-danger: #ff7a83;
+          --ops-radius: 16px;
       }
-      .hero { padding: 1.25rem 1.4rem; border: 1px solid #1d3b32;
-              border-radius: 18px; background: linear-gradient(135deg,#0b1c17,#0c1514); }
-      .eyebrow { color:#56d6a0; font-size:.78rem; letter-spacing:.15em; font-weight:700; }
-      .hero h1 { margin:.25rem 0 .35rem; font-size:2rem; }
-      .muted { color:#86a69a; }
-      div[data-testid="stMetric"] { background:#0c1b17; border:1px solid #1c382f;
-          border-radius:14px; padding:1rem 1.1rem; }
-      div[data-testid="stMetricValue"] { font-weight:750; }
+      html {
+          color-scheme: dark;
+          background: var(--ops-bg);
+      }
+      body, .stApp {
+          background:
+              radial-gradient(circle at 88% -8%, rgba(66, 211, 146, .09), transparent 28rem),
+              var(--ops-bg);
+          color: var(--ops-text);
+          font-family: "Pretendard Variable", Pretendard, -apple-system,
+              BlinkMacSystemFont, "Segoe UI", sans-serif;
+          text-rendering: optimizeLegibility;
+          -webkit-font-smoothing: antialiased;
+      }
+      [data-testid="stHeader"] {
+          background: rgba(7, 16, 15, .82);
+          backdrop-filter: blur(14px);
+          -webkit-backdrop-filter: blur(14px);
+          border-bottom: 1px solid rgba(32, 58, 52, .55);
+      }
+      [data-testid="stToolbar"] {
+          right: .75rem;
+      }
+      .block-container {
+          width: min(100%, 1480px);
+          max-width: 1480px;
+          padding: 2rem 2rem 3rem;
+      }
+      h1, h2, h3 {
+          color: var(--ops-text);
+          letter-spacing: -.035em;
+      }
+      h2, h3 {
+          margin-top: 1.75rem;
+      }
+      p, [data-testid="stCaptionContainer"] {
+          line-height: 1.65;
+      }
+      .hero {
+          position: relative;
+          isolation: isolate;
+          overflow: hidden;
+          padding: 1.5rem 1.6rem;
+          border: 1px solid var(--ops-border);
+          border-radius: var(--ops-radius);
+          background:
+              linear-gradient(120deg, rgba(66, 211, 146, .08), transparent 48%),
+              var(--ops-surface);
+          box-shadow: 0 18px 50px rgba(1, 12, 9, .22);
+      }
+      .hero::after {
+          content: "";
+          position: absolute;
+          inset: 0 0 auto;
+          height: 1px;
+          background: linear-gradient(90deg, transparent, rgba(118, 244, 185, .56), transparent);
+          pointer-events: none;
+      }
+      .eyebrow {
+          color: var(--ops-accent);
+          font-size: .74rem;
+          letter-spacing: .13em;
+          font-weight: 750;
+      }
+      .hero h1 {
+          margin: .32rem 0 .45rem;
+          max-width: none;
+          font-size: clamp(1.75rem, 4vw, 2.55rem);
+          line-height: 1.08;
+      }
+      .muted {
+          color: var(--ops-muted);
+      }
+      .hero-status {
+          display: flex;
+          flex-wrap: wrap;
+          align-items: center;
+          gap: .45rem;
+          font-size: .9rem;
+      }
+      .status-dot {
+          display: inline-block;
+          flex: 0 0 auto;
+          width: 9px;
+          height: 9px;
+          border-radius: 50%;
+          background: var(--ops-accent);
+          box-shadow: 0 0 0 4px rgba(66, 211, 146, .11);
+      }
+      .status-off {
+          background: var(--ops-danger);
+          box-shadow: 0 0 0 4px rgba(255, 122, 131, .12);
+      }
+      .ops-kpi-grid {
+          display: grid;
+          grid-template-columns: repeat(4, minmax(0, 1fr));
+          gap: .8rem;
+          margin: 1rem 0 1.4rem;
+      }
+      .ops-kpi-card {
+          min-width: 0;
+          padding: 1.05rem 1.1rem;
+          border: 1px solid var(--ops-border-soft);
+          border-radius: var(--ops-radius);
+          background: linear-gradient(180deg, rgba(255,255,255,.018), transparent), var(--ops-surface);
+          box-shadow: 0 12px 28px rgba(1, 12, 9, .16);
+      }
+      .ops-kpi-card[data-emphasis="true"] {
+          border-color: rgba(66, 211, 146, .42);
+          background: linear-gradient(145deg, var(--ops-accent-soft), transparent 64%), var(--ops-surface);
+      }
+      .ops-kpi-label {
+          margin-bottom: .42rem;
+          color: var(--ops-muted);
+          font-size: .76rem;
+          font-weight: 650;
+          letter-spacing: .015em;
+      }
+      .ops-kpi-value {
+          overflow-wrap: anywhere;
+          color: var(--ops-text);
+          font-size: clamp(1.28rem, 2.2vw, 1.72rem);
+          font-weight: 780;
+          letter-spacing: -.035em;
+          line-height: 1.1;
+      }
+      .ops-kpi-value.positive {
+          color: #74e6ad;
+      }
+      .ops-kpi-value.negative {
+          color: #ff8f97;
+      }
+      .ops-kpi-detail {
+          margin-top: .48rem;
+          overflow-wrap: anywhere;
+          color: var(--ops-muted);
+          font-size: .75rem;
+          line-height: 1.35;
+      }
+      .ops-kpi-live {
+          display: inline-flex;
+          align-items: center;
+          gap: .5rem;
+      }
+      div[data-testid="stMetric"] {
+          min-width: 0;
+          padding: 1rem 1.05rem;
+          border: 1px solid var(--ops-border-soft);
+          border-radius: var(--ops-radius);
+          background: var(--ops-surface);
+      }
+      div[data-testid="stMetricLabel"] {
+          color: var(--ops-muted);
+      }
+      div[data-testid="stMetricValue"] {
+          overflow-wrap: anywhere;
+          font-weight: 760;
+          letter-spacing: -.025em;
+      }
+      div[data-testid="stExpander"] {
+          overflow: hidden;
+          border-color: var(--ops-border-soft);
+          border-radius: var(--ops-radius);
+          background: rgba(12, 24, 22, .68);
+      }
+      div[data-testid="stExpander"] summary {
+          min-width: 0;
+      }
+      div[data-testid="stExpander"] summary p {
+          overflow-wrap: anywhere;
+          word-break: break-word;
+      }
       div[data-testid="stExpander"] div[data-testid="stMetric"] {
-          padding:.72rem .9rem;
+          padding: .72rem .9rem;
       }
       div[data-testid="stExpander"] div[data-testid="stMetricLabel"] {
-          font-size:.8rem;
+          font-size: .8rem;
       }
       div[data-testid="stExpander"] div[data-testid="stMetricValue"] {
-          font-size:1.45rem;
-          line-height:1.25;
+          font-size: 1.35rem;
+          line-height: 1.25;
+      }
+      [data-testid="stTabs"] [data-baseweb="tab-list"] {
+          gap: .35rem;
+          overflow-x: auto;
+          scrollbar-width: thin;
+      }
+      [data-testid="stTabs"] [data-baseweb="tab"] {
+          flex: 0 0 auto;
+          min-height: 2.7rem;
+          white-space: nowrap;
+      }
+      [data-testid="stDataFrame"],
+      [data-testid="stTable"] {
+          max-width: 100%;
+          overflow-x: auto;
+          border-radius: var(--ops-radius);
+      }
+      [data-testid="stButton"] button {
+          min-height: 2.6rem;
+          border-radius: 12px;
+          border-color: var(--ops-border);
+          background: var(--ops-surface-raised);
+          color: var(--ops-text);
+          font-weight: 650;
+          transition: transform .14s ease, border-color .14s ease, background .14s ease;
+      }
+      [data-testid="stButton"] button p,
+      [data-testid="stFormSubmitButton"] button p {
+          color: inherit;
+      }
+      [data-testid="stFormSubmitButton"] button {
+          min-height: 2.7rem;
+          border-radius: 12px;
+          border-color: var(--ops-accent);
+          background: var(--ops-accent);
+          color: #052017;
+          font-weight: 750;
+      }
+      [data-testid="stButton"] button:hover {
+          border-color: rgba(66, 211, 146, .55);
+          background: var(--ops-accent-soft);
+      }
+      [data-testid="stButton"] button:active {
+          transform: translateY(1px);
       }
       div[data-testid="stElementContainer"]:has(.position-mint-column-marker) {
-          display:none;
+          display: none;
       }
       div[data-testid="stColumn"]:has(.position-mint-column-marker)
       div[data-testid="stCode"] pre {
-          overflow:hidden;
+          overflow: hidden;
       }
       div[data-testid="stColumn"]:has(.position-mint-column-marker)
       div[data-testid="stCode"] code {
-          display:block;
-          overflow:hidden;
-          padding-right:2rem;
-          text-overflow:ellipsis;
-          white-space:nowrap !important;
+          display: block;
+          overflow: hidden;
+          padding-right: 2rem;
+          text-overflow: ellipsis;
+          white-space: nowrap !important;
       }
-      .status-dot { display:inline-block; width:9px; height:9px; border-radius:50%;
-                    margin-right:7px; background:#42d392; box-shadow:0 0 12px #42d392; }
-      .status-off { background:#ef6b73; box-shadow:0 0 12px #ef6b73; }
+      @media (max-width: 1024px) {
+          .block-container {
+              padding-inline: 1.25rem;
+          }
+          .ops-kpi-grid {
+              grid-template-columns: repeat(2, minmax(0, 1fr));
+          }
+      }
+      @media (max-width: 767px) {
+          [data-testid="stHeader"] {
+              height: 3rem;
+          }
+          .block-container {
+              width: 100%;
+              padding: 1rem .82rem 2.25rem;
+          }
+          .hero {
+              padding: 1.15rem 1rem;
+          }
+          .hero h1 {
+              max-width: none;
+              font-size: 1.72rem;
+          }
+          .hero-status {
+              align-items: flex-start;
+              font-size: .82rem;
+          }
+          .ops-kpi-grid {
+              grid-template-columns: minmax(0, 1fr);
+              gap: .65rem;
+              margin: .8rem 0 1.15rem;
+          }
+          .ops-kpi-card {
+              padding: .92rem 1rem;
+          }
+          .ops-kpi-value {
+              font-size: 1.42rem;
+          }
+          div[data-testid="stHorizontalBlock"] {
+              flex-direction: column !important;
+              flex-wrap: nowrap !important;
+              gap: .7rem !important;
+          }
+          div[data-testid="stHorizontalBlock"] > div[data-testid="stColumn"] {
+              width: 100% !important;
+              min-width: 0 !important;
+              flex: 1 1 auto !important;
+          }
+          div[data-testid="stMetric"] {
+              width: 100%;
+              padding: .9rem 1rem;
+          }
+          div[data-testid="stMetricValue"] {
+              font-size: 1.35rem;
+          }
+          [data-testid="stButton"] button {
+              width: 100%;
+          }
+          [data-testid="stTabs"] {
+              min-width: 0;
+          }
+          [data-testid="stTabs"] [data-baseweb="tab-panel"] {
+              padding-top: .75rem;
+          }
+          div[data-testid="stExpander"] summary {
+              padding: .8rem .85rem;
+          }
+          div[data-testid="stCode"] {
+              max-width: 100%;
+          }
+          div[data-testid="stCode"] code {
+              white-space: pre-wrap !important;
+              overflow-wrap: anywhere;
+              word-break: break-word;
+          }
+      }
+      @media (prefers-reduced-motion: reduce) {
+          *, *::before, *::after {
+              scroll-behavior: auto !important;
+              transition-duration: .01ms !important;
+              animation-duration: .01ms !important;
+              animation-iteration-count: 1 !important;
+          }
+      }
+      @media (prefers-reduced-transparency: reduce) {
+          [data-testid="stHeader"] {
+              background: var(--ops-bg);
+              backdrop-filter: none;
+              -webkit-backdrop-filter: none;
+          }
+      }
     </style>
     """,
     unsafe_allow_html=True,
 )
 cookie_controller = CookieController(key="dashboard_auth_cookies")
+
+
+def render_operations_overview(
+    *,
+    total_return: float,
+    realized_pnl: int,
+    book_value: int,
+    cash_lamports: int,
+    invested_lamports: int,
+    wallet_count: int,
+    position_count: int,
+    running: bool,
+) -> None:
+    """운영자가 모바일 상단에서 핵심 상태를 즉시 스캔하도록 표시한다."""
+    return_class = "positive" if total_return >= 0 else "negative"
+    status_class = "" if running else " status-off"
+    status_text = "프로세스 정상" if running else "점검 필요"
+    heartbeat_detail = "하트비트 🟢 · 2초 자동 갱신" if running else "하트비트 🔴 · 로그 확인 필요"
+    wallet_ratio = f"{wallet_count}/20"
+    wallet_detail = f"보유 포지션 {position_count}개 · 공급 기준 17개"
+    cards = (
+        (
+            "종합 수익률",
+            f"{total_return:+.2f}%",
+            f"실현 손익 {sol(realized_pnl):+.6f} SOL",
+            return_class,
+            "true",
+        ),
+        (
+            "감시 지갑",
+            wallet_ratio,
+            wallet_detail,
+            "",
+            "true",
+        ),
+        (
+            "프로세스 하트비트",
+            (
+                f'<span class="ops-kpi-live"><span class="status-dot{status_class}">'
+                f"</span>{html.escape(status_text)}</span>"
+            ),
+            heartbeat_detail,
+            "",
+            "true",
+        ),
+        (
+            "장부 기준 총자산",
+            f"{sol(book_value):.6f} SOL",
+            (
+                f"가상 현금 {sol(cash_lamports):.6f} · "
+                f"투입 {sol(invested_lamports):.6f}"
+            ),
+            "",
+            "false",
+        ),
+    )
+    markup = ['<section class="ops-kpi-grid" aria-label="핵심 운영 지표">']
+    for label, value, detail, value_class, emphasis in cards:
+        markup.append(
+            f'<article class="ops-kpi-card" data-emphasis="{emphasis}">'
+            f'<div class="ops-kpi-label">{html.escape(label)}</div>'
+            f'<div class="ops-kpi-value {value_class}">{value}</div>'
+            f'<div class="ops-kpi-detail">{html.escape(detail)}</div>'
+            "</article>"
+        )
+    markup.append("</section>")
+    st.markdown("".join(markup), unsafe_allow_html=True)
 
 
 def _update_auth_cookie(value: str | None) -> None:
@@ -881,18 +1252,30 @@ def live_dashboard() -> None:
     status_class = "" if running else " status-off"
     status_text = "수집 서비스 가동 중" if running else "서비스 로그 확인 필요"
     st.markdown(
-        f"""<div class="hero"><div class="eyebrow">SOLANA AI BOT · LIVE OPS</div>
-        <h1>실시간 운영 대시보드</h1><div class="muted">
-        <span class="status-dot{status_class}"></span>{status_text} · 2초 자동 갱신</div></div>""",
+        f"""
+        <header class="hero">
+          <div class="eyebrow">SOLANA AI BOT · LIVE OPS</div>
+          <h1>실시간 운영 대시보드</h1>
+          <div class="muted hero-status">
+            <span class="status-dot{status_class}"></span>
+            <span>{html.escape(status_text)}</span>
+            <span aria-hidden="true">·</span>
+            <span>2초 자동 갱신</span>
+          </div>
+        </header>
+        """,
         unsafe_allow_html=True,
     )
-    st.write("")
-
-    top = st.columns(4)
-    top[0].metric("종합 수익률", f"{total_return:+.2f}%", delta=f"{sol(realized_pnl):+.6f} SOL 실현", delta_color="normal")
-    top[1].metric("현재 가상 현금", f"{sol(cash_lamports):.6f} SOL", delta=f"시작 {DEFAULT_INITIAL_SOL:.2f} SOL")
-    top[2].metric("장부 기준 총자산", f"{sol(book_value):.6f} SOL", delta=f"투입 {sol(invested_lamports):.6f} SOL")
-    top[3].metric("감시 지갑", f"{len(wallets)}개", delta=f"보유 포지션 {len(positions)}개")
+    render_operations_overview(
+        total_return=total_return,
+        realized_pnl=realized_pnl,
+        book_value=book_value,
+        cash_lamports=cash_lamports,
+        invested_lamports=invested_lamports,
+        wallet_count=len(wallets),
+        position_count=len(positions),
+        running=running,
+    )
 
     degraded_positions = [
         position for position in positions.values()
