@@ -44,7 +44,7 @@ jobs:
 
             if sudo test -d /root/.pm2; then
               sudo env PM2_HOME=/root/.pm2 pm2 delete \
-                aibot-monitor aibot-risk-manager aibot-dashboard || true
+                aibot-monitor aibot-risk-manager aibot-dashboard wallet_feeder || true
               sudo env PM2_HOME=/root/.pm2 pm2 save --force || true
             fi
 
@@ -113,6 +113,7 @@ jobs:
             pm2 describe aibot-monitor >/dev/null
             pm2 describe aibot-risk-manager >/dev/null
             pm2 describe aibot-dashboard >/dev/null
+            pm2 describe wallet_feeder >/dev/null
 
             ownership_mismatch="$(find /var/www/aibot -xdev \
               \( ! -user deploy -o ! -group deploy \) -print -quit)"

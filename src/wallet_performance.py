@@ -14,6 +14,7 @@ from typing import Any
 import aiohttp
 from dotenv import load_dotenv
 
+from src import state_store
 from src.state_store import (
     atomic_write_json,
     migrate_json,
@@ -255,58 +256,75 @@ def ensure_performance_migrated() -> dict[str, Any]:
 
 
 def restore_expired_cooldowns(now: datetime | None = None) -> int:
-    """Return wallets to the candidate pool after 24 elapsed UTC hours."""
+    """기존 호출부와 호환되는 24시간 셀프 복구 진입점이다."""
+    return self_recovery_cooldown_wallets(now)
+
+
+def self_recovery_cooldown_wallets(now: datetime | None = None) -> int:
+    """24시간이 지난 격리 지갑을 누적 성과 보존 상태로 ACTIVE 전환한다."""
     current = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    current_iso = current.isoformat()
+    restored = 0
+    try:
+        cooling_wallets = state_store.get_wallets_by_status(STATUS_COOL_DOWN)
+    except Exception:
+        logger.exception("cool-down wallet self-recovery scan failed")
+        return 0
 
-    def mutate(state: dict[str, Any]) -> int:
-        restored = 0
-        for wallet, row in state.setdefault("wallets", {}).items():
-            if isinstance(row, dict) and row.get("evicted") is True:
-                legacy_reason = row.get("eviction_reason")
-                if legacy_reason:
-                    row["legacy_eviction_reason"] = legacy_reason
-                row["evicted"] = False
-                row.pop("eviction_reason", None)
-                row["status"] = STATUS_ACTIVE
-                row["safety_block_count"] = 0
-                row["scam_rejections"] = 0
-                row["safety_block_signatures"] = []
-                row["amnestied_at"] = current.isoformat()
-                state["late_legacy_evictions_amnestied_count"] = int(
-                    state.get("late_legacy_evictions_amnestied_count", 0)
-                ) + 1
-                restored += 1
-                continue
-            if not wallet_is_cooling_down(row):
-                continue
-            started = parse_utc_timestamp(row.get("cooldown_started_at"))
-            if started is None:
-                # A malformed timestamp must not release immediately or trap forever.
-                row["cooldown_started_at"] = current.isoformat()
-                row["cooldown_timestamp_repaired_at"] = current.isoformat()
-                continue
-            if (current - started).total_seconds() < COOLDOWN_SECONDS:
-                continue
-            row["status"] = STATUS_ACTIVE
-            row["cooldown_completed_at"] = current.isoformat()
-            row.pop("cooldown_started_at", None)
-            row.pop("cooldown_reason", None)
-            row["safety_block_count"] = 0
-            row["scam_rejections"] = 0
-            row["safety_block_signatures"] = []
-            row["evicted"] = False
-            restored += 1
-        state["updated_at"] = current.isoformat()
-        return restored
-
-    restored, _ = update_json(
-        PERFORMANCE_PATH,
-        {"schema_version": 3, "version": 0, "wallets": {}},
-        mutate,
-    )
+    for row in cooling_wallets:
+        address = str(row.get("address", "")).strip()
+        if not address:
+            logger.error("cool-down wallet self-recovery skipped: missing address")
+            continue
+        raw_started = row.get("cooldown_start_time")
+        if raw_started is None:
+            raw_started = row.get("cooldown_started_at")
+        started = parse_utc_timestamp(raw_started)
+        if started is None:
+            logger.error(
+                "cool-down wallet self-recovery skipped: invalid timestamp "
+                "wallet=%s cooldown_start_time=%r",
+                address,
+                raw_started,
+            )
+            continue
+        elapsed = (current - started).total_seconds()
+        if elapsed < COOLDOWN_SECONDS:
+            continue
+        try:
+            changed = state_store.set_wallet_status(
+                address,
+                STATUS_ACTIVE,
+                reset_metrics=False,
+                completed_at=current_iso,
+            )
+        except Exception:
+            logger.exception(
+                "cool-down wallet self-recovery update failed: wallet=%s "
+                "elapsed_seconds=%.3f",
+                address,
+                elapsed,
+            )
+            continue
+        if not changed:
+            logger.warning(
+                "cool-down wallet self-recovery lost update target: wallet=%s",
+                address,
+            )
+            continue
+        restored += 1
+        logger.info(
+            "cool-down wallet self-recovered: wallet=%s elapsed_seconds=%.3f "
+            "reset_metrics=False",
+            address,
+            elapsed,
+        )
     if restored:
-        logger.info("restored %s wallets after 24-hour cool-down", restored)
-    return int(restored)
+        logger.info(
+            "restored %s wallets after 24-hour cool-down without metric reset",
+            restored,
+        )
+    return restored
 
 
 async def record_paper_buy_success(wallet: str, mint: str, signature: str) -> None:

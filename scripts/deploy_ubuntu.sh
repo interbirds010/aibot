@@ -42,4 +42,5 @@ pm2 save
 pm2 describe aibot-monitor >/dev/null
 pm2 describe aibot-risk-manager >/dev/null
 pm2 describe aibot-dashboard >/dev/null
+pm2 describe wallet_feeder >/dev/null
 pm2 status

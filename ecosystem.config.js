@@ -49,5 +49,21 @@ module.exports = {
         PYTHONPATH: "/var/www/aibot",
       },
     },
+    {
+      name: "wallet_feeder",
+      cwd: "/var/www/aibot",
+      script: "src/wallet_feeder.py",
+      args: "--once",
+      interpreter: "/var/www/aibot/venv/bin/python",
+      instances: 1,
+      autorestart: false,
+      max_memory_restart: "180M",
+      kill_timeout: 10000,
+      env: {
+        PYTHONUNBUFFERED: "1",
+        PYTHONDONTWRITEBYTECODE: "1",
+        PYTHONPATH: "/var/www/aibot",
+      },
+    },
   ],
 };

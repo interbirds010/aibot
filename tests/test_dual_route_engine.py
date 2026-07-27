@@ -115,7 +115,7 @@ class MarketMomentumTests(unittest.TestCase):
             "baseToken": {"address": "MINT"},
             "txns": {"m5": {"buys": 20, "sells": 5}},
             "volume": {"m5": 12_000},
-            "liquidity": {"usd": 5_000},
+            "liquidity": {"usd": 7_500},
         }
         candidate = monitor.momentum_candidate_from_pair(pair)
         self.assertIsNotNone(candidate)
@@ -123,7 +123,7 @@ class MarketMomentumTests(unittest.TestCase):
         self.assertEqual(candidate.mint, "MINT")
         self.assertGreater(candidate.momentum_score, 0)
 
-        pair["liquidity"]["usd"] = 4_999
+        pair["liquidity"]["usd"] = 7_499
         self.assertIsNone(monitor.momentum_candidate_from_pair(pair))
 
     def test_route_a_never_inherits_relaxed_route_b_analysis(self) -> None:

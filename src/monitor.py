@@ -7,6 +7,7 @@ import contextlib
 import json
 import logging
 import os
+import subprocess
 import time
 from collections import defaultdict, deque
 from dataclasses import dataclass
@@ -19,6 +20,8 @@ import aiohttp
 from dotenv import load_dotenv
 from solders.pubkey import Pubkey
 from websockets.asyncio.client import ClientConnection, connect
+
+from src import state_store
 
 logger = logging.getLogger("smart-money-monitor")
 
@@ -38,12 +41,20 @@ DEX_SCREENER_BOOSTS_URL = "https://api.dexscreener.com/token-boosts/top/v1"
 DEX_SCREENER_TOKENS_URL = "https://api.dexscreener.com/tokens/v1/solana"
 MOMENTUM_MIN_VOLUME_M5_USD = 10_000.0
 MOMENTUM_MIN_NET_BUYS_M5 = 10
-MOMENTUM_MIN_LIQUIDITY_USD = 5_000.0
+MOMENTUM_MIN_LIQUIDITY_USD = 7_500.0
 MOMENTUM_MAX_DISCOVERY_TOKENS = 30
 MOMENTUM_MAX_CANDIDATES = 8
-MOMENTUM_ENTRY_COOLDOWN_SECONDS = 600.0
+MOMENTUM_ENTRY_COOLDOWN_SECONDS = 2_700.0
 UNKNOWN_WHALE_MIN_COUNT = 3
 UNKNOWN_WHALE_SIGNATURE_LIMIT = 12
+ROUTE_B_MIN_SAFETY_SCORE = 55
+ROUTE_B_MIN_LIQUIDITY_USD = 7_500.0
+ROUTE_B_MIN_LP_LOCKED_PERCENT = 40.0
+TOKEN_TRADE_COOLDOWN_SECONDS = 2_700.0
+WALLET_TARGET_COUNT = 20
+WALLET_FEEDER_TRIGGER_COUNT = 17
+WALLET_FEEDER_COOLDOWN_SECONDS = 7_200.0
+MONITOR_MAINTENANCE_INTERVAL_SECONDS = 60.0
 
 # On-chain feeder output is verified; fail closed if an old unverified row remains.
 TEST_ALLOW_UNVERIFIED_WALLETS = False
@@ -251,6 +262,156 @@ async def monitor_heartbeat(wallet_count: int) -> None:
         await asyncio.sleep(60)
 
 
+def _float_or_none(value: Any) -> float | None:
+    """외부 분석값을 유한한 실수로 안전하게 정규화한다."""
+    if value is None:
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if number != number or number in {float("inf"), float("-inf")}:
+        return None
+    return number
+
+
+def route_b_safety_filter(report: Any, mint: str) -> bool:
+    """B 경로의 강화된 안전점수, 유동성, LP 잠금 하한을 검증한다."""
+    safety_score = _float_or_none(getattr(report, "safety_score", None))
+    liquidity = _float_or_none(getattr(report, "liquidity_usd", None))
+    lp_locked = _float_or_none(getattr(report, "lp_locked_percent", None))
+    if safety_score is None or safety_score < ROUTE_B_MIN_SAFETY_SCORE:
+        logger.warning(
+            "FAIL_SAFETY_SCORE_UNDER_55 mint=%s safety_score=%s threshold=%s",
+            mint,
+            safety_score,
+            ROUTE_B_MIN_SAFETY_SCORE,
+        )
+        return False
+    if liquidity is None or liquidity < ROUTE_B_MIN_LIQUIDITY_USD:
+        logger.warning(
+            "FAIL_LIQUIDITY_UNDER_7500 mint=%s liquidity_usd=%s threshold=%s",
+            mint,
+            liquidity,
+            ROUTE_B_MIN_LIQUIDITY_USD,
+        )
+        return False
+    if lp_locked is None or lp_locked < ROUTE_B_MIN_LP_LOCKED_PERCENT:
+        logger.warning(
+            "FAIL_LP_LOCKED_UNDER_40 mint=%s lp_locked_percentage=%s threshold=%s",
+            mint,
+            lp_locked,
+            ROUTE_B_MIN_LP_LOCKED_PERCENT,
+        )
+        return False
+    return True
+
+
+def token_cooldown_is_active(mint: str, now: float | None = None) -> bool:
+    """공통 거래 원장을 기준으로 동일 토큰의 45분 재진입을 차단한다."""
+    current = float(now if now is not None else time.time())
+    try:
+        last_trade_time = float(state_store.get_last_trade_time(mint) or 0)
+    except Exception:
+        logger.exception("token cooldown lookup failed; fail-closed mint=%s", mint)
+        return True
+    elapsed = current - last_trade_time
+    if last_trade_time > 0 and elapsed < TOKEN_TRADE_COOLDOWN_SECONDS:
+        logger.info(
+            "FAIL_TOKEN_COOLDOWN_ACTIVE mint=%s elapsed_seconds=%.3f "
+            "required_seconds=%s last_trade_time=%.3f",
+            mint,
+            elapsed,
+            TOKEN_TRADE_COOLDOWN_SECONDS,
+            last_trade_time,
+        )
+        return True
+    return False
+
+
+def trigger_wallet_feeder_if_needed(now: float | None = None) -> bool:
+    """감시 지갑 부족 시 두 시간에 한 번만 PM2 공급기를 비동기 기동한다."""
+    current = float(now if now is not None else time.time())
+    try:
+        active_count = state_store.get_active_wallets_count()
+        if active_count > WALLET_FEEDER_TRIGGER_COUNT:
+            return False
+        raw_last_run = state_store.get_global_metric(
+            "last_wallet_feeder_run_time",
+            0,
+        )
+        try:
+            last_run = float(raw_last_run or 0)
+        except (TypeError, ValueError):
+            last_run = 0.0
+        elapsed = current - last_run
+        if elapsed < WALLET_FEEDER_COOLDOWN_SECONDS:
+            logger.info(
+                "wallet feeder trigger skipped: active_wallets=%s threshold=%s "
+                "cooldown_remaining_seconds=%.3f",
+                active_count,
+                WALLET_FEEDER_TRIGGER_COUNT,
+                WALLET_FEEDER_COOLDOWN_SECONDS - elapsed,
+            )
+            return False
+        if not state_store.claim_global_interval(
+            "last_wallet_feeder_run_time",
+            current,
+            WALLET_FEEDER_COOLDOWN_SECONDS,
+        ):
+            logger.info(
+                "wallet feeder trigger already claimed by another process: "
+                "active_wallets=%s",
+                active_count,
+            )
+            return False
+        subprocess.Popen(
+            ["pm2", "start", "wallet_feeder"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            close_fds=True,
+            start_new_session=True,
+        )
+        logger.warning(
+            "wallet feeder started asynchronously: active_wallets=%s "
+            "target_wallets=%s trigger_threshold=%s",
+            active_count,
+            WALLET_TARGET_COUNT,
+            WALLET_FEEDER_TRIGGER_COUNT,
+        )
+        return True
+    except FileNotFoundError:
+        logger.exception("wallet feeder trigger failed: pm2 executable not found")
+    except Exception:
+        logger.exception("wallet feeder trigger failed")
+    return False
+
+
+async def monitor_maintenance_loop() -> None:
+    """모니터 프로세스 안에서 쿨다운 복구와 공급 공백 복원을 수행한다."""
+    from src.wallet_performance import self_recovery_cooldown_wallets
+
+    while True:
+        started = time.monotonic()
+        try:
+            restored = self_recovery_cooldown_wallets()
+            if restored:
+                logger.info(
+                    "wallet cooldown self-recovery completed: restored=%s",
+                    restored,
+                )
+            trigger_wallet_feeder_if_needed()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("monitor maintenance cycle failed")
+        elapsed = time.monotonic() - started
+        await asyncio.sleep(
+            max(1.0, MONITOR_MAINTENANCE_INTERVAL_SECONDS - elapsed)
+        )
+
+
 def subscription_request(request_id: int, wallets: tuple[str, ...], program: str) -> dict[str, Any]:
     """Require one watched wallet AND the given DEX program at the RPC layer."""
     return {
@@ -337,6 +498,8 @@ async def process_paper_signal(
     """Run the rug gate, then record an executable Jupiter paper-buy quote."""
     async with _analysis_limit:
         try:
+            if requested_route == "B" and token_cooldown_is_active(mint):
+                return
             from src.analyzer import analyze_token
             from src.risk_manager import (
                 paper_cash_balance,
@@ -347,6 +510,8 @@ async def process_paper_signal(
 
             report = await analyze_token(mint)
             analysis_completed_at = datetime.now(timezone.utc).isoformat()
+            if requested_route == "B" and not route_b_safety_filter(report, mint):
+                return
             route_allowed = route_report_allowed(requested_route, report.route_type)
             if not route_allowed:
                 if requested_route == "A":
@@ -991,6 +1156,7 @@ async def run_service() -> None:
         run_forever(settings),
         performance_loop(),
         run_market_momentum_route(settings),
+        monitor_maintenance_loop(),
     )
 
 
