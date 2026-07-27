@@ -18,6 +18,7 @@ import streamlit as st
 import streamlit.components.v1 as components
 from dotenv import load_dotenv
 from streamlit_cookies_controller import CookieController
+from src.dashboard_clipboard import clipboard_button_document, clipboard_script
 from src.service_health import service_is_fresh as monitor_service_is_fresh
 from src.wallet_performance import MAX_RETURN_PERCENT, capped_return_percent
 
@@ -283,21 +284,6 @@ st.markdown(
       }
       [data-testid="stButton"] button:active {
           transform: translateY(1px);
-      }
-      div[data-testid="stElementContainer"]:has(.position-mint-column-marker) {
-          display: none;
-      }
-      div[data-testid="stColumn"]:has(.position-mint-column-marker)
-      div[data-testid="stCode"] pre {
-          overflow: hidden;
-      }
-      div[data-testid="stColumn"]:has(.position-mint-column-marker)
-      div[data-testid="stCode"] code {
-          display: block;
-          overflow: hidden;
-          padding-right: 2rem;
-          text-overflow: ellipsis;
-          white-space: nowrap !important;
       }
       @media (max-width: 1024px) {
           .block-container {
@@ -852,11 +838,12 @@ def render_position_rows(live_positions: list[dict[str, Any]]) -> None:
         mint = str(row["Mint 주소"])
         columns = st.columns(widths, vertical_alignment="center")
         columns[0].write(str(row["토큰"]))
-        columns[1].markdown(
-            '<span class="position-mint-column-marker"></span>',
-            unsafe_allow_html=True,
-        )
-        columns[1].code(mint, language=None, wrap_lines=False)
+        with columns[1]:
+            components.html(
+                clipboard_button_document(mint),
+                height=40,
+                scrolling=False,
+            )
         columns[2].write(f"{float(row['매수 수량']):.6f}")
         columns[3].write(format_token_price(row["매수 평단가(SOL)"]))
         columns[4].write(format_token_price(row["현재가(SOL)"]))
@@ -991,23 +978,12 @@ def render_trade_history_table(rows: list[dict[str, Any]]) -> None:
                   cursor: pointer; font-size: 17px; line-height: 1; }}
       .copy-ca:hover {{ color: #50e3ad; border-color: #50e3ad; }}
       .copy-ca.copied {{ color: #50e3ad; }}
+      .copy-ca.copy-failed {{ color: #ff7a83; border-color: #ff7a83; }}
     </style>
     <div class="table-wrap">
       <table><thead><tr>{header}</tr></thead><tbody>{''.join(body_rows)}</tbody></table>
     </div>
-    <script>
-      document.querySelectorAll('.copy-ca').forEach((button) => {{
-        button.addEventListener('click', async () => {{
-          await navigator.clipboard.writeText(button.dataset.ca);
-          button.textContent = '✓';
-          button.classList.add('copied');
-          setTimeout(() => {{
-            button.textContent = '⧉';
-            button.classList.remove('copied');
-          }}, 900);
-        }});
-      }});
-    </script>
+    <script>{clipboard_script()}</script>
     """
     components.html(document, height=405, scrolling=False)
 
