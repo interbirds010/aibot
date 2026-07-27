@@ -17,7 +17,7 @@ import aiohttp
 import streamlit as st
 import streamlit.components.v1 as components
 from dotenv import load_dotenv
-from streamlit_cookies_controller import CookieController
+from src.dashboard_auth import request_is_authenticated
 from src.dashboard_clipboard import clipboard_button_document, clipboard_script
 from src.service_health import service_is_fresh as monitor_service_is_fresh
 from src.wallet_performance import MAX_RETURN_PERCENT, capped_return_percent
@@ -380,9 +380,6 @@ st.markdown(
     """,
     unsafe_allow_html=True,
 )
-cookie_controller = CookieController(key="dashboard_auth_cookies")
-
-
 def render_operations_overview(
     *,
     total_return: float,
@@ -488,10 +485,13 @@ def require_dashboard_login() -> None:
     # Invalidate the previous URL bearer-token implementation immediately.
     if "_auth" in st.query_params:
         st.query_params.pop("_auth", None)
-    cookie_token = str(cookie_controller.get(DASHBOARD_AUTH_COOKIE) or "")
-    authenticated = (
-        st.session_state.get("dashboard_authenticated") is True
-        or hmac.compare_digest(cookie_token, expected_token)
+    authenticated = request_is_authenticated(
+        st.context.cookies,
+        DASHBOARD_AUTH_COOKIE,
+        expected_token,
+        session_authenticated=(
+            st.session_state.get("dashboard_authenticated") is True
+        ),
     )
     if authenticated:
         st.session_state["dashboard_authenticated"] = True

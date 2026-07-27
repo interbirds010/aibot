@@ -15,6 +15,5 @@ protobuf>=5,<7
 python-dotenv>=1.0,<2.0
 cryptography>=43,<47
 streamlit>=1.41,<2.0
-streamlit-cookies-controller==0.0.4
 
 # NOTE: asyncio is included with Python 3.10+ and must not be installed from PyPI.
