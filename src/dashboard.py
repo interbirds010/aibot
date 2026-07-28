@@ -18,6 +18,10 @@ import streamlit as st
 from dotenv import load_dotenv
 from src.dashboard_auth import request_is_authenticated
 from src.dashboard_clipboard import clipboard_button_document, clipboard_script
+from src.dashboard_progress import (
+    clear_manual_close_progress_document,
+    manual_close_progress_document,
+)
 from src.logging_utils import install_redacting_formatters, redact_sensitive_text
 from src.service_health import service_is_fresh as monitor_service_is_fresh
 from src.wallet_performance import MAX_RETURN_PERCENT, capped_return_percent
@@ -825,9 +829,6 @@ def position_rows(
 
 def render_position_rows(live_positions: list[dict[str, Any]]) -> None:
     """Render table-like position rows with a paper-only close action."""
-    message = st.session_state.pop("manual_close_message", None)
-    if message:
-        st.success(message)
     widths = [0.7, 1.5, 0.9, 1.0, 0.85, 0.85, 0.8, 0.8, 0.8, 0.85]
     headers = st.columns(widths)
     for column, label in zip(headers, (
@@ -870,6 +871,10 @@ def render_position_rows(live_positions: list[dict[str, Any]]) -> None:
                 )
                 st.rerun()
             except (aiohttp.ClientError, asyncio.TimeoutError, RuntimeError, ValueError) as exc:
+                st.html(
+                    clear_manual_close_progress_document(),
+                    unsafe_allow_javascript=True,
+                )
                 st.error(
                     "포지션 종료 실패: "
                     f"{redact_sensitive_text(exc)}"
@@ -1270,6 +1275,20 @@ def live_dashboard() -> None:
         st.warning(f"Jupiter 견적 또는 청산 확인이 필요한 포지션: {labels}")
 
     st.subheader("현재 보유 포지션 현황")
+    st.html(
+        manual_close_progress_document(),
+        unsafe_allow_javascript=True,
+    )
+    manual_close_message = st.session_state.pop(
+        "manual_close_message",
+        None,
+    )
+    if manual_close_message:
+        st.html(
+            clear_manual_close_progress_document(),
+            unsafe_allow_javascript=True,
+        )
+        st.success(manual_close_message)
     if live_positions:
         render_position_rows(live_positions)
     else:
