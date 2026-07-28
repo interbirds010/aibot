@@ -58,6 +58,43 @@ class WalletPerformanceIsolationTests(unittest.TestCase):
         self.assertEqual(row["processed_count"], 1)
         self.assertEqual(row["evaluation_pending_count"], 2)
 
+    def test_no_route_skip_removes_pending_without_changing_performance(self):
+        asyncio.run(
+            performance.observe_buy(
+                "wallet-a",
+                "mint-a",
+                10,
+                SOL,
+                "signature-a",
+            )
+        )
+        state = json.loads(
+            performance.PERFORMANCE_PATH.read_text(encoding="utf-8")
+        )
+        sample = dict(state["wallets"]["wallet-a"]["pending"][0])
+
+        self.assertTrue(
+            performance.skip_observation("wallet-a", sample)
+        )
+        self.assertFalse(
+            performance.skip_observation("wallet-a", sample)
+        )
+
+        state = json.loads(
+            performance.PERFORMANCE_PATH.read_text(encoding="utf-8")
+        )
+        row = state["wallets"]["wallet-a"]
+        self.assertEqual(row["processed_count"], 1)
+        self.assertEqual(row["evaluation_pending_count"], 0)
+        self.assertEqual(row["evaluation_skipped_count"], 1)
+        self.assertEqual(row["wins"], 0)
+        self.assertEqual(row["losses"], 0)
+        self.assertEqual(row["samples"], [])
+        self.assertEqual(
+            row["last_evaluation_skip"]["reason"],
+            "NO_ROUTE_PERFORMANCE",
+        )
+
 
 class WalletFeederRankingTests(unittest.TestCase):
     def test_rank_combines_copy_success_and_raw_onchain_performance(self):

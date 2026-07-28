@@ -22,6 +22,7 @@ from solders.pubkey import Pubkey
 from websockets.asyncio.client import ClientConnection, connect
 
 from src import state_store
+from src.logging_utils import configure_safe_logging, redact_sensitive_text
 
 logger = logging.getLogger("smart-money-monitor")
 
@@ -582,7 +583,7 @@ async def process_paper_signal(
                     )
                     exit_price_impact = validate_exit_price_impact(exit_quote)
                 except RuntimeError as exc:
-                    reason = str(exc)
+                    reason = redact_sensitive_text(exc)
                     rejection_reason = (
                         reason
                         if reason.startswith("[ENTRY_REJECTED]")
@@ -651,7 +652,7 @@ async def process_paper_signal(
                 report.safety_score, wallet, signature,
             )
         except RuntimeError as exc:
-            reason = str(exc)
+            reason = redact_sensitive_text(exc)
             if (
                 "failed after 3 attempts" in reason
                 or "getTokenSupply failed" in reason
@@ -659,7 +660,11 @@ async def process_paper_signal(
             ):
                 from src.risk_manager import record_rpc_skip
                 await record_rpc_skip(mint, wallet, signature, reason)
-            logger.info("paper signal skipped: mint=%s reason=%s", mint, exc)
+            logger.info(
+                "paper signal skipped: mint=%s reason=%s",
+                mint,
+                redact_sensitive_text(exc),
+            )
         except Exception:
             logger.exception("paper signal processing failed: mint=%s", mint)
 
@@ -1235,10 +1240,7 @@ async def run_service() -> None:
 
 
 def main() -> None:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    )
+    configure_safe_logging()
     asyncio.run(run_service())
 
 

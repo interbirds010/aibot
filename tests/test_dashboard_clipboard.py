@@ -1,4 +1,5 @@
 import unittest
+from pathlib import Path
 
 from src.dashboard_clipboard import clipboard_button_document, clipboard_script
 
@@ -21,6 +22,15 @@ class DashboardClipboardTests(unittest.TestCase):
         self.assertNotIn(address, document)
         self.assertIn("Mint&quot;&lt;u…56789", document)
         self.assertIn("copyCaText", document)
+
+    def test_dashboard_uses_current_streamlit_html_api(self):
+        dashboard = (
+            Path(__file__).resolve().parents[1] / "src" / "dashboard.py"
+        ).read_text(encoding="utf-8")
+        self.assertNotIn("streamlit.components.v1", dashboard)
+        self.assertNotIn("components.html(", dashboard)
+        self.assertIn("st.html(", dashboard)
+        self.assertIn("unsafe_allow_javascript=True", dashboard)
 
 
 if __name__ == "__main__":

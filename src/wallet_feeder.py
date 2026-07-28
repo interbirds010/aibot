@@ -17,6 +17,7 @@ from typing import Any
 
 import aiohttp
 from dotenv import load_dotenv
+from src.logging_utils import configure_safe_logging, redact_sensitive_text
 from solders.pubkey import Pubkey
 from src.wallet_performance import (
     capped_return_percent,
@@ -199,7 +200,10 @@ async def candidate_wallets(rpc: RpcClient, settings: FeederSettings) -> list[st
     signatures: list[str] = []
     for batch in batches:
         if isinstance(batch, BaseException):
-            logger.warning("DEX signature scan skipped: %s", batch)
+            logger.warning(
+                "DEX signature scan skipped: %s",
+                redact_sensitive_text(batch),
+            )
             continue
         signatures.extend(str(row["signature"]) for row in batch or [] if row.get("signature"))
     signatures = list(dict.fromkeys(signatures))[: settings.max_candidates]
@@ -467,7 +471,11 @@ async def refresh(settings: FeederSettings) -> list[WalletScore]:
                 fallback_count += 1
                 logger.warning("incumbent RPC validation failed; preserving snapshot wallet=%s", address)
             else:
-                logger.warning("candidate validation skipped wallet=%s error=%s", address, result)
+                logger.warning(
+                    "candidate validation skipped wallet=%s error=%s",
+                    address,
+                    redact_sensitive_text(result),
+                )
     qualified.sort(key=score_rank, reverse=True)
     selected = select_active_wallets(qualified, set(existing_by_address), settings)
     write_results(qualified, selected, settings)
@@ -506,7 +514,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--once", action="store_true", help="refresh once and exit")
     args = parser.parse_args()
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    configure_safe_logging()
     asyncio.run(scheduler(FeederSettings.from_env(), args.once))
 
 

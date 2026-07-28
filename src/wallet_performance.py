@@ -15,6 +15,7 @@ import aiohttp
 from dotenv import load_dotenv
 
 from src import state_store
+from src.logging_utils import redact_sensitive_text
 from src.state_store import (
     atomic_write_json,
     migrate_json,
@@ -530,12 +531,58 @@ def fail_observation(wallet: str, sample: dict[str, Any], error: Exception) -> N
             "status": "PENDING",
             "evaluation_attempts": attempts,
             "next_retry_at": time.time() + min(3600, 60 * (2 ** min(attempts - 1, 6))),
-            "last_error": f"{type(error).__name__}: {error}"[:500],
+            "last_error": redact_sensitive_text(
+                f"{type(error).__name__}: {error}"
+            )[:500],
         })
         sync_pipeline_counts(row)
         state["updated_at"] = datetime.now(timezone.utc).isoformat()
 
     update_json(PERFORMANCE_PATH, {"wallets": {}}, mutate)
+
+
+def skip_observation(
+    wallet: str,
+    sample: dict[str, Any],
+    reason: str = "NO_ROUTE_PERFORMANCE",
+) -> bool:
+    """종결 경로 부재 표본을 승패에 반영하지 않고 pending에서 제거한다."""
+    observation_id = str(
+        sample.get("observation_id")
+        or f"{sample.get('signature')}:{sample.get('mint')}"
+    )
+
+    def mutate(state: dict[str, Any]) -> bool:
+        row = wallet_row(state, wallet)
+        target = next((
+            item
+            for item in row.get("pending", [])
+            if str(
+                item.get("observation_id")
+                or f"{item.get('signature')}:{item.get('mint')}"
+            )
+            == observation_id
+        ), None)
+        if not isinstance(target, dict):
+            return False
+        row["pending"] = [
+            item for item in row["pending"] if item is not target
+        ]
+        row["evaluation_skipped_count"] = (
+            int(row.get("evaluation_skipped_count", 0) or 0) + 1
+        )
+        row["last_evaluation_skip"] = {
+            "observation_id": observation_id,
+            "mint": str(target.get("mint", "")),
+            "reason": reason,
+            "at": datetime.now(timezone.utc).isoformat(),
+        }
+        sync_pipeline_counts(row)
+        state["updated_at"] = datetime.now(timezone.utc).isoformat()
+        return True
+
+    skipped, _ = update_json(PERFORMANCE_PATH, {"wallets": {}}, mutate)
+    return bool(skipped)
 
 
 async def legacy_probe_amount(
@@ -571,7 +618,7 @@ async def performance_loop(interval_seconds: float = 60) -> None:
     if not rpc_url:
         logger.warning("wallet performance evaluator disabled: Helius RPC URL is missing")
         return
-    from src.executor import WSOL_MINT, jupiter_quote
+    from src.executor import JupiterNoRouteError, WSOL_MINT, jupiter_quote
 
     timeout = aiohttp.ClientTimeout(total=15)
     async with aiohttp.ClientSession(timeout=timeout) as session:
@@ -586,17 +633,32 @@ async def performance_loop(interval_seconds: float = 60) -> None:
                             session, rpc_url, str(sample["mint"])
                         )
                     quote = await jupiter_quote(
-                        session, api_key, str(sample["mint"]), WSOL_MINT, amount
+                        session,
+                        api_key,
+                        str(sample["mint"]),
+                        WSOL_MINT,
+                        amount,
+                        fail_fast_bad_request=True,
                     )
                     current_price = int(quote["outAmount"]) / amount
                     reason = complete_observation(wallet, sample, current_price)
                     if reason:
                         cooldowns.append((wallet, reason))
+                except JupiterNoRouteError:
+                    if skip_observation(wallet, sample):
+                        logger.info(
+                            "wallet observation skipped: wallet=%s mint=%s "
+                            "reason=NO_ROUTE_PERFORMANCE",
+                            wallet,
+                            sample.get("mint"),
+                        )
                 except Exception as exc:
                     fail_observation(wallet, sample, exc)
                     logger.warning(
                         "wallet observation retry scheduled: wallet=%s mint=%s error=%s",
-                        wallet, sample.get("mint"), exc,
+                        wallet,
+                        sample.get("mint"),
+                        redact_sensitive_text(exc),
                     )
             for wallet, reason in cooldowns:
                 cooldown_and_replace(wallet, reason)

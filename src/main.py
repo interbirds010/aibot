@@ -7,6 +7,7 @@ import os
 from src.collectors.helius_ws import stream_logs
 from src.config import Settings
 from src.models import ChainEvent
+from src.logging_utils import configure_safe_logging
 from src.monitor import DEX_PROGRAMS
 from src.pipeline import consume_events
 from src.risk_manager import run_risk_loop
@@ -38,10 +39,7 @@ async def run() -> None:
 
 
 def main() -> None:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    )
+    configure_safe_logging()
     asyncio.run(run())
 
 

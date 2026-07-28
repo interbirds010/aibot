@@ -14,6 +14,7 @@ from typing import Any
 import aiohttp
 from dotenv import load_dotenv
 from solders.pubkey import Pubkey
+from src.logging_utils import configure_safe_logging, redact_sensitive_text
 
 RUGCHECK_BASE = "https://api.rugcheck.xyz/v1/tokens"
 ROUTE_B_MINIMUM_LIQUIDITY_USD = Decimal("10000")
@@ -82,11 +83,12 @@ async def rpc_call(
                 attempt_index + 1,
                 RPC_MAX_ATTEMPTS,
                 delay,
-                str(exc)[:300],
+                redact_sensitive_text(exc)[:300],
             )
             await asyncio.sleep(delay)
     raise RuntimeError(
-        f"{method} failed after {RPC_MAX_ATTEMPTS} attempts: {last_error}"
+        f"{method} failed after {RPC_MAX_ATTEMPTS} attempts: "
+        f"{redact_sensitive_text(last_error)}"
     ) from last_error
 
 
@@ -343,6 +345,7 @@ async def async_main(mint: str) -> int:
 
 
 def main() -> None:
+    configure_safe_logging()
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("mint", help="SPL token Mint address (CA)")
     args = parser.parse_args()

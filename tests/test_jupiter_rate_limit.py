@@ -134,6 +134,50 @@ class JupiterRateLimitTests(unittest.TestCase):
         self.assertIn("exponential-fallback", logs)
         self.assertNotIn(api_key, logs)
 
+    def test_performance_bad_request_fails_fast_without_retry(self) -> None:
+        session = _Session([_Response(400, {})])
+
+        async def scenario() -> None:
+            with patch.object(
+                executor,
+                "_wait_for_global_jupiter_slot",
+                new=AsyncMock(),
+            ):
+                await executor.jupiter_quote(
+                    session,
+                    "key",
+                    "INPUT",
+                    "OUTPUT",
+                    100,
+                    fail_fast_bad_request=True,
+                )
+
+        with self.assertRaises(executor.JupiterNoRouteError):
+            asyncio.run(scenario())
+        self.assertEqual(session.responses, [])
+
+    def test_performance_empty_route_is_terminal_no_route(self) -> None:
+        session = _Session([_Response(200, {"routePlan": [], "outAmount": "0"})])
+
+        async def scenario() -> None:
+            with patch.object(
+                executor,
+                "_wait_for_global_jupiter_slot",
+                new=AsyncMock(),
+            ):
+                await executor.jupiter_quote(
+                    session,
+                    "key",
+                    "INPUT",
+                    "OUTPUT",
+                    100,
+                    fail_fast_bad_request=True,
+                )
+
+        with self.assertRaises(executor.JupiterNoRouteError):
+            asyncio.run(scenario())
+        self.assertEqual(session.responses, [])
+
 
 if __name__ == "__main__":
     unittest.main()

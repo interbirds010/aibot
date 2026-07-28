@@ -18,6 +18,7 @@ from src.executor import (
     execute_sell,
     jupiter_quote,
 )
+from src.logging_utils import configure_safe_logging, redact_sensitive_text
 from src.state_store import (
     migrate_json,
     normalized_route_metadata,
@@ -685,7 +686,9 @@ async def record_quote_failure(mint: str, position_id: str, error: Exception) ->
             return None
         failures = int(position.get("consecutive_quote_failures", 0)) + 1
         position["consecutive_quote_failures"] = failures
-        position["last_quote_error"] = f"{type(error).__name__}: {error}"[:500]
+        position["last_quote_error"] = redact_sensitive_text(
+            f"{type(error).__name__}: {error}"
+        )[:500]
         position["last_quote_failure_at"] = utc_now()
         last_success = parse_time(position.get("last_quote_success_at"))
         quote_gap = (
@@ -1017,10 +1020,7 @@ async def run_risk_loop(paper_trading: bool = True) -> None:
 
 def main() -> None:
     """Run the risk manager as a standalone PM2 service."""
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    )
+    configure_safe_logging()
     asyncio.run(run_risk_loop(paper_trading=True))
 
 

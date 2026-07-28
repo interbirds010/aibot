@@ -15,10 +15,10 @@ from typing import Any
 
 import aiohttp
 import streamlit as st
-import streamlit.components.v1 as components
 from dotenv import load_dotenv
 from src.dashboard_auth import request_is_authenticated
 from src.dashboard_clipboard import clipboard_button_document, clipboard_script
+from src.logging_utils import install_redacting_formatters, redact_sensitive_text
 from src.service_health import service_is_fresh as monitor_service_is_fresh
 from src.wallet_performance import MAX_RETURN_PERCENT, capped_return_percent
 
@@ -33,6 +33,7 @@ WSOL_MINT = "So11111111111111111111111111111111111111112"
 DEFAULT_INITIAL_SOL = 10.0
 KST = timezone(timedelta(hours=9), name="KST")
 load_dotenv()
+install_redacting_formatters()
 DASHBOARD_AUTH_COOKIE = "solana_ai_bot_auth"
 
 
@@ -457,7 +458,7 @@ def _update_auth_cookie(value: str | None) -> None:
         else ""
     )
     max_age = 0 if value is None else 60 * 60 * 12
-    components.html(
+    st.html(
         f"""
         <script>
           document.cookie =
@@ -466,7 +467,7 @@ def _update_auth_cookie(value: str | None) -> None:
           window.parent.location.reload();
         </script>
         """,
-        height=0,
+        unsafe_allow_javascript=True,
     )
 
 
@@ -839,10 +840,9 @@ def render_position_rows(live_positions: list[dict[str, Any]]) -> None:
         columns = st.columns(widths, vertical_alignment="center")
         columns[0].write(str(row["토큰"]))
         with columns[1]:
-            components.html(
+            st.html(
                 clipboard_button_document(mint),
-                height=40,
-                scrolling=False,
+                unsafe_allow_javascript=True,
             )
         columns[2].write(f"{float(row['매수 수량']):.6f}")
         columns[3].write(format_token_price(row["매수 평단가(SOL)"]))
@@ -870,7 +870,10 @@ def render_position_rows(live_positions: list[dict[str, Any]]) -> None:
                 )
                 st.rerun()
             except (aiohttp.ClientError, asyncio.TimeoutError, RuntimeError, ValueError) as exc:
-                st.error(f"포지션 종료 실패: {exc}")
+                st.error(
+                    "포지션 종료 실패: "
+                    f"{redact_sensitive_text(exc)}"
+                )
         st.divider()
 
 
@@ -985,7 +988,7 @@ def render_trade_history_table(rows: list[dict[str, Any]]) -> None:
     </div>
     <script>{clipboard_script()}</script>
     """
-    components.html(document, height=405, scrolling=False)
+    st.html(document, unsafe_allow_javascript=True)
 
 
 def position_trade_groups(

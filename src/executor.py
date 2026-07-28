@@ -27,6 +27,7 @@ from solders.pubkey import Pubkey
 from solders.transaction import VersionedTransaction
 
 from src.analyzer import analyze_token
+from src.logging_utils import configure_safe_logging, redact_sensitive_text
 from src.state_store import (
     atomic_write_json,
     exclusive_file_lock,
@@ -66,6 +67,10 @@ MAX_ENTRY_PRICE_IMPACT_PCT = 1.5
 MAX_EXIT_PRICE_IMPACT_PCT = 3.5
 logger = logging.getLogger("executor")
 _last_successful_tip_lamports: int | None = None
+
+
+class JupiterNoRouteError(RuntimeError):
+    """Jupiter가 실행 가능한 경로를 만들 수 없는 종결 오류다."""
 
 
 def entry_price_impact_pct(quote: dict[str, Any]) -> float:
@@ -291,6 +296,7 @@ async def jupiter_quote(
     amount: int,
     *,
     slippage_bps: int = 100,
+    fail_fast_bad_request: bool = False,
 ) -> dict[str, Any]:
     if not 0 <= int(slippage_bps) <= 10_000:
         raise ValueError("slippage_bps must be between 0 and 10000")
@@ -310,6 +316,10 @@ async def jupiter_quote(
             async with session.get(
                 f"{JUPITER_BASE}/quote", params=params, headers=headers
             ) as response:
+                if response.status == 400 and fail_fast_bad_request:
+                    raise JupiterNoRouteError(
+                        "Jupiter returned HTTP 400 without an executable route"
+                    )
                 if response.status != 429 and response.status < 500:
                     response.raise_for_status()
                     quote = await response.json()
@@ -356,6 +366,10 @@ async def jupiter_quote(
             f"Jupiter quote failed after 3 attempts: {last_error or 'no response'}"
         ) from last_error
     if not quote.get("routePlan") or int(quote.get("outAmount", "0")) <= 0:
+        if fail_fast_bad_request:
+            raise JupiterNoRouteError(
+                "Jupiter returned no executable route"
+            )
         raise RuntimeError("Jupiter returned no executable route")
     return quote
 
@@ -515,7 +529,11 @@ async def dynamic_jito_tip(
     except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, TypeError) as exc:
         requested = _last_successful_tip_lamports or JITO_FALLBACK_TIP_LAMPORTS
         source = "recent_success" if _last_successful_tip_lamports else "fallback_0.002_sol"
-        logger.warning("Jito tip floor unavailable; using %s: %s", source, exc)
+        logger.warning(
+            "Jito tip floor unavailable; using %s: %s",
+            source,
+            redact_sensitive_text(exc),
+        )
     selected = max(JITO_MIN_TIP_LAMPORTS, min(requested, cap))
     logger.info(
         "Jito dynamic tip: urgency=%s percentile=%.1f requested=%d cap=%d selected=%d source=%s",
@@ -601,7 +619,11 @@ async def execute_live_swap(
             consumed, COMPUTE_UNIT_MARGIN, limit,
         )
     except Exception as exc:
-        events.append(lifecycle_event("FAILED", stage="SIMULATION", error=str(exc)[:500]))
+        events.append(lifecycle_event(
+            "FAILED",
+            stage="SIMULATION",
+            error=redact_sensitive_text(exc)[:500],
+        ))
         return ExecutionResult(
             False, False, mint, input_amount, status="FAILED",
             jito_tip_lamports=tip, lifecycle=tuple(events),
@@ -612,7 +634,11 @@ async def execute_live_swap(
             "SUBMITTED", bundle_id=bundle_id, signature=signature
         ))
     except Exception as exc:
-        events.append(lifecycle_event("FAILED", stage="SUBMISSION", error=str(exc)[:500]))
+        events.append(lifecycle_event(
+            "FAILED",
+            stage="SUBMISSION",
+            error=redact_sensitive_text(exc)[:500],
+        ))
         return ExecutionResult(
             False, False, mint, input_amount, signature=signature, status="FAILED",
             compute_units_consumed=consumed, compute_unit_limit=limit,
@@ -626,13 +652,20 @@ async def execute_live_swap(
             consumed, limit, tip, tuple(events),
         )
     except TimeoutError as exc:
-        events.append(lifecycle_event("UNKNOWN", error=str(exc)[:500]))
+        events.append(lifecycle_event(
+            "UNKNOWN",
+            error=redact_sensitive_text(exc)[:500],
+        ))
         return ExecutionResult(
             True, False, mint, input_amount, bundle_id, signature, "UNKNOWN",
             consumed, limit, tip, tuple(events),
         )
     except Exception as exc:
-        events.append(lifecycle_event("FAILED", stage="CONFIRMATION", error=str(exc)[:500]))
+        events.append(lifecycle_event(
+            "FAILED",
+            stage="CONFIRMATION",
+            error=redact_sensitive_text(exc)[:500],
+        ))
         return ExecutionResult(
             True, False, mint, input_amount, bundle_id, signature, "FAILED",
             consumed, limit, tip, tuple(events),
@@ -767,6 +800,7 @@ async def async_main(mint: str) -> int:
 
 
 def main() -> None:
+    configure_safe_logging()
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("mint", help="SPL token Mint address to buy")
     args = parser.parse_args()
