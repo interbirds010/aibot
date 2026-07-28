@@ -31,13 +31,13 @@ class DualRouteSelectionTests(unittest.TestCase):
 
     def test_route_b_uses_fifteen_percent_size(self) -> None:
         self.assertEqual(self.route("0", "10000"), "B")
-        self.assertEqual(self.route("80", "5000"), "B")
+        self.assertEqual(self.route("0", "10000"), "B")
         self.assertEqual(executor.route_sized_amount(10_000, "B"), 1_500)
         with self.assertRaises(ValueError):
             executor.route_sized_amount(10_000, "UNKNOWN")
 
     def test_route_b_fails_closed_for_low_liquidity_or_live_authority(self) -> None:
-        self.assertIsNone(self.route("0", "4999.99"))
+        self.assertIsNone(self.route("0", "9999.99"))
         self.assertIsNone(self.route("0", "10000", authority=False))
 
 
@@ -113,18 +113,59 @@ class MarketMomentumTests(unittest.TestCase):
             "chainId": "solana",
             "pairAddress": "PAIR",
             "baseToken": {"address": "MINT"},
-            "txns": {"m5": {"buys": 20, "sells": 5}},
-            "volume": {"m5": 12_000},
-            "liquidity": {"usd": 7_500},
+            "txns": {"m5": {"buys": 25, "sells": 10}},
+            "volume": {"m5": 15_000},
+            "liquidity": {"usd": 10_000},
+            "pairCreatedAt": 1_000_000,
         }
-        candidate = monitor.momentum_candidate_from_pair(pair)
+        candidate = monitor.momentum_candidate_from_pair(
+            pair,
+            now_ms=1_900_000,
+        )
         self.assertIsNotNone(candidate)
         assert candidate is not None
         self.assertEqual(candidate.mint, "MINT")
         self.assertGreater(candidate.momentum_score, 0)
 
-        pair["liquidity"]["usd"] = 7_499
-        self.assertIsNone(monitor.momentum_candidate_from_pair(pair))
+        pair["liquidity"]["usd"] = 9_999
+        self.assertIsNone(
+            monitor.momentum_candidate_from_pair(pair, now_ms=1_900_000)
+        )
+
+    def test_pair_requires_all_burst_conditions_and_minimum_age(self) -> None:
+        pair = {
+            "chainId": "solana",
+            "pairAddress": "PAIR",
+            "baseToken": {"address": "MINT"},
+            "txns": {"m5": {"buys": 34, "sells": 10}},
+            "volume": {"m5": 15_000},
+            "liquidity": {"usd": 10_000},
+            "pairCreatedAt": 1_000_000,
+        }
+        self.assertIsNotNone(
+            monitor.momentum_candidate_from_pair(pair, now_ms=1_900_000)
+        )
+        pair["volume"]["m5"] = 14_999.99
+        self.assertIsNone(
+            monitor.momentum_candidate_from_pair(pair, now_ms=1_900_000)
+        )
+        pair["volume"]["m5"] = 15_000
+        pair["txns"]["m5"] = {"buys": 24, "sells": 10}
+        self.assertIsNone(
+            monitor.momentum_candidate_from_pair(pair, now_ms=1_900_000)
+        )
+        pair["txns"]["m5"] = {"buys": 34, "sells": 10}
+        self.assertIsNone(
+            monitor.momentum_candidate_from_pair(pair, now_ms=1_899_999)
+        )
+        pair["txns"]["m5"] = {"buys": 35, "sells": 20}
+        self.assertIsNone(
+            monitor.momentum_candidate_from_pair(pair, now_ms=1_900_000)
+        )
+        pair["txns"]["m5"] = {"buys": 36, "sells": 20}
+        self.assertIsNotNone(
+            monitor.momentum_candidate_from_pair(pair, now_ms=1_900_000)
+        )
 
     def test_route_a_never_inherits_relaxed_route_b_analysis(self) -> None:
         self.assertTrue(monitor.route_report_allowed("A", "A"))

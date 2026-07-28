@@ -16,7 +16,7 @@ from dotenv import load_dotenv
 from solders.pubkey import Pubkey
 
 RUGCHECK_BASE = "https://api.rugcheck.xyz/v1/tokens"
-ROUTE_B_MINIMUM_LIQUIDITY_USD = Decimal("5000")
+ROUTE_B_MINIMUM_LIQUIDITY_USD = Decimal("10000")
 RPC_MAX_ATTEMPTS = 3
 logger = logging.getLogger("analyzer")
 

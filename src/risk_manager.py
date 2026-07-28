@@ -52,6 +52,44 @@ def parse_time(value: Any) -> datetime | None:
     return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
 
 
+def _legacy_break_even_required_value(
+    position: dict[str, Any],
+    token_amount_raw: int | None = None,
+) -> int:
+    """구버전 포지션은 최초 매수가를 기준으로 필요한 매도대금을 계산한다."""
+    amount = int(
+        position.get("token_amount_raw", 0)
+        if token_amount_raw is None
+        else token_amount_raw
+    )
+    entry_amount = int(
+        position.get("entry_token_amount_raw", amount) or amount
+    )
+    entry_cost = int(
+        position.get(
+            "entry_cost_lamports",
+            position.get("remaining_cost_lamports", 0),
+        )
+        or 0
+    )
+    if amount <= 0 or entry_amount <= 0 or entry_cost <= 0:
+        return 0
+    return (entry_cost * amount + entry_amount - 1) // entry_amount
+
+
+def break_even_required_value(
+    position: dict[str, Any],
+    token_amount_raw: int | None = None,
+) -> int:
+    """동적 floor가 있으면 사용하고, 없으면 최초 매수가로 하위 호환한다."""
+    if "break_even_required_proceeds_lamports" in position:
+        return max(
+            0,
+            int(position.get("break_even_required_proceeds_lamports", 0) or 0),
+        )
+    return _legacy_break_even_required_value(position, token_amount_raw)
+
+
 def empty_ledger() -> dict[str, Any]:
     return {
         "schema_version": 2,
@@ -111,6 +149,28 @@ def _normalize_position(
         "break_even_floor_active": bool(
             position.get("break_even_floor_active", position.get("take_profit_done", False))
         ),
+        "break_even_price": float(
+            position.get(
+                "break_even_price",
+                (
+                    int(position.get("entry_cost_lamports", cost) or cost)
+                    / int(position.get("entry_token_amount_raw", amount) or amount)
+                    if int(position.get("entry_token_amount_raw", amount) or amount) > 0
+                    else 0.0
+                ),
+            )
+            or 0.0
+        ),
+        "break_even_required_proceeds_lamports": int(
+            position.get(
+                "break_even_required_proceeds_lamports",
+                _legacy_break_even_required_value(position, amount),
+            )
+            or 0
+        ),
+        "cumulative_proceeds_lamports": int(
+            position.get("cumulative_proceeds_lamports", 0) or 0
+        ),
         "version": int(position.get("version", 1) or 1),
     })
 
@@ -127,6 +187,33 @@ def migrate_ledger_document(document: dict[str, Any]) -> bool:
                 changed = True
             if "dex_momentum_score" not in position:
                 position["dex_momentum_score"] = 0.0
+                changed = True
+            if "break_even_price" not in position:
+                entry_amount = int(
+                    position.get(
+                        "entry_token_amount_raw",
+                        position.get("token_amount_raw", 0),
+                    )
+                    or 0
+                )
+                entry_cost = int(
+                    position.get(
+                        "entry_cost_lamports",
+                        position.get("remaining_cost_lamports", 0),
+                    )
+                    or 0
+                )
+                position["break_even_price"] = (
+                    entry_cost / entry_amount if entry_amount > 0 else 0.0
+                )
+                changed = True
+            if "break_even_required_proceeds_lamports" not in position:
+                position["break_even_required_proceeds_lamports"] = (
+                    _legacy_break_even_required_value(position)
+                )
+                changed = True
+            if "cumulative_proceeds_lamports" not in position:
+                position["cumulative_proceeds_lamports"] = 0
                 changed = True
         for event in document.get("events", []):
             if not isinstance(event, dict) or event.get("type") != "BUY":
@@ -216,6 +303,7 @@ async def record_paper_buy(
     analysis_completed_at: str | None = None,
     entry_quote_at: str | None = None,
     entry_price_impact_pct: float = 0.0,
+    exit_price_impact_pct: float = 0.0,
     expected_slippage_bps: int = 100,
     whale_reference_price: float = 0.0,
     copy_price_gap_pct: float = 0.0,
@@ -272,6 +360,7 @@ async def record_paper_buy(
             "analysis_completed_at": analysis_completed_at or quote_at,
             "entry_quote_at": quote_at,
             "entry_price_impact_pct": float(entry_price_impact_pct),
+            "exit_price_impact_pct": float(exit_price_impact_pct),
             "expected_slippage_bps": int(expected_slippage_bps),
             "whale_reference_price": float(whale_reference_price),
             "copy_price_gap_pct": float(copy_price_gap_pct),
@@ -299,6 +388,9 @@ async def record_paper_buy(
                 else STOP_LOSS_RATIO
             ),
             "break_even_floor_active": False,
+            "break_even_price": cost_lamports / token_amount_raw,
+            "break_even_required_proceeds_lamports": cost_lamports,
+            "cumulative_proceeds_lamports": 0,
             "version": 1,
             **metadata,
         }
@@ -422,6 +514,7 @@ async def record_paper_sell(
     exit_id: str | None = None,
     trigger_roi_percent: float | None = None,
     quote_age_ms: int | None = None,
+    exit_trigger_latency_ms: int | None = None,
 ) -> bool:
     ensure_ledger_migrated()
 
@@ -443,6 +536,11 @@ async def record_paper_sell(
         realized_roi = realized_pnl / cost_released * 100 if cost_released > 0 else 0.0
         position["token_amount_raw"] = previous_amount - sold
         position["remaining_cost_lamports"] -= cost_released
+        cumulative_proceeds = (
+            int(position.get("cumulative_proceeds_lamports", 0) or 0)
+            + proceeds_lamports
+        )
+        position["cumulative_proceeds_lamports"] = cumulative_proceeds
         position.pop("pending_exit_id", None)
         position.pop("pending_exit_reason", None)
         position["risk_state"] = "NORMAL"
@@ -457,6 +555,15 @@ async def record_paper_sell(
             position["stop_loss_ratio"] = BREAK_EVEN_STOP_RATIO
             position["break_even_floor_active"] = True
             position["break_even_floor_armed_at"] = utc_now()
+            remaining_amount = int(position.get("token_amount_raw", 0) or 0)
+            entry_cost = int(position.get("entry_cost_lamports", 0) or 0)
+            required_proceeds = max(0, entry_cost - cumulative_proceeds)
+            position["break_even_required_proceeds_lamports"] = required_proceeds
+            position["break_even_price"] = (
+                required_proceeds / remaining_amount
+                if remaining_amount > 0
+                else 0.0
+            )
         elif reason in {"TAKE_PROFIT_100", "LIVE_TAKE_PROFIT_100"}:
             position["second_take_profit_done"] = True
         ledger.setdefault("events", []).append(_next_event(ledger, {
@@ -468,6 +575,7 @@ async def record_paper_sell(
             "trigger_roi_percent": trigger_roi_percent,
             "realized_roi_percent": realized_roi,
             "quote_age_ms": quote_age_ms,
+            "exit_trigger_latency_ms": exit_trigger_latency_ms,
             "at": utc_now(),
         }))
         if position["token_amount_raw"] <= 0:
@@ -641,6 +749,10 @@ async def _execute_paper_exit(
     position: dict[str, Any],
     reason: str,
     trigger_roi: float,
+    *,
+    detected_quote: dict[str, Any] | None = None,
+    detected_amount: int | None = None,
+    trigger_started: float | None = None,
 ) -> bool:
     mint = str(position["mint"])
     position_id = str(position["position_id"])
@@ -656,15 +768,46 @@ async def _execute_paper_exit(
     if amount <= 0:
         await release_exit_claim(mint, position_id, exit_id)
         return False
+    if detected_quote is not None and detected_amount != amount:
+        await release_exit_claim(mint, position_id, exit_id)
+        logger.warning(
+            "paper exit quote discarded after position changed: mint=%s "
+            "position_id=%s detected_amount=%s current_amount=%s",
+            mint,
+            position_id,
+            detected_amount,
+            amount,
+        )
+        return False
     started = datetime.now(timezone.utc)
     try:
-        quote = await jupiter_quote(session, api_key, mint, WSOL_MINT, amount)
+        quote = detected_quote
+        if quote is None:
+            quote = await jupiter_quote(session, api_key, mint, WSOL_MINT, amount)
+        latency_ms = (
+            int(
+                (asyncio.get_running_loop().time() - trigger_started)
+                * 1000
+            )
+            if trigger_started is not None
+            else None
+        )
         recorded = await record_paper_sell(
             mint, amount, int(quote["outAmount"]), reason,
             position_id=position_id, exit_id=exit_id,
             trigger_roi_percent=trigger_roi,
             quote_age_ms=int((datetime.now(timezone.utc) - started).total_seconds() * 1000),
+            exit_trigger_latency_ms=latency_ms,
         )
+        if recorded and detected_quote is not None:
+            logger.warning(
+                "paper urgent exit dispatched from detection quote: mint=%s "
+                "reason=%s latency_ms=%s slippage_bps=%s",
+                mint,
+                reason,
+                latency_ms,
+                quote.get("slippageBps", 100),
+            )
         return recorded
     except Exception as exc:
         await release_exit_claim(mint, position_id, exit_id, degraded=True)
@@ -682,7 +825,14 @@ async def evaluate_paper_position(
     if amount <= 0 or cost <= 0 or position.get("risk_state") == "EXIT_PENDING":
         return
     try:
-        quote = await jupiter_quote(session, api_key, mint, WSOL_MINT, amount)
+        quote = await jupiter_quote(
+            session,
+            api_key,
+            mint,
+            WSOL_MINT,
+            amount,
+            slippage_bps=1_000,
+        )
     except Exception as exc:
         await record_quote_failure(mint, position_id, exc)
         raise
@@ -693,14 +843,12 @@ async def evaluate_paper_position(
     route_type = str(position.get("route_type") or "A")
     break_even_active = bool(position.get("take_profit_done"))
     stop_loss_ratio = (
-        max(
-            BREAK_EVEN_STOP_RATIO,
-            float(position.get("stop_loss_ratio", BREAK_EVEN_STOP_RATIO) or 0),
-        )
+        ROUTE_B_STOP_LOSS_RATIO if route_type == "B" else STOP_LOSS_RATIO
+    )
+    break_even_required = (
+        break_even_required_value(position, amount)
         if break_even_active
-        else (
-            ROUTE_B_STOP_LOSS_RATIO if route_type == "B" else STOP_LOSS_RATIO
-        )
+        else None
     )
     if break_even_active and await ensure_break_even_floor(mint, position_id):
         logger.info(
@@ -709,21 +857,38 @@ async def evaluate_paper_position(
             position_id,
             (stop_loss_ratio - 1) * 100,
         )
-    if ratio <= stop_loss_ratio:
+    stop_triggered = (
+        current_value <= int(break_even_required)
+        if break_even_active and break_even_required is not None
+        else ratio <= stop_loss_ratio
+    )
+    if stop_triggered:
         reason = (
             "TP_BREAK_EVEN"
             if break_even_active
             else ("ROUTE_B_STOP_LOSS_10" if route_type == "B" else "STOP_LOSS_15")
         )
+        trigger_started = asyncio.get_running_loop().time()
         if await _execute_paper_exit(
-            session, api_key, position, reason, trigger_roi
+            session,
+            api_key,
+            position,
+            reason,
+            trigger_roi,
+            detected_quote=quote,
+            detected_amount=amount,
+            trigger_started=trigger_started,
         ):
             logger.warning(
                 "paper stop-loss: mint=%s reason=%s return=%.2f%% floor=%.2f%%",
                 mint,
                 reason,
                 trigger_roi,
-                (stop_loss_ratio - 1) * 100,
+                (
+                    (int(break_even_required) / cost - 1) * 100
+                    if break_even_active and cost > 0
+                    else (stop_loss_ratio - 1) * 100
+                ),
             )
     elif route_type == "B" and ratio >= ROUTE_B_TAKE_PROFIT_RATIO and not position.get(
         "take_profit_done"

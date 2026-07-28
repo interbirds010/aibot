@@ -63,6 +63,7 @@ _QUOTE_INTERVAL_SECONDS = 1.25
 _JUPITER_MAX_QUOTE_ATTEMPTS = 3
 _JUPITER_MAX_RESET_WAIT_SECONDS = 60.0
 MAX_ENTRY_PRICE_IMPACT_PCT = 1.5
+MAX_EXIT_PRICE_IMPACT_PCT = 3.5
 logger = logging.getLogger("executor")
 _last_successful_tip_lamports: int | None = None
 
@@ -82,10 +83,21 @@ def entry_price_impact_pct(quote: dict[str, Any]) -> float:
 def validate_entry_price_impact(quote: dict[str, Any]) -> float:
     """Fail closed before every paper or live buy when impact exceeds 1.5%."""
     impact = entry_price_impact_pct(quote)
-    if impact < 0 or impact > MAX_ENTRY_PRICE_IMPACT_PCT:
+    if not math.isfinite(impact) or impact < 0 or impact > MAX_ENTRY_PRICE_IMPACT_PCT:
         raise RuntimeError(
             f"[FILTER] Entry price impact {impact:.4f}% exceeds "
             f"{MAX_ENTRY_PRICE_IMPACT_PCT:.2f}%. Abort buy."
+        )
+    return impact
+
+
+def validate_exit_price_impact(quote: dict[str, Any]) -> float:
+    """진입 전 전량 매도 견적의 출구 가격 영향을 fail-closed로 검증한다."""
+    impact = entry_price_impact_pct(quote)
+    if not math.isfinite(impact) or impact < 0 or impact >= MAX_EXIT_PRICE_IMPACT_PCT:
+        raise RuntimeError(
+            f"[ENTRY_REJECTED] Exit impact too high: {impact:.4f}% "
+            f"(threshold < {MAX_EXIT_PRICE_IMPACT_PCT:.2f}%)"
         )
     return impact
 
@@ -277,13 +289,17 @@ async def jupiter_quote(
     input_mint: str,
     output_mint: str,
     amount: int,
+    *,
+    slippage_bps: int = 100,
 ) -> dict[str, Any]:
+    if not 0 <= int(slippage_bps) <= 10_000:
+        raise ValueError("slippage_bps must be between 0 and 10000")
     headers = {"x-api-key": api_key}
     params = {
         "inputMint": input_mint,
         "outputMint": output_mint,
         "amount": str(amount),
-        "slippageBps": "100",
+        "slippageBps": str(int(slippage_bps)),
         "restrictIntermediateTokens": "true",
     }
     quote: dict[str, Any] | None = None

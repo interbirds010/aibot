@@ -194,6 +194,46 @@ def get_last_trade_time(token_address: str) -> float:
     return 0.0
 
 
+def get_recent_stop_loss_time(
+    token_address: str,
+    *,
+    maximum_tokens: int = 50,
+) -> float:
+    """최근 손절 토큰 최대 50개의 원장 이력에서 해당 민트의 손절 시각을 찾는다."""
+    token = str(token_address).strip()
+    limit = max(1, min(50, int(maximum_tokens)))
+    if not token:
+        return 0.0
+    stop_reasons = {
+        "STOP_LOSS_15",
+        "ROUTE_B_STOP_LOSS_10",
+        "LIVE_STOP_LOSS_15",
+    }
+    with exclusive_file_lock(PAPER_TRADES_PATH):
+        document = read_json(PAPER_TRADES_PATH, {"events": []})
+        events = document.get("events", [])
+        if not isinstance(events, list):
+            raise ValueError("paper trade events must be a list")
+        seen_tokens: set[str] = set()
+        for event in reversed(events):
+            if not isinstance(event, dict):
+                continue
+            if event.get("type") != "SELL" or event.get("reason") not in stop_reasons:
+                continue
+            event_mint = str(event.get("mint", "")).strip()
+            if not event_mint or event_mint in seen_tokens:
+                continue
+            seen_tokens.add(event_mint)
+            if event_mint == token:
+                raw_timestamp = event.get("at")
+                if not raw_timestamp:
+                    raise ValueError("stop-loss event is missing at")
+                return datetime_from_iso(raw_timestamp)
+            if len(seen_tokens) >= limit:
+                break
+    return 0.0
+
+
 def datetime_from_iso(value: Any) -> float:
     """ISO-8601 시각을 UTC Unix 초 단위로 변환한다."""
     from datetime import datetime, timezone

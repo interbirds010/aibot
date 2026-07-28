@@ -13,7 +13,7 @@ class RouteBPrecisionFilterTests(unittest.TestCase):
         self,
         *,
         safety_score: float = 55,
-        liquidity_usd: float = 7_500,
+        liquidity_usd: float = 10_000,
         lp_locked_percent: float = 40,
     ) -> SimpleNamespace:
         return SimpleNamespace(
@@ -39,14 +39,14 @@ class RouteBPrecisionFilterTests(unittest.TestCase):
         self.assertFalse(allowed)
         self.assertIn("FAIL_SAFETY_SCORE_UNDER_55", "\n".join(captured.output))
 
-    def test_route_b_rejects_liquidity_under_7500(self) -> None:
+    def test_route_b_rejects_liquidity_under_10000(self) -> None:
         with self.assertLogs("smart-money-monitor", level="WARNING") as captured:
             allowed = monitor.route_b_safety_filter(
-                self.report(liquidity_usd=7_499.99),
+                self.report(liquidity_usd=9_999.99),
                 "MINT",
             )
         self.assertFalse(allowed)
-        self.assertIn("FAIL_LIQUIDITY_UNDER_7500", "\n".join(captured.output))
+        self.assertIn("FAIL_LIQUIDITY_UNDER_10000", "\n".join(captured.output))
 
     def test_route_b_rejects_lp_under_40(self) -> None:
         with self.assertLogs("smart-money-monitor", level="WARNING") as captured:
@@ -62,6 +62,11 @@ class RouteBPrecisionFilterTests(unittest.TestCase):
         with (
             patch.object(
                 monitor.state_store,
+                "get_recent_stop_loss_time",
+                return_value=0,
+            ),
+            patch.object(
+                monitor.state_store,
                 "get_last_trade_time",
                 return_value=now - 2_699,
             ),
@@ -73,10 +78,54 @@ class RouteBPrecisionFilterTests(unittest.TestCase):
 
     def test_token_cooldown_allows_trade_at_45_minutes(self) -> None:
         now = 10_000.0
-        with patch.object(
-            monitor.state_store,
-            "get_last_trade_time",
-            return_value=now - 2_700,
+        with (
+            patch.object(
+                monitor.state_store,
+                "get_recent_stop_loss_time",
+                return_value=0,
+            ),
+            patch.object(
+                monitor.state_store,
+                "get_last_trade_time",
+                return_value=now - 2_700,
+            ),
+        ):
+            self.assertFalse(monitor.token_cooldown_is_active("MINT", now))
+
+    def test_stop_loss_blacklist_blocks_for_24_hours(self) -> None:
+        now = 100_000.0
+        with (
+            patch.object(
+                monitor.state_store,
+                "get_recent_stop_loss_time",
+                return_value=now - 86_399,
+            ),
+            patch.object(
+                monitor.state_store,
+                "get_last_trade_time",
+                return_value=0,
+            ),
+            self.assertLogs("smart-money-monitor", level="INFO") as captured,
+        ):
+            self.assertTrue(monitor.token_cooldown_is_active("MINT", now))
+        self.assertIn(
+            "FAIL_STOP_LOSS_BLACKLIST_ACTIVE",
+            "\n".join(captured.output),
+        )
+
+    def test_stop_loss_blacklist_expires_at_24_hours(self) -> None:
+        now = 100_000.0
+        with (
+            patch.object(
+                monitor.state_store,
+                "get_recent_stop_loss_time",
+                return_value=now - 86_400,
+            ),
+            patch.object(
+                monitor.state_store,
+                "get_last_trade_time",
+                return_value=0,
+            ),
         ):
             self.assertFalse(monitor.token_cooldown_is_active("MINT", now))
 

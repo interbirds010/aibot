@@ -39,18 +39,22 @@ DEX_SCREENER_SEARCH_URL = "https://api.dexscreener.com/latest/dex/search"
 DEX_SCREENER_PROFILES_URL = "https://api.dexscreener.com/token-profiles/latest/v1"
 DEX_SCREENER_BOOSTS_URL = "https://api.dexscreener.com/token-boosts/top/v1"
 DEX_SCREENER_TOKENS_URL = "https://api.dexscreener.com/tokens/v1/solana"
-MOMENTUM_MIN_VOLUME_M5_USD = 10_000.0
-MOMENTUM_MIN_NET_BUYS_M5 = 10
-MOMENTUM_MIN_LIQUIDITY_USD = 7_500.0
+MOMENTUM_MIN_VOLUME_M5_USD = 15_000.0
+MOMENTUM_MIN_NET_BUYS_M5 = 15
+MOMENTUM_MIN_BUY_SELL_RATIO = 1.8
+MOMENTUM_MIN_LIQUIDITY_USD = 10_000.0
+MOMENTUM_MIN_PAIR_AGE_SECONDS = 900.0
 MOMENTUM_MAX_DISCOVERY_TOKENS = 30
 MOMENTUM_MAX_CANDIDATES = 8
 MOMENTUM_ENTRY_COOLDOWN_SECONDS = 2_700.0
 UNKNOWN_WHALE_MIN_COUNT = 3
 UNKNOWN_WHALE_SIGNATURE_LIMIT = 12
 ROUTE_B_MIN_SAFETY_SCORE = 55
-ROUTE_B_MIN_LIQUIDITY_USD = 7_500.0
+ROUTE_B_MIN_LIQUIDITY_USD = 10_000.0
 ROUTE_B_MIN_LP_LOCKED_PERCENT = 40.0
 TOKEN_TRADE_COOLDOWN_SECONDS = 2_700.0
+STOP_LOSS_TOKEN_COOLDOWN_SECONDS = 86_400.0
+STOP_LOSS_BLACKLIST_MAX_TOKENS = 50
 WALLET_TARGET_COUNT = 20
 WALLET_FEEDER_TRIGGER_COUNT = 17
 WALLET_FEEDER_COOLDOWN_SECONDS = 7_200.0
@@ -290,7 +294,7 @@ def route_b_safety_filter(report: Any, mint: str) -> bool:
         return False
     if liquidity is None or liquidity < ROUTE_B_MIN_LIQUIDITY_USD:
         logger.warning(
-            "FAIL_LIQUIDITY_UNDER_7500 mint=%s liquidity_usd=%s threshold=%s",
+            "FAIL_LIQUIDITY_UNDER_10000 mint=%s liquidity_usd=%s threshold=%s",
             mint,
             liquidity,
             ROUTE_B_MIN_LIQUIDITY_USD,
@@ -311,9 +315,30 @@ def token_cooldown_is_active(mint: str, now: float | None = None) -> bool:
     """공통 거래 원장을 기준으로 동일 토큰의 45분 재진입을 차단한다."""
     current = float(now if now is not None else time.time())
     try:
+        last_stop_loss_time = float(
+            state_store.get_recent_stop_loss_time(
+                mint,
+                maximum_tokens=STOP_LOSS_BLACKLIST_MAX_TOKENS,
+            )
+            or 0
+        )
         last_trade_time = float(state_store.get_last_trade_time(mint) or 0)
     except Exception:
         logger.exception("token cooldown lookup failed; fail-closed mint=%s", mint)
+        return True
+    stop_elapsed = current - last_stop_loss_time
+    if (
+        last_stop_loss_time > 0
+        and stop_elapsed < STOP_LOSS_TOKEN_COOLDOWN_SECONDS
+    ):
+        logger.info(
+            "FAIL_STOP_LOSS_BLACKLIST_ACTIVE mint=%s elapsed_seconds=%.3f "
+            "required_seconds=%s last_stop_loss_time=%.3f",
+            mint,
+            stop_elapsed,
+            STOP_LOSS_TOKEN_COOLDOWN_SECONDS,
+            last_stop_loss_time,
+        )
         return True
     elapsed = current - last_trade_time
     if last_trade_time > 0 and elapsed < TOKEN_TRADE_COOLDOWN_SECONDS:
@@ -532,7 +557,12 @@ async def process_paper_signal(
             if paper_cost <= 0:
                 logger.warning("paper signal has unusable observed price: %s", signature)
                 return
-            from src.executor import jupiter_quote, validate_entry_price_impact
+            from src.executor import (
+                MAX_EXIT_PRICE_IMPACT_PCT,
+                jupiter_quote,
+                validate_entry_price_impact,
+                validate_exit_price_impact,
+            )
 
             timeout = aiohttp.ClientTimeout(total=20)
             async with aiohttp.ClientSession(timeout=timeout) as session:
@@ -540,9 +570,39 @@ async def process_paper_signal(
                     session, os.getenv("JUPITER_API_KEY", "").strip(),
                     WSOL_MINT, mint, paper_cost,
                 )
-            entry_price_impact = validate_entry_price_impact(quote)
+                entry_price_impact = validate_entry_price_impact(quote)
+                paper_tokens = int(quote["outAmount"])
+                try:
+                    exit_quote = await jupiter_quote(
+                        session,
+                        os.getenv("JUPITER_API_KEY", "").strip(),
+                        mint,
+                        WSOL_MINT,
+                        paper_tokens,
+                    )
+                    exit_price_impact = validate_exit_price_impact(exit_quote)
+                except RuntimeError as exc:
+                    reason = str(exc)
+                    rejection_reason = (
+                        reason
+                        if reason.startswith("[ENTRY_REJECTED]")
+                        else f"[ENTRY_REJECTED] Exit pre-flight failed: {reason}"
+                    )
+                    await record_paper_rejection(
+                        mint,
+                        int(report.safety_score),
+                        [rejection_reason],
+                        wallet,
+                        signature,
+                    )
+                    logger.warning(
+                        "%s mint=%s threshold=%.2f",
+                        rejection_reason,
+                        mint,
+                        MAX_EXIT_PRICE_IMPACT_PCT,
+                    )
+                    return
             entry_quote_at = datetime.now(timezone.utc).isoformat()
-            paper_tokens = int(quote["outAmount"])
             whale_reference_price = (
                 whale_paid_lamports / whale_token_amount_raw
                 if whale_token_amount_raw > 0 else 0.0
@@ -573,6 +633,7 @@ async def process_paper_signal(
                 analysis_completed_at=analysis_completed_at,
                 entry_quote_at=entry_quote_at,
                 entry_price_impact_pct=entry_price_impact,
+                exit_price_impact_pct=exit_price_impact,
                 expected_slippage_bps=int(quote.get("slippageBps", 100) or 100),
                 whale_reference_price=whale_reference_price,
                 copy_price_gap_pct=copy_price_gap_pct,
@@ -704,7 +765,11 @@ def momentum_score(volume_m5_usd: float, buys_m5: int, sells_m5: int) -> float:
     return round(volume_points + imbalance_points, 4)
 
 
-def momentum_candidate_from_pair(pair: dict[str, Any]) -> MomentumCandidate | None:
+def momentum_candidate_from_pair(
+    pair: dict[str, Any],
+    *,
+    now_ms: float | None = None,
+) -> MomentumCandidate | None:
     if pair.get("chainId") != "solana":
         return None
     base = pair.get("baseToken") or {}
@@ -717,14 +782,23 @@ def momentum_candidate_from_pair(pair: dict[str, Any]) -> MomentumCandidate | No
     buys_m5 = int(txns_m5.get("buys") or 0)
     sells_m5 = int(txns_m5.get("sells") or 0)
     liquidity = float((pair.get("liquidity") or {}).get("usd") or 0)
+    try:
+        pair_created_at_ms = float(pair.get("pairCreatedAt"))
+    except (TypeError, ValueError):
+        return None
+    current_ms = float(now_ms if now_ms is not None else time.time() * 1000)
+    pair_age_seconds = (current_ms - pair_created_at_ms) / 1000
+    if (
+        not 0 < pair_created_at_ms <= current_ms
+        or pair_age_seconds < MOMENTUM_MIN_PAIR_AGE_SECONDS
+    ):
+        return None
     net_buys = buys_m5 - sells_m5
-    has_volume_burst = volume_m5 >= MOMENTUM_MIN_VOLUME_M5_USD
-    has_buy_burst = (
-        net_buys >= MOMENTUM_MIN_NET_BUYS_M5
-        and buys_m5 >= max(1, sells_m5) * 1.5
-    )
-    if liquidity < MOMENTUM_MIN_LIQUIDITY_USD or not (
-        has_volume_burst or has_buy_burst
+    if not (
+        liquidity >= MOMENTUM_MIN_LIQUIDITY_USD
+        and volume_m5 >= MOMENTUM_MIN_VOLUME_M5_USD
+        and net_buys >= MOMENTUM_MIN_NET_BUYS_M5
+        and buys_m5 >= sells_m5 * MOMENTUM_MIN_BUY_SELL_RATIO
     ):
         return None
     return MomentumCandidate(
