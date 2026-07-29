@@ -55,6 +55,16 @@ class ExitPreflightTests(unittest.TestCase):
                 new=AsyncMock(return_value=report),
             ),
             patch.object(
+                monitor.state_store,
+                "get_route_initial_stop_streak",
+                return_value=(0, 0),
+            ),
+            patch.object(
+                monitor,
+                "token_cooldown_is_active",
+                return_value=False,
+            ),
+            patch.object(
                 risk_manager,
                 "paper_cash_balance",
                 new=AsyncMock(return_value=10_000_000_000),
@@ -87,6 +97,35 @@ class ExitPreflightTests(unittest.TestCase):
         self.assertEqual(quote.await_args_list[1].args[4], 2500)
         rejection.assert_awaited_once()
         record_buy.assert_not_awaited()
+
+    def test_route_a_cooldown_blocks_before_analysis(self) -> None:
+        analyze = AsyncMock()
+        with (
+            patch.object(
+                monitor.state_store,
+                "get_route_initial_stop_streak",
+                return_value=(0, 0),
+            ),
+            patch.object(
+                monitor,
+                "token_cooldown_is_active",
+                return_value=True,
+            ),
+            patch.object(analyzer, "analyze_token", new=analyze),
+        ):
+            asyncio.run(
+                monitor.process_paper_signal(
+                    "MINT",
+                    1_000,
+                    6,
+                    2_000_000_000,
+                    "WALLET",
+                    "SIGNATURE",
+                    "2026-07-28T00:00:00+00:00",
+                    "A",
+                )
+            )
+        analyze.assert_not_awaited()
 
 
 class StopLossBlacklistLedgerTests(unittest.TestCase):
@@ -128,6 +167,53 @@ class StopLossBlacklistLedgerTests(unittest.TestCase):
                 maximum_tokens=2,
             ),
             0.0,
+        )
+
+    def test_route_a_initial_stop_streak_resets_on_non_stop_exit(self) -> None:
+        events = [
+            {
+                "type": "BUY",
+                "position_id": "OLD",
+                "route_type": "A",
+                "at": "2026-07-28T00:00:00+00:00",
+            },
+            {
+                "type": "SELL",
+                "position_id": "OLD",
+                "reason": "POST_TP_TRAILING_STOP_50",
+                "at": "2026-07-28T00:10:00+00:00",
+            },
+            {
+                "type": "BUY",
+                "position_id": "LOSS-1",
+                "route_type": "A",
+                "at": "2026-07-28T01:00:00+00:00",
+            },
+            {
+                "type": "SELL",
+                "position_id": "LOSS-1",
+                "reason": "STOP_LOSS_15",
+                "at": "2026-07-28T01:10:00+00:00",
+            },
+            {
+                "type": "BUY",
+                "position_id": "LOSS-2",
+                "route_type": "A",
+                "at": "2026-07-28T02:00:00+00:00",
+            },
+            {
+                "type": "SELL",
+                "position_id": "LOSS-2",
+                "reason": "STOP_LOSS_15",
+                "at": "2026-07-28T02:10:00+00:00",
+            },
+        ]
+        self.path.write_text(json.dumps({"events": events}), encoding="utf-8")
+        streak, latest = state_store.get_route_initial_stop_streak("A")
+        self.assertEqual(streak, 2)
+        self.assertEqual(
+            latest,
+            state_store.datetime_from_iso("2026-07-28T02:10:00+00:00"),
         )
 
 
@@ -216,7 +302,33 @@ class PaperExitOptimizationTests(unittest.TestCase):
         release.assert_awaited_once()
         quote_mock.assert_not_awaited()
 
-    def test_first_take_profit_sets_dynamic_break_even_floor(self) -> None:
+    def test_first_take_profit_quotes_exactly_eighty_percent(self) -> None:
+        record = AsyncMock(return_value=True)
+        quote = AsyncMock(return_value={"outAmount": "104000", "routePlan": [{}]})
+        with (
+            patch.object(
+                risk_manager,
+                "claim_position_exit",
+                new=AsyncMock(return_value=("EXIT", 1_000)),
+            ),
+            patch.object(risk_manager, "record_paper_sell", new=record),
+            patch.object(risk_manager, "jupiter_quote", new=quote),
+        ):
+            self.assertTrue(
+                asyncio.run(
+                    risk_manager._execute_paper_exit(
+                        object(),
+                        "key",
+                        {"mint": "MINT", "position_id": "POSITION"},
+                        "TAKE_PROFIT_30_SELL_80",
+                        30.0,
+                    )
+                )
+            )
+        self.assertEqual(quote.await_args.args[4], 800)
+        self.assertEqual(record.await_args.args[1], 800)
+
+    def test_first_take_profit_leaves_twenty_percent_and_resets_peak(self) -> None:
         asyncio.run(
             risk_manager.record_paper_buy(
                 "MINT",
@@ -232,20 +344,17 @@ class PaperExitOptimizationTests(unittest.TestCase):
             asyncio.run(
                 risk_manager.record_paper_sell(
                     "MINT",
-                    500,
-                    65_000,
-                    "ROUTE_B_TAKE_PROFIT_30",
+                    800,
+                    104_000,
+                    "TAKE_PROFIT_30_SELL_80",
                     position_id=position_id,
                 )
             )
         )
         position = risk_manager.read_ledger()["positions"]["MINT"]
-        self.assertEqual(position["remaining_cost_lamports"], 50_000)
-        self.assertEqual(
-            position["break_even_required_proceeds_lamports"],
-            35_000,
-        )
-        self.assertEqual(position["break_even_price"], 70.0)
+        self.assertEqual(position["token_amount_raw"], 200)
+        self.assertEqual(position["remaining_cost_lamports"], 20_000)
+        self.assertEqual(position["post_tp_peak_exit_value_lamports"], 0)
 
     def test_legacy_position_uses_original_entry_price_fallback(self) -> None:
         position = {
@@ -260,7 +369,7 @@ class PaperExitOptimizationTests(unittest.TestCase):
             40_000,
         )
 
-    def test_dynamic_break_even_triggers_at_required_proceeds(self) -> None:
+    def test_post_take_profit_trailing_stop_triggers_at_half_peak(self) -> None:
         asyncio.run(
             risk_manager.record_paper_buy(
                 "MINT",
@@ -275,19 +384,20 @@ class PaperExitOptimizationTests(unittest.TestCase):
         asyncio.run(
             risk_manager.record_paper_sell(
                 "MINT",
-                500,
-                65_000,
-                "ROUTE_B_TAKE_PROFIT_30",
+                800,
+                104_000,
+                "TAKE_PROFIT_30_SELL_80",
                 position_id=position_id,
             )
         )
         position = risk_manager.read_ledger()["positions"]["MINT"]
+        first_quote = {"outAmount": "40_000", "routePlan": [{}], "slippageBps": "1000"}
+        with patch.object(risk_manager, "jupiter_quote", new=AsyncMock(return_value=first_quote)):
+            asyncio.run(risk_manager.evaluate_paper_position(object(), "key", position))
+        position = risk_manager.read_ledger()["positions"]["MINT"]
+        self.assertEqual(position["post_tp_peak_exit_value_lamports"], 40_000)
         quote_mock = AsyncMock(
-            return_value={
-                "outAmount": "35000",
-                "routePlan": [{}],
-                "slippageBps": "1000",
-            }
+            return_value={"outAmount": "20000", "routePlan": [{}], "slippageBps": "1000"}
         )
         with patch.object(
             risk_manager,
@@ -303,7 +413,10 @@ class PaperExitOptimizationTests(unittest.TestCase):
             )
         ledger = risk_manager.read_ledger()
         self.assertNotIn("MINT", ledger["positions"])
-        self.assertEqual(ledger["events"][-1]["reason"], "TP_BREAK_EVEN")
+        self.assertEqual(
+            ledger["events"][-1]["reason"],
+            "POST_TP_TRAILING_STOP_50",
+        )
         self.assertEqual(quote_mock.await_count, 1)
 
 

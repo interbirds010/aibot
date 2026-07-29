@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+from decimal import Decimal
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -128,6 +129,20 @@ class RouteBPrecisionFilterTests(unittest.TestCase):
             ),
         ):
             self.assertFalse(monitor.token_cooldown_is_active("MINT", now))
+
+    def test_route_a_loss_streak_reduces_then_pauses_entries(self) -> None:
+        now = 100_000.0
+        self.assertEqual(
+            monitor.route_a_entry_multiplier(2, now - 1, now),
+            Decimal("0.5"),
+        )
+        self.assertIsNone(
+            monitor.route_a_entry_multiplier(3, now - 21_599, now)
+        )
+        self.assertEqual(
+            monitor.route_a_entry_multiplier(3, now - 21_600, now),
+            Decimal("0.5"),
+        )
 
 
 class WalletFeederTriggerTests(unittest.TestCase):

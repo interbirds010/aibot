@@ -30,12 +30,13 @@ logger = logging.getLogger("risk-manager")
 
 LEDGER_PATH = Path(__file__).resolve().parents[1] / "data" / "paper_trades.json"
 INITIAL_PAPER_LAMPORTS = 10_000_000_000
-TAKE_PROFIT_RATIO = 1.50
+TAKE_PROFIT_RATIO = 1.30
 SECOND_TAKE_PROFIT_RATIO = 2.00
 STOP_LOSS_RATIO = 0.85
 ROUTE_B_TAKE_PROFIT_RATIO = 1.30
 ROUTE_B_STOP_LOSS_RATIO = 0.90
 BREAK_EVEN_STOP_RATIO = 1.00
+TAKE_PROFIT_SELL_PERCENT = 80
 PRICE_POLL_SECONDS = 1.0
 QUOTE_FAILURE_WARNING_COUNT = 3
 DEGRADED_QUOTE_GAP_SECONDS = 10.0
@@ -172,6 +173,12 @@ def _normalize_position(
         "cumulative_proceeds_lamports": int(
             position.get("cumulative_proceeds_lamports", 0) or 0
         ),
+        "post_tp_peak_exit_value_lamports": int(
+            position.get("post_tp_peak_exit_value_lamports", 0) or 0
+        ),
+        "post_tp_trailing_stop_ratio": float(
+            position.get("post_tp_trailing_stop_ratio", 0.50) or 0.50
+        ),
         "version": int(position.get("version", 1) or 1),
     })
 
@@ -215,6 +222,12 @@ def migrate_ledger_document(document: dict[str, Any]) -> bool:
                 changed = True
             if "cumulative_proceeds_lamports" not in position:
                 position["cumulative_proceeds_lamports"] = 0
+                changed = True
+            if "post_tp_peak_exit_value_lamports" not in position:
+                position["post_tp_peak_exit_value_lamports"] = 0
+                changed = True
+            if "post_tp_trailing_stop_ratio" not in position:
+                position["post_tp_trailing_stop_ratio"] = 0.50
                 changed = True
         for event in document.get("events", []):
             if not isinstance(event, dict) or event.get("type") != "BUY":
@@ -392,6 +405,8 @@ async def record_paper_buy(
             "break_even_price": cost_lamports / token_amount_raw,
             "break_even_required_proceeds_lamports": cost_lamports,
             "cumulative_proceeds_lamports": 0,
+            "post_tp_peak_exit_value_lamports": 0,
+            "post_tp_trailing_stop_ratio": 0.50,
             "version": 1,
             **metadata,
         }
@@ -516,6 +531,10 @@ async def record_paper_sell(
     trigger_roi_percent: float | None = None,
     quote_age_ms: int | None = None,
     exit_trigger_latency_ms: int | None = None,
+    previous_value_lamports: int | None = None,
+    previous_quote_at: str | None = None,
+    trigger_peak_value_lamports: int | None = None,
+    trigger_price_impact_pct: float | None = None,
 ) -> bool:
     ensure_ledger_migrated()
 
@@ -551,11 +570,10 @@ async def record_paper_sell(
             "TAKE_PROFIT_50",
             "LIVE_TAKE_PROFIT_50",
             "ROUTE_B_TAKE_PROFIT_30",
+            "TAKE_PROFIT_30_SELL_80",
         }:
             position["take_profit_done"] = True
-            position["stop_loss_ratio"] = BREAK_EVEN_STOP_RATIO
-            position["break_even_floor_active"] = True
-            position["break_even_floor_armed_at"] = utc_now()
+            position["break_even_floor_active"] = False
             remaining_amount = int(position.get("token_amount_raw", 0) or 0)
             entry_cost = int(position.get("entry_cost_lamports", 0) or 0)
             required_proceeds = max(0, entry_cost - cumulative_proceeds)
@@ -565,6 +583,7 @@ async def record_paper_sell(
                 if remaining_amount > 0
                 else 0.0
             )
+            position["post_tp_peak_exit_value_lamports"] = 0
         elif reason in {"TAKE_PROFIT_100", "LIVE_TAKE_PROFIT_100"}:
             position["second_take_profit_done"] = True
         ledger.setdefault("events", []).append(_next_event(ledger, {
@@ -577,6 +596,10 @@ async def record_paper_sell(
             "realized_roi_percent": realized_roi,
             "quote_age_ms": quote_age_ms,
             "exit_trigger_latency_ms": exit_trigger_latency_ms,
+            "previous_value_lamports": previous_value_lamports,
+            "previous_quote_at": previous_quote_at,
+            "trigger_peak_value_lamports": trigger_peak_value_lamports,
+            "trigger_price_impact_pct": trigger_price_impact_pct,
             "at": utc_now(),
         }))
         if position["token_amount_raw"] <= 0:
@@ -612,6 +635,11 @@ async def record_position_mark(
         position["peak_exit_value_lamports"] = max(
             int(position.get("peak_exit_value_lamports", 0)), current_value_lamports
         )
+        if position.get("take_profit_done"):
+            position["post_tp_peak_exit_value_lamports"] = max(
+                int(position.get("post_tp_peak_exit_value_lamports", 0) or 0),
+                current_value_lamports,
+            )
         position["price_updated_at"] = now
         position["last_quote_success_at"] = now
         position["consecutive_quote_failures"] = 0
@@ -765,8 +793,13 @@ async def _execute_paper_exit(
     exit_id, current_amount = claim
     amount = (
         current_amount
-        if reason in {"STOP_LOSS_15", "ROUTE_B_STOP_LOSS_10", "TP_BREAK_EVEN"}
-        else current_amount // 2
+        if reason in {
+            "STOP_LOSS_15",
+            "ROUTE_B_STOP_LOSS_10",
+            "TP_BREAK_EVEN",
+            "POST_TP_TRAILING_STOP_50",
+        }
+        else current_amount * TAKE_PROFIT_SELL_PERCENT // 100
     )
     if amount <= 0:
         await release_exit_claim(mint, position_id, exit_id)
@@ -801,6 +834,14 @@ async def _execute_paper_exit(
             trigger_roi_percent=trigger_roi,
             quote_age_ms=int((datetime.now(timezone.utc) - started).total_seconds() * 1000),
             exit_trigger_latency_ms=latency_ms,
+            previous_value_lamports=int(
+                position.get("current_value_lamports", 0) or 0
+            ),
+            previous_quote_at=str(position.get("price_updated_at") or ""),
+            trigger_peak_value_lamports=int(
+                position.get("post_tp_peak_exit_value_lamports", 0) or 0
+            ),
+            trigger_price_impact_pct=float(quote.get("priceImpactPct", 0) or 0),
         )
         if recorded and detected_quote is not None:
             logger.warning(
@@ -844,31 +885,23 @@ async def evaluate_paper_position(
     trigger_roi = (ratio - 1) * 100
     await record_position_mark(mint, position_id, current_value)
     route_type = str(position.get("route_type") or "A")
-    break_even_active = bool(position.get("take_profit_done"))
+    take_profit_done = bool(position.get("take_profit_done"))
     stop_loss_ratio = (
         ROUTE_B_STOP_LOSS_RATIO if route_type == "B" else STOP_LOSS_RATIO
     )
-    break_even_required = (
-        break_even_required_value(position, amount)
-        if break_even_active
-        else None
+    trailing_peak = int(
+        position.get("post_tp_peak_exit_value_lamports", 0) or 0
     )
-    if break_even_active and await ensure_break_even_floor(mint, position_id):
-        logger.info(
-            "break-even floor armed: mint=%s position_id=%s stop=%.2f%%",
-            mint,
-            position_id,
-            (stop_loss_ratio - 1) * 100,
-        )
     stop_triggered = (
-        current_value <= int(break_even_required)
-        if break_even_active and break_even_required is not None
+        trailing_peak > 0
+        and current_value * 2 <= trailing_peak
+        if take_profit_done
         else ratio <= stop_loss_ratio
     )
     if stop_triggered:
         reason = (
-            "TP_BREAK_EVEN"
-            if break_even_active
+            "POST_TP_TRAILING_STOP_50"
+            if take_profit_done
             else ("ROUTE_B_STOP_LOSS_10" if route_type == "B" else "STOP_LOSS_15")
         )
         trigger_started = asyncio.get_running_loop().time()
@@ -888,38 +921,19 @@ async def evaluate_paper_position(
                 reason,
                 trigger_roi,
                 (
-                    (int(break_even_required) / cost - 1) * 100
-                    if break_even_active and cost > 0
+                    -50.0
+                    if take_profit_done
                     else (stop_loss_ratio - 1) * 100
                 ),
             )
-    elif route_type == "B" and ratio >= ROUTE_B_TAKE_PROFIT_RATIO and not position.get(
-        "take_profit_done"
-    ):
+    elif ratio >= TAKE_PROFIT_RATIO and not take_profit_done:
         if await _execute_paper_exit(
-            session, api_key, position, "ROUTE_B_TAKE_PROFIT_30", trigger_roi
+            session, api_key, position, "TAKE_PROFIT_30_SELL_80", trigger_roi
         ):
             logger.info(
-                "Route B take-profit: %s return=%.2f%%; break-even floor armed",
+                "paper take-profit: mint=%s route=%s return=%.2f%% sold=80%%",
                 mint,
-                trigger_roi,
-            )
-    elif (
-        ratio >= SECOND_TAKE_PROFIT_RATIO
-        and position.get("take_profit_done")
-        and not position.get("second_take_profit_done")
-    ):
-        if await _execute_paper_exit(
-            session, api_key, position, "TAKE_PROFIT_100", trigger_roi
-        ):
-            logger.info("paper second take-profit: %s return=%.2f%%", mint, trigger_roi)
-    elif ratio >= TAKE_PROFIT_RATIO and not position.get("take_profit_done"):
-        if await _execute_paper_exit(
-            session, api_key, position, "TAKE_PROFIT_50", trigger_roi
-        ):
-            logger.info(
-                "paper take-profit: %s return=%.2f%%; break-even floor armed at +0.00%%",
-                mint,
+                route_type,
                 trigger_roi,
             )
 

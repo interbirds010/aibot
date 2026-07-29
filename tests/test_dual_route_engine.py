@@ -65,7 +65,7 @@ class RouteBRiskTests(unittest.TestCase):
         self.assertEqual(ledger["events"][-1]["route_type"], "B")
         self.assertEqual(position["dex_momentum_score"], 0.0)
 
-    def test_route_b_takes_half_profit_at_thirty_percent(self) -> None:
+    def test_route_b_takes_eighty_percent_profit_at_thirty_percent(self) -> None:
         position = {
             "mint": "MINT_B",
             "position_id": "position-b",
@@ -82,7 +82,26 @@ class RouteBRiskTests(unittest.TestCase):
             patch.object(risk_manager, "_execute_paper_exit", new=AsyncMock(return_value=True)) as exit_mock,
         ):
             asyncio.run(risk_manager.evaluate_paper_position(object(), "key", position))
-        self.assertEqual(exit_mock.await_args.args[3], "ROUTE_B_TAKE_PROFIT_30")
+        self.assertEqual(exit_mock.await_args.args[3], "TAKE_PROFIT_30_SELL_80")
+
+    def test_route_a_uses_same_thirty_percent_take_profit(self) -> None:
+        position = {
+            "mint": "MINT_A",
+            "position_id": "position-a",
+            "token_amount_raw": 1_000,
+            "remaining_cost_lamports": 100_000,
+            "route_type": "A",
+            "risk_state": "NORMAL",
+            "take_profit_done": False,
+        }
+        quote = {"outAmount": "130000", "routePlan": [{}]}
+        with (
+            patch.object(risk_manager, "jupiter_quote", new=AsyncMock(return_value=quote)),
+            patch.object(risk_manager, "record_position_mark", new=AsyncMock()),
+            patch.object(risk_manager, "_execute_paper_exit", new=AsyncMock(return_value=True)) as exit_mock,
+        ):
+            asyncio.run(risk_manager.evaluate_paper_position(object(), "key", position))
+        self.assertEqual(exit_mock.await_args.args[3], "TAKE_PROFIT_30_SELL_80")
 
     def test_rpc_skip_does_not_lock_cash(self) -> None:
         before = risk_manager.empty_ledger()["cash_lamports"]
@@ -107,6 +126,19 @@ class MarketMomentumTests(unittest.TestCase):
     def tearDown(self) -> None:
         risk_manager.LEDGER_PATH = self.original_ledger_path
         self.temporary.cleanup()
+
+    def test_route_b_revalidation_rejects_weakened_snapshot(self) -> None:
+        original = monitor.MomentumCandidate(
+            "MINT", "PAIR", 20_000, 30, 10, 15_000, 80.0
+        )
+        weaker = monitor.MomentumCandidate(
+            "MINT", "PAIR", 19_999, 30, 10, 15_000, 79.99
+        )
+        stronger = monitor.MomentumCandidate(
+            "MINT", "PAIR", 21_000, 31, 10, 15_000, 82.0
+        )
+        self.assertFalse(monitor.momentum_is_still_strong(original, weaker))
+        self.assertTrue(monitor.momentum_is_still_strong(original, stronger))
 
     def test_pair_requires_burst_and_minimum_liquidity(self) -> None:
         pair = {

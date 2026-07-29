@@ -56,6 +56,9 @@ ROUTE_B_MIN_LP_LOCKED_PERCENT = 40.0
 TOKEN_TRADE_COOLDOWN_SECONDS = 2_700.0
 STOP_LOSS_TOKEN_COOLDOWN_SECONDS = 86_400.0
 STOP_LOSS_BLACKLIST_MAX_TOKENS = 50
+ROUTE_A_LOSS_SIZE_REDUCTION_STREAK = 2
+ROUTE_A_PAUSE_STREAK = 3
+ROUTE_A_PAUSE_SECONDS = 21_600.0
 WALLET_TARGET_COUNT = 20
 WALLET_FEEDER_TRIGGER_COUNT = 17
 WALLET_FEEDER_COOLDOWN_SECONDS = 7_200.0
@@ -355,6 +358,24 @@ def token_cooldown_is_active(mint: str, now: float | None = None) -> bool:
     return False
 
 
+def route_a_entry_multiplier(
+    loss_streak: int,
+    latest_loss_at: float,
+    now: float | None = None,
+) -> Decimal | None:
+    """A 경로 연속 손절에 따른 중단 또는 진입 배수를 반환한다."""
+    current = float(now if now is not None else time.time())
+    if (
+        loss_streak >= ROUTE_A_PAUSE_STREAK
+        and latest_loss_at > 0
+        and current - latest_loss_at < ROUTE_A_PAUSE_SECONDS
+    ):
+        return None
+    if loss_streak >= ROUTE_A_LOSS_SIZE_REDUCTION_STREAK:
+        return Decimal("0.5")
+    return Decimal("1")
+
+
 def trigger_wallet_feeder_if_needed(now: float | None = None) -> bool:
     """감시 지갑 부족 시 두 시간에 한 번만 PM2 공급기를 비동기 기동한다."""
     current = float(now if now is not None else time.time())
@@ -524,7 +545,40 @@ async def process_paper_signal(
     """Run the rug gate, then record an executable Jupiter paper-buy quote."""
     async with _analysis_limit:
         try:
-            if requested_route == "B" and token_cooldown_is_active(mint):
+            route_a_size_multiplier = Decimal("1")
+            if requested_route == "A":
+                try:
+                    loss_streak, latest_loss_at = (
+                        state_store.get_route_initial_stop_streak("A")
+                    )
+                except Exception:
+                    logger.exception(
+                        "route A loss streak lookup failed; fail-closed mint=%s",
+                        mint,
+                    )
+                    return
+                route_a_size_multiplier = route_a_entry_multiplier(
+                    loss_streak,
+                    latest_loss_at,
+                )
+                if route_a_size_multiplier is None:
+                    pause_elapsed = time.time() - latest_loss_at
+                    logger.warning(
+                        "FAIL_ROUTE_A_LOSS_PAUSE mint=%s streak=%s "
+                        "remaining_seconds=%.3f",
+                        mint,
+                        loss_streak,
+                        ROUTE_A_PAUSE_SECONDS - pause_elapsed,
+                    )
+                    return
+                if route_a_size_multiplier < 1:
+                    logger.warning(
+                        "ROUTE_A_SIZE_REDUCED mint=%s streak=%s multiplier=%s",
+                        mint,
+                        loss_streak,
+                        route_a_size_multiplier,
+                    )
+            if token_cooldown_is_active(mint):
                 return
             from src.analyzer import analyze_token
             from src.risk_manager import (
@@ -555,6 +609,7 @@ async def process_paper_signal(
             base_paper_cost = cash * PAPER_BUY_BASIS_POINTS // 10_000
             from src.executor import route_sized_amount
             paper_cost = route_sized_amount(base_paper_cost, requested_route)
+            paper_cost = int(Decimal(paper_cost) * route_a_size_multiplier)
             if paper_cost <= 0:
                 logger.warning("paper signal has unusable observed price: %s", signature)
                 return
@@ -768,6 +823,20 @@ def momentum_score(volume_m5_usd: float, buys_m5: int, sells_m5: int) -> float:
     net_buys = max(0, buys_m5 - sells_m5)
     imbalance_points = min(40.0, net_buys * 2.0)
     return round(volume_points + imbalance_points, 4)
+
+
+def momentum_is_still_strong(
+    original: MomentumCandidate,
+    refreshed: MomentumCandidate,
+) -> bool:
+    """고래 확인 중 약해진 B 경로 모멘텀을 추격하지 않는다."""
+    return (
+        refreshed.mint == original.mint
+        and refreshed.volume_m5_usd >= original.volume_m5_usd
+        and refreshed.buys_m5 - refreshed.sells_m5
+        >= original.buys_m5 - original.sells_m5
+        and refreshed.momentum_score >= original.momentum_score
+    )
 
 
 def momentum_candidate_from_pair(
@@ -1019,6 +1088,32 @@ async def run_market_momentum_route(settings: MonitorSettings) -> None:
                         session, settings.http_url, candidate, wallets
                     )
                     if len(whales) >= UNKNOWN_WHALE_MIN_COUNT:
+                        refreshed_candidates = await fetch_momentum_candidates(session)
+                        refreshed = next(
+                            (
+                                item
+                                for item in refreshed_candidates
+                                if item.mint == candidate.mint
+                            ),
+                            None,
+                        )
+                        if (
+                            refreshed is None
+                            or not momentum_is_still_strong(candidate, refreshed)
+                        ):
+                            logger.info(
+                                "FAIL_ROUTE_B_MOMENTUM_WEAKENED mint=%s "
+                                "initial_score=%.2f refreshed_score=%s",
+                                candidate.mint,
+                                candidate.momentum_score,
+                                (
+                                    f"{refreshed.momentum_score:.2f}"
+                                    if refreshed is not None
+                                    else "missing"
+                                ),
+                            )
+                            continue
+                        candidate = refreshed
                         strongest = whales[0]
                         _market_entry_cooldowns[candidate.mint] = (
                             now + MOMENTUM_ENTRY_COOLDOWN_SECONDS

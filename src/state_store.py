@@ -208,6 +208,7 @@ def get_recent_stop_loss_time(
         "STOP_LOSS_15",
         "ROUTE_B_STOP_LOSS_10",
         "LIVE_STOP_LOSS_15",
+        "POST_TP_TRAILING_STOP_50",
     }
     with exclusive_file_lock(PAPER_TRADES_PATH):
         document = read_json(PAPER_TRADES_PATH, {"events": []})
@@ -232,6 +233,61 @@ def get_recent_stop_loss_time(
             if len(seen_tokens) >= limit:
                 break
     return 0.0
+
+
+def get_route_initial_stop_streak(route_type: str) -> tuple[int, float]:
+    """완전 청산된 최근 포지션에서 경로별 최초 손절 연속 횟수를 계산한다."""
+    route = str(route_type).strip().upper()
+    if route not in {"A", "B"}:
+        raise ValueError("route_type must be A or B")
+    terminal_reasons = {
+        "STOP_LOSS_15",
+        "ROUTE_B_STOP_LOSS_10",
+        "TP_BREAK_EVEN",
+        "POST_TP_TRAILING_STOP_50",
+        "MANUAL_CLOSE",
+        "TAKE_PROFIT_100",
+    }
+    initial_stop_reason = (
+        "STOP_LOSS_15" if route == "A" else "ROUTE_B_STOP_LOSS_10"
+    )
+    with exclusive_file_lock(PAPER_TRADES_PATH):
+        document = read_json(PAPER_TRADES_PATH, {"events": []})
+        events = document.get("events", [])
+        if not isinstance(events, list):
+            raise ValueError("paper trade events must be a list")
+        position_routes = {
+            str(event.get("position_id", "")): str(event.get("route_type", "A"))
+            for event in events
+            if isinstance(event, dict)
+            and event.get("type") == "BUY"
+            and event.get("position_id")
+        }
+        streak = 0
+        latest_stop_at = 0.0
+        seen_positions: set[str] = set()
+        for event in reversed(events):
+            if (
+                not isinstance(event, dict)
+                or event.get("type") != "SELL"
+                or event.get("reason") not in terminal_reasons
+            ):
+                continue
+            position_id = str(event.get("position_id", ""))
+            if not position_id or position_id in seen_positions:
+                continue
+            seen_positions.add(position_id)
+            if position_routes.get(position_id, "A") != route:
+                continue
+            if event.get("reason") != initial_stop_reason:
+                break
+            raw_timestamp = event.get("at")
+            if not raw_timestamp:
+                raise ValueError("route stop-loss event is missing at")
+            if streak == 0:
+                latest_stop_at = datetime_from_iso(raw_timestamp)
+            streak += 1
+        return streak, latest_stop_at
 
 
 def datetime_from_iso(value: Any) -> float:

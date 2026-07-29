@@ -1009,6 +1009,8 @@ def position_trade_groups(
     reason_labels = {
         "TAKE_PROFIT_50": "익절 기준 +50% · 절반 청산",
         "TAKE_PROFIT_100": "익절 기준 +100% · 남은 물량 절반 청산",
+        "TAKE_PROFIT_30_SELL_80": "익절 기준 +30% · 보유 물량 80% 청산",
+        "POST_TP_TRAILING_STOP_50": "익절 후 고점 대비 -50% · 잔량 청산",
         "STOP_LOSS_15": "손절 기준 -15% · 전량 청산",
         "LIVE_TAKE_PROFIT_50": "실거래 익절 기준 +50% · 절반 청산",
         "LIVE_TAKE_PROFIT_100": "실거래 익절 기준 +100% · 남은 물량 절반 청산",
