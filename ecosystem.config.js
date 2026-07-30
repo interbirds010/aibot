@@ -14,6 +14,7 @@ module.exports = {
         PYTHONUNBUFFERED: "1",
         PYTHONDONTWRITEBYTECODE: "1",
         PYTHONPATH: "/var/www/aibot",
+        OBSERVATION_MODE: "true",
       },
     },
     {

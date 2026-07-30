@@ -672,6 +672,40 @@ async def process_paper_signal(
             entry_latency_ms = int(
                 (datetime.now(timezone.utc) - detected).total_seconds() * 1000
             )
+            from src.observation_tracker import (
+                observation_mode_enabled,
+                record_observation,
+            )
+            if observation_mode_enabled():
+                await record_observation(
+                    mint=mint,
+                    route_type=requested_route,
+                    source_wallet=wallet,
+                    source_signature=signature,
+                    safety_score=int(report.safety_score),
+                    entry_cost_lamports=paper_cost,
+                    token_amount_raw=paper_tokens,
+                    token_decimals=token_decimals,
+                    entry_price_impact_pct=entry_price_impact,
+                    exit_price_impact_pct=exit_price_impact,
+                    expected_slippage_bps=int(
+                        quote.get("slippageBps", 100) or 100
+                    ),
+                    dex_momentum_score=dex_momentum_score,
+                    signal_detected_at=signal_detected_at,
+                    analysis_completed_at=analysis_completed_at,
+                    entry_quote_at=entry_quote_at,
+                    entry_latency_ms=entry_latency_ms,
+                )
+                logger.info(
+                    "observation recorded without paper entry: mint=%s "
+                    "route=%s momentum=%.2f score=%s",
+                    mint,
+                    requested_route,
+                    dex_momentum_score,
+                    report.safety_score,
+                )
+                return
             await record_paper_buy(
                 mint,
                 paper_cost,
@@ -1323,14 +1357,25 @@ async def run_forever(settings: MonitorSettings) -> None:
 
 
 async def run_service() -> None:
+    from src.observation_tracker import (
+        observation_loop,
+        observation_mode_enabled,
+    )
     from src.wallet_performance import performance_loop
 
     settings = MonitorSettings.from_env()
+    observation_mode = observation_mode_enabled()
+    logger.info(
+        "monitor startup: observation_mode=%s paper_entries=%s",
+        observation_mode,
+        not observation_mode,
+    )
     await asyncio.gather(
         run_forever(settings),
         performance_loop(),
         run_market_momentum_route(settings),
         monitor_maintenance_loop(),
+        observation_loop() if observation_mode else asyncio.Event().wait(),
     )
 
 
