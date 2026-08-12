@@ -191,9 +191,11 @@ systemctl reload nginx
 status="000"
 for _ in {1..20}; do
   status="$(curl --silent --show-error --output /dev/null \
+    --location \
     --write-out '%{http_code}' \
-    --header "Host: $DOMAIN" \
-    http://127.0.0.1/ai-bot/ || true)"
+    --resolve "$DOMAIN:80:127.0.0.1" \
+    --resolve "$DOMAIN:443:127.0.0.1" \
+    "http://$DOMAIN/ai-bot/" || true)"
   if [[ "$status" == "200" ]]; then
     break
   fi
