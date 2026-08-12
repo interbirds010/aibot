@@ -23,11 +23,15 @@ OBSERVATION_PATH = (
 )
 OBSERVATION_INTERVALS = (("1m", 60), ("5m", 300), ("15m", 900))
 MAX_OBSERVATIONS = 1_000
+CANDIDATE_V2_MIN_SCORE = 90.0
+CANDIDATE_V2_MAX_SCORE = 100.0
+CANDIDATE_V2_MINT_COOLDOWN_SECONDS = 86_400.0
+CANDIDATE_V2_EARLY_FAILURE_PERCENT = -10.0
 
 
 def empty_observations() -> dict[str, Any]:
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "observations": [],
         "updated_at": datetime.now(timezone.utc).isoformat(),
         "version": 0,
@@ -61,6 +65,7 @@ async def record_observation(
     analysis_completed_at: str,
     entry_quote_at: str,
     entry_latency_ms: int,
+    momentum_metrics: dict[str, int | float] | None = None,
 ) -> bool:
     """Record one approved hypothetical entry without changing trading state."""
     if entry_cost_lamports <= 0 or token_amount_raw <= 0:
@@ -77,6 +82,26 @@ async def record_observation(
             for row in rows
         ):
             return False
+        score = float(dex_momentum_score)
+        candidate_reasons: list[str] = []
+        candidate_eligible = route_type == "B"
+        if route_type != "B":
+            candidate_reasons.append("ROUTE_NOT_B")
+        if not CANDIDATE_V2_MIN_SCORE <= score < CANDIDATE_V2_MAX_SCORE:
+            candidate_eligible = False
+            candidate_reasons.append("MOMENTUM_OUTSIDE_90_TO_BELOW_100")
+        if candidate_eligible and any(
+            isinstance(row, dict)
+            and row.get("mint") == mint
+            and row.get("candidate_v2_eligible") is True
+            and started_at
+            - float(row.get("started_at_epoch", 0) or 0)
+            < CANDIDATE_V2_MINT_COOLDOWN_SECONDS
+            for row in rows
+        ):
+            candidate_eligible = False
+            candidate_reasons.append("MINT_SEEN_WITHIN_24H")
+        metrics = momentum_metrics if route_type == "B" else None
         rows.append({
             "observation_id": observation_id,
             "mint": mint,
@@ -91,6 +116,26 @@ async def record_observation(
             "exit_price_impact_pct": float(exit_price_impact_pct),
             "expected_slippage_bps": int(expected_slippage_bps),
             "dex_momentum_score": float(dex_momentum_score),
+            "strategy_version": "baseline_v1+candidate_v2",
+            "momentum_metrics": ({
+                "volume_m5_usd": float(metrics.get("volume_m5_usd", 0) or 0),
+                "buys_m5": int(metrics.get("buys_m5", 0) or 0),
+                "sells_m5": int(metrics.get("sells_m5", 0) or 0),
+                "net_buys_m5": int(metrics.get("net_buys_m5", 0) or 0),
+                "buy_sell_ratio_m5": float(
+                    metrics.get("buy_sell_ratio_m5", 0) or 0
+                ),
+                "liquidity_usd": float(metrics.get("liquidity_usd", 0) or 0),
+                "pair_age_seconds": float(
+                    metrics.get("pair_age_seconds", 0) or 0
+                ),
+                "unknown_whale_count": int(
+                    metrics.get("unknown_whale_count", 0) or 0
+                ),
+            } if metrics is not None else None),
+            "candidate_v2_eligible": candidate_eligible,
+            "candidate_v2_filter_reasons": candidate_reasons,
+            "candidate_v2_early_failure": None,
             "signal_detected_at": signal_detected_at,
             "analysis_completed_at": analysis_completed_at,
             "entry_quote_at": entry_quote_at,
@@ -101,6 +146,7 @@ async def record_observation(
             "status": "PENDING",
         })
         document["observations"] = rows[-MAX_OBSERVATIONS:]
+        document["schema_version"] = 2
         document["updated_at"] = datetime.now(timezone.utc).isoformat()
         return True
 
@@ -176,6 +222,12 @@ def record_sample(
             "error": error[:500] if error else None,
             "sampled_at": datetime.now(timezone.utc).isoformat(),
         })
+        if interval == "1m" and target.get("candidate_v2_eligible") is True:
+            target["candidate_v2_early_failure"] = (
+                return_percent <= CANDIDATE_V2_EARLY_FAILURE_PERCENT
+                if return_percent is not None
+                else None
+            )
         if interval == "15m":
             target["status"] = "COMPLETE"
             valid_returns = [

@@ -113,6 +113,7 @@ class MomentumCandidate:
     sells_m5: int
     liquidity_usd: float
     momentum_score: float
+    pair_age_seconds: float = 0.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -541,6 +542,8 @@ async def process_paper_signal(
     signal_detected_at: str,
     requested_route: str = "A",
     dex_momentum_score: float = 0.0,
+    *,
+    momentum_metrics: dict[str, int | float] | None = None,
 ) -> None:
     """Run the rug gate, then record an executable Jupiter paper-buy quote."""
     async with _analysis_limit:
@@ -692,6 +695,7 @@ async def process_paper_signal(
                         quote.get("slippageBps", 100) or 100
                     ),
                     dex_momentum_score=dex_momentum_score,
+                    momentum_metrics=momentum_metrics,
                     signal_detected_at=signal_detected_at,
                     analysis_completed_at=analysis_completed_at,
                     entry_quote_at=entry_quote_at,
@@ -917,6 +921,7 @@ def momentum_candidate_from_pair(
         sells_m5=sells_m5,
         liquidity_usd=liquidity,
         momentum_score=momentum_score(volume_m5, buys_m5, sells_m5),
+        pair_age_seconds=pair_age_seconds,
     )
 
 
@@ -1175,6 +1180,21 @@ async def run_market_momentum_route(settings: MonitorSettings) -> None:
                                 datetime.now(timezone.utc).isoformat(),
                                 "B",
                                 candidate.momentum_score,
+                                momentum_metrics={
+                                    "volume_m5_usd": candidate.volume_m5_usd,
+                                    "buys_m5": candidate.buys_m5,
+                                    "sells_m5": candidate.sells_m5,
+                                    "net_buys_m5": (
+                                        candidate.buys_m5 - candidate.sells_m5
+                                    ),
+                                    "buy_sell_ratio_m5": (
+                                        candidate.buys_m5
+                                        / max(1, candidate.sells_m5)
+                                    ),
+                                    "liquidity_usd": candidate.liquidity_usd,
+                                    "pair_age_seconds": candidate.pair_age_seconds,
+                                    "unknown_whale_count": len(whales),
+                                },
                             )
                         )
                         _signal_tasks.add(task)
