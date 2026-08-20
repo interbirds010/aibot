@@ -338,8 +338,15 @@ def get_global_metric(name: str, default: Any = None) -> Any:
 
 def set_global_metric(name: str, value: Any) -> None:
     """공통 글로벌 메트릭을 파일 락과 원자적 교체를 통해 저장한다."""
-    key = str(name).strip()
-    if not key:
+    set_global_metrics({name: value})
+
+
+def set_global_metrics(values: dict[str, Any]) -> None:
+    """여러 공통 메트릭을 한 번의 원자적 갱신으로 병합한다."""
+    if not isinstance(values, dict) or not values:
+        raise ValueError("global metrics must not be empty")
+    normalized = {str(key).strip(): value for key, value in values.items()}
+    if any(not key for key in normalized):
         raise ValueError("global metric name must not be empty")
 
     def mutate(document: dict[str, Any]) -> None:
@@ -348,14 +355,13 @@ def set_global_metric(name: str, value: Any) -> None:
         if not isinstance(metrics, dict):
             metrics = {}
             document["metrics"] = metrics
-        metrics[key] = value
+        metrics.update(normalized)
 
     update_json(
         GLOBAL_METRICS_PATH,
         {"schema_version": 2, "version": 0, "metrics": {}},
         mutate,
     )
-
 
 def claim_global_interval(name: str, now: float, interval_seconds: float) -> bool:
     """여러 PM2 프로세스 중 하나만 주어진 주기 작업을 선점하도록 한다."""

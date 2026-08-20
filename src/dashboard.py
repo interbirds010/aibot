@@ -23,7 +23,10 @@ from src.dashboard_progress import (
     manual_close_progress_document,
 )
 from src.logging_utils import install_redacting_formatters, redact_sensitive_text
-from src.service_health import service_is_fresh as monitor_service_is_fresh
+from src.service_health import (
+    collection_metrics_are_fresh,
+    service_is_fresh as monitor_service_is_fresh,
+)
 from src.wallet_performance import MAX_RETURN_PERCENT, capped_return_percent
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -32,6 +35,7 @@ PERFORMANCE_PATH = PROJECT_ROOT / "data" / "wallet_performance.json"
 LEDGER_PATH = PROJECT_ROOT / "data" / "paper_trades.json"
 SERVICE_LOG_PATH = PROJECT_ROOT / "logs" / "service.stderr.log"
 STATS_PATH = PROJECT_ROOT / "data" / "dashboard_stats.json"
+GLOBAL_METRICS_PATH = PROJECT_ROOT / "data" / "global_metrics.json"
 LAMPORTS_PER_SOL = 1_000_000_000
 WSOL_MINT = "So11111111111111111111111111111111111111112"
 DEFAULT_INITIAL_SOL = 10.0
@@ -1233,7 +1237,19 @@ def live_dashboard() -> None:
     start_lamports = int(DEFAULT_INITIAL_SOL * LAMPORTS_PER_SOL)
     book_value = cash_lamports + invested_lamports
     total_return = (book_value - start_lamports) / start_lamports * 100
-    running = service_is_fresh()
+    global_metrics = load_json(
+        GLOBAL_METRICS_PATH,
+        {"metrics": {}},
+        cache_key="global_metrics",
+    )
+    collection_metrics = (
+        global_metrics.get("metrics", {})
+        if isinstance(global_metrics, dict)
+        else {}
+    )
+    running = service_is_fresh() and collection_metrics_are_fresh(
+        collection_metrics
+    )
 
     status_class = "" if running else " status-off"
     status_text = "수집 서비스 가동 중" if running else "서비스 로그 확인 필요"

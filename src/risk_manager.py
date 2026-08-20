@@ -179,6 +179,10 @@ def _normalize_position(
         "post_tp_trailing_stop_ratio": float(
             position.get("post_tp_trailing_stop_ratio", 0.50) or 0.50
         ),
+        "strategy_version": str(
+            position.get("strategy_version") or "baseline_v1"
+        ),
+        "observation_id": position.get("observation_id"),
         "version": int(position.get("version", 1) or 1),
     })
 
@@ -195,6 +199,12 @@ def migrate_ledger_document(document: dict[str, Any]) -> bool:
                 changed = True
             if "dex_momentum_score" not in position:
                 position["dex_momentum_score"] = 0.0
+                changed = True
+            if "strategy_version" not in position:
+                position["strategy_version"] = "baseline_v1"
+                changed = True
+            if "observation_id" not in position:
+                position["observation_id"] = None
                 changed = True
             if "break_even_price" not in position:
                 entry_amount = int(
@@ -230,13 +240,28 @@ def migrate_ledger_document(document: dict[str, Any]) -> bool:
                 position["post_tp_trailing_stop_ratio"] = 0.50
                 changed = True
         for event in document.get("events", []):
-            if not isinstance(event, dict) or event.get("type") != "BUY":
+            if not isinstance(event, dict):
                 continue
-            if "route_type" not in event:
+            if event.get("type") == "BUY" and "route_type" not in event:
                 event["route_type"] = "A"
                 changed = True
-            if "dex_momentum_score" not in event:
+            if (
+                event.get("type") == "BUY"
+                and "dex_momentum_score" not in event
+            ):
                 event["dex_momentum_score"] = 0.0
+                changed = True
+            if (
+                event.get("type") in {"BUY", "SELL"}
+                and "strategy_version" not in event
+            ):
+                event["strategy_version"] = "baseline_v1"
+                changed = True
+            if (
+                event.get("type") in {"BUY", "SELL"}
+                and "observation_id" not in event
+            ):
+                event["observation_id"] = None
                 changed = True
         if changed:
             document["updated_at"] = utc_now()
@@ -255,6 +280,9 @@ def migrate_ledger_document(document: dict[str, Any]) -> bool:
         if event_type == "BUY":
             round_counts[mint] = round_counts.get(mint, 0) + 1
             open_rounds[mint] = str(uuid4())
+        if event_type in {"BUY", "SELL"}:
+            event.setdefault("strategy_version", "baseline_v1")
+            event.setdefault("observation_id", None)
         position_id = str(event.get("position_id") or open_rounds.get(mint) or uuid4())
         event.setdefault("position_id", position_id)
         event.setdefault("event_id", str(uuid4()))
@@ -324,6 +352,9 @@ async def record_paper_buy(
     entry_latency_ms: int = 0,
     route_type: str = "A",
     dex_momentum_score: float = 0.0,
+    strategy_version: str = "baseline_v1",
+    observation_id: str | None = None,
+    max_strategy_open_positions: int | None = None,
 ) -> str:
     if cost_lamports <= 0 or token_amount_raw <= 0:
         raise ValueError("paper buy amounts must be positive")
@@ -339,6 +370,20 @@ async def record_paper_buy(
     route_metadata = normalized_route_metadata(route_type, dex_momentum_score)
 
     def mutate(ledger: dict[str, Any]) -> str:
+        if max_strategy_open_positions is not None:
+            if max_strategy_open_positions <= 0:
+                raise ValueError("max strategy open positions must be positive")
+            open_count = sum(
+                1
+                for position in ledger.setdefault("positions", {}).values()
+                if isinstance(position, dict)
+                and str(position.get("strategy_version") or "baseline_v1")
+                == str(strategy_version or "baseline_v1")
+            )
+            if open_count >= max_strategy_open_positions:
+                raise RuntimeError(
+                    "paper experiment position capacity reached"
+                )
         if mint in ledger.setdefault("positions", {}):
             raise RuntimeError(f"paper position already exists for {mint}")
         if source_signature and any(
@@ -379,6 +424,8 @@ async def record_paper_buy(
             "whale_reference_price": float(whale_reference_price),
             "copy_price_gap_pct": float(copy_price_gap_pct),
             "entry_latency_ms": int(entry_latency_ms),
+            "strategy_version": str(strategy_version or "baseline_v1"),
+            "observation_id": observation_id,
             **route_metadata,
         }
         ledger["cash_lamports"] = int(ledger["cash_lamports"]) - cost_lamports
@@ -537,6 +584,7 @@ async def record_paper_sell(
     trigger_price_impact_pct: float | None = None,
 ) -> bool:
     ensure_ledger_migrated()
+    closed_experiment: dict[str, str] = {}
 
     def mutate(ledger: dict[str, Any]) -> bool:
         position = ledger.setdefault("positions", {}).get(mint)
@@ -600,14 +648,39 @@ async def record_paper_sell(
             "previous_quote_at": previous_quote_at,
             "trigger_peak_value_lamports": trigger_peak_value_lamports,
             "trigger_price_impact_pct": trigger_price_impact_pct,
+            "strategy_version": str(
+                position.get("strategy_version") or "baseline_v1"
+            ),
+            "observation_id": position.get("observation_id"),
             "at": utc_now(),
         }))
         if position["token_amount_raw"] <= 0:
+            observation_id = position.get("observation_id")
+            if observation_id:
+                closed_experiment["observation_id"] = str(observation_id)
+                closed_experiment["position_id"] = actual_position_id
             del ledger["positions"][mint]
         ledger["updated_at"] = utc_now()
         return True
 
     recorded, _ = update_json(LEDGER_PATH, empty_ledger(), mutate)
+    if recorded and closed_experiment:
+        try:
+            from src.observation_tracker import mark_paper_experiment_status
+
+            await asyncio.to_thread(
+                mark_paper_experiment_status,
+                closed_experiment["observation_id"],
+                "CLOSED",
+                position_id=closed_experiment["position_id"],
+            )
+        except Exception as exc:
+            logger.warning(
+                "관찰 원장 종료 상태 갱신 실패 mint=%s position_id=%s error=%s",
+                mint,
+                closed_experiment.get("position_id"),
+                redact_sensitive_text(str(exc)),
+            )
     return bool(recorded)
 
 

@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import math
 import os
 import subprocess
 import time
@@ -47,6 +48,10 @@ MOMENTUM_MIN_LIQUIDITY_USD = 10_000.0
 MOMENTUM_MIN_PAIR_AGE_SECONDS = 900.0
 MOMENTUM_MAX_DISCOVERY_TOKENS = 30
 MOMENTUM_MAX_CANDIDATES = 8
+MOMENTUM_MAX_RAW_PAIRS = 200
+MOMENTUM_MAX_SHADOW_CANDIDATES = 8
+MOMENTUM_SHADOWS_PER_TICK = 1
+MOMENTUM_SHADOW_CAPTURE_INTERVAL_SECONDS = 30.0
 MOMENTUM_ENTRY_COOLDOWN_SECONDS = 2_700.0
 UNKNOWN_WHALE_MIN_COUNT = 3
 UNKNOWN_WHALE_SIGNATURE_LIMIT = 12
@@ -63,14 +68,23 @@ WALLET_TARGET_COUNT = 20
 WALLET_FEEDER_TRIGGER_COUNT = 17
 WALLET_FEEDER_COOLDOWN_SECONDS = 7_200.0
 MONITOR_MAINTENANCE_INTERVAL_SECONDS = 60.0
+SUBSCRIPTION_REFRESH_SECONDS = 1_800.0
+HEALTH_WRITE_INTERVAL_SECONDS = 60.0
+ROUTE_B_CONFIRM_TIMEOUT_SECONDS = 180.0
+MAX_PENDING_SHADOW_SIGNALS = 40
 
 # On-chain feeder output is verified; fail closed if an old unverified row remains.
 TEST_ALLOW_UNVERIFIED_WALLETS = False
 _analysis_limit = asyncio.Semaphore(2)
 _signal_tasks: set[asyncio.Task[None]] = set()
+_shadow_signal_tasks: set[asyncio.Task[None]] = set()
 _whale_buy_history: dict[tuple[str, str], deque[tuple[float, int]]] = {}
 _last_history_cleanup_at = 0.0
 _market_entry_cooldowns: dict[str, float] = {}
+_market_shadow_cooldowns: dict[str, float] = {}
+_last_route_b_health_write_at = 0.0
+_route_b_consecutive_failures = 0
+_last_market_shadow_capture_at = 0.0
 
 # Canonical mainnet program IDs. Keep this list reviewed before production use.
 DEX_PROGRAMS = {
@@ -114,6 +128,12 @@ class MomentumCandidate:
     liquidity_usd: float
     momentum_score: float
     pair_age_seconds: float = 0.0
+
+
+@dataclass(frozen=True, slots=True)
+class MomentumShadowCandidate:
+    candidate: MomentumCandidate
+    rejection_reasons: tuple[str, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -252,6 +272,10 @@ class EnhancedSubscriptionUnavailable(Exception):
     """Signal that the Helius plan requires standard WebSocket fallback."""
 
 
+class SubscriptionRefresh(Exception):
+    """정상 연결도 주기적으로 재구독해 장기 정체를 방지한다."""
+
+
 async def watch_wallet_file(
     path: Path, initial_mtime_ns: int, reload_seconds: float = 5.0
 ) -> None:
@@ -267,8 +291,20 @@ async def watch_wallet_file(
 
 async def monitor_heartbeat(wallet_count: int) -> None:
     while True:
+        await asyncio.to_thread(
+            state_store.set_global_metrics,
+            {
+                "monitor_process_heartbeat_at": time.time(),
+                "monitor_wallet_count": int(wallet_count),
+            },
+        )
         logger.info("heartbeat: actively monitoring %s wallets", wallet_count)
         await asyncio.sleep(60)
+
+
+async def subscription_refresh_timer() -> None:
+    await asyncio.sleep(SUBSCRIPTION_REFRESH_SECONDS)
+    raise SubscriptionRefresh
 
 
 def _float_or_none(value: Any) -> float | None:
@@ -544,10 +580,48 @@ async def process_paper_signal(
     dex_momentum_score: float = 0.0,
     *,
     momentum_metrics: dict[str, int | float] | None = None,
+    prefilter_reasons: tuple[str, ...] = (),
 ) -> None:
-    """Run the rug gate, then record an executable Jupiter paper-buy quote."""
+    """모든 형성 후보를 관찰하고 승인 후보만 페이퍼 매수한다."""
     async with _analysis_limit:
+        observation_id: str | None = None
+        observation_enabled = False
+        decision_reasons = [str(reason) for reason in prefilter_reasons]
+        safety_snapshot: dict[str, Any] = {}
+        analysis_completed_at: str | None = None
         try:
+            from src.observation_tracker import (
+                approved_signal_max_open_positions,
+                approved_signal_paper_mode_enabled,
+                finalize_candidate_without_quote,
+                mark_paper_experiment_status,
+                observation_mode_enabled,
+                record_candidate_discovery,
+                record_observation_decision,
+            )
+
+            observation_enabled = observation_mode_enabled()
+            if observation_enabled:
+                discovered = await record_candidate_discovery(
+                    mint=mint,
+                    route_type=requested_route,
+                    source_wallet=wallet,
+                    source_signature=signature,
+                    token_amount_raw=whale_token_amount_raw,
+                    token_decimals=token_decimals,
+                    signal_detected_at=signal_detected_at,
+                    dex_momentum_score=dex_momentum_score,
+                    momentum_metrics=momentum_metrics,
+                    discovery_metadata={
+                        "whale_paid_lamports": whale_paid_lamports,
+                        "source_token_amount_raw": whale_token_amount_raw,
+                        "source_token_decimals": token_decimals,
+                        "prefilter_reasons": ",".join(decision_reasons),
+                    },
+                )
+                observation_id = discovered.observation_id
+            elif decision_reasons:
+                return
             route_a_size_multiplier = Decimal("1")
             if requested_route == "A":
                 try:
@@ -559,7 +633,10 @@ async def process_paper_signal(
                         "route A loss streak lookup failed; fail-closed mint=%s",
                         mint,
                     )
-                    return
+                    decision_reasons.append("ROUTE_A_LOSS_STREAK_LOOKUP_FAILED")
+                    if not observation_enabled:
+                        return
+                    loss_streak, latest_loss_at = 0, 0.0
                 route_a_size_multiplier = route_a_entry_multiplier(
                     loss_streak,
                     latest_loss_at,
@@ -573,7 +650,10 @@ async def process_paper_signal(
                         loss_streak,
                         ROUTE_A_PAUSE_SECONDS - pause_elapsed,
                     )
-                    return
+                    decision_reasons.append("ROUTE_A_LOSS_PAUSE")
+                    if not observation_enabled:
+                        return
+                    route_a_size_multiplier = Decimal("1")
                 if route_a_size_multiplier < 1:
                     logger.warning(
                         "ROUTE_A_SIZE_REDUCED mint=%s streak=%s multiplier=%s",
@@ -582,7 +662,9 @@ async def process_paper_signal(
                         route_a_size_multiplier,
                     )
             if token_cooldown_is_active(mint):
-                return
+                decision_reasons.append("TOKEN_COOLDOWN_OR_LOOKUP_FAILURE")
+                if not observation_enabled:
+                    return
             from src.analyzer import analyze_token
             from src.risk_manager import (
                 paper_cash_balance,
@@ -593,20 +675,43 @@ async def process_paper_signal(
 
             report = await analyze_token(mint)
             analysis_completed_at = datetime.now(timezone.utc).isoformat()
+            safety_snapshot = {
+                "developer_supply_percent": (
+                    getattr(report, "developer_supply_percent", None)
+                ),
+                "developer_below_ten_percent": (
+                    getattr(report, "developer_below_ten_percent", False)
+                ),
+                "mint_authority_renounced": (
+                    getattr(report, "mint_authority_renounced", False)
+                ),
+                "lp_locked": getattr(report, "lp_locked", False),
+                "lp_locked_percent": getattr(report, "lp_locked_percent", None),
+                "liquidity_usd": getattr(report, "liquidity_usd", None),
+                "liquidity_above_minimum": (
+                    getattr(report, "liquidity_above_minimum", False)
+                ),
+                "reasons": getattr(report, "reasons", []),
+                "sources": getattr(report, "sources", []),
+            }
             if requested_route == "B" and not route_b_safety_filter(report, mint):
-                return
+                decision_reasons.append("ROUTE_B_SAFETY_FILTER_REJECTED")
             route_allowed = route_report_allowed(requested_route, report.route_type)
             if not route_allowed:
-                if requested_route == "A":
+                operational_rejection = not decision_reasons
+                decision_reasons.append("ANALYZER_ROUTE_REJECTED")
+                if requested_route == "A" and operational_rejection:
                     from src.wallet_performance import reject_unsafe_buy
                     await reject_unsafe_buy(wallet, mint, report.reasons, signature)
-                await record_paper_rejection(
-                    mint, report.safety_score, report.reasons, wallet, signature
-                )
+                if operational_rejection:
+                    await record_paper_rejection(
+                        mint, report.safety_score, report.reasons, wallet, signature
+                    )
                 logger.info(
                     "paper signal rejected by analyzer: mint=%s score=%s reasons=%s",
                     mint, report.safety_score, "; ".join(report.reasons),
                 )
+            if decision_reasons and not observation_enabled:
                 return
             cash = await paper_cash_balance()
             base_paper_cost = cash * PAPER_BUY_BASIS_POINTS // 10_000
@@ -615,6 +720,17 @@ async def process_paper_signal(
             paper_cost = int(Decimal(paper_cost) * route_a_size_multiplier)
             if paper_cost <= 0:
                 logger.warning("paper signal has unusable observed price: %s", signature)
+                if observation_id:
+                    await asyncio.to_thread(
+                        finalize_candidate_without_quote,
+                        observation_id,
+                        decision_status="UNAVAILABLE",
+                        decision_reasons=decision_reasons + ["PAPER_SIZE_UNUSABLE"],
+                        quote_status="SIZE_UNUSABLE",
+                        safety_score=int(report.safety_score),
+                        safety_metrics=safety_snapshot,
+                        analysis_completed_at=analysis_completed_at,
+                    )
                 return
             from src.executor import (
                 MAX_EXIT_PRICE_IMPACT_PCT,
@@ -631,6 +747,8 @@ async def process_paper_signal(
                 )
                 entry_price_impact = validate_entry_price_impact(quote)
                 paper_tokens = int(quote["outAmount"])
+                quote_status = "EXECUTABLE"
+                exit_price_impact: float | None = None
                 try:
                     exit_quote = await jupiter_quote(
                         session,
@@ -641,26 +759,31 @@ async def process_paper_signal(
                     )
                     exit_price_impact = validate_exit_price_impact(exit_quote)
                 except RuntimeError as exc:
+                    operational_rejection = not decision_reasons
                     reason = redact_sensitive_text(exc)
                     rejection_reason = (
                         reason
                         if reason.startswith("[ENTRY_REJECTED]")
                         else f"[ENTRY_REJECTED] Exit pre-flight failed: {reason}"
                     )
-                    await record_paper_rejection(
-                        mint,
-                        int(report.safety_score),
-                        [rejection_reason],
-                        wallet,
-                        signature,
-                    )
+                    if operational_rejection:
+                        await record_paper_rejection(
+                            mint,
+                            int(report.safety_score),
+                            [rejection_reason],
+                            wallet,
+                            signature,
+                        )
                     logger.warning(
                         "%s mint=%s threshold=%.2f",
                         rejection_reason,
                         mint,
                         MAX_EXIT_PRICE_IMPACT_PCT,
                     )
-                    return
+                    decision_reasons.append("EXIT_PREFLIGHT_FAILED")
+                    quote_status = "ENTRY_ONLY"
+                    if not observation_enabled:
+                        return
             entry_quote_at = datetime.now(timezone.utc).isoformat()
             whale_reference_price = (
                 whale_paid_lamports / whale_token_amount_raw
@@ -675,12 +798,9 @@ async def process_paper_signal(
             entry_latency_ms = int(
                 (datetime.now(timezone.utc) - detected).total_seconds() * 1000
             )
-            from src.observation_tracker import (
-                observation_mode_enabled,
-                record_observation,
-            )
-            if observation_mode_enabled():
-                await record_observation(
+            strategy_version = "baseline_v1"
+            if observation_enabled:
+                decision = await record_observation_decision(
                     mint=mint,
                     route_type=requested_route,
                     source_wallet=wallet,
@@ -696,45 +816,113 @@ async def process_paper_signal(
                     ),
                     dex_momentum_score=dex_momentum_score,
                     momentum_metrics=momentum_metrics,
+                    safety_metrics=safety_snapshot,
                     signal_detected_at=signal_detected_at,
                     analysis_completed_at=analysis_completed_at,
                     entry_quote_at=entry_quote_at,
                     entry_latency_ms=entry_latency_ms,
+                    decision_status=(
+                        "APPROVED" if not decision_reasons else "REJECTED"
+                    ),
+                    decision_reasons=decision_reasons,
+                    quote_status=quote_status,
                 )
+                observation_id = decision.observation_id
+                if decision_reasons:
+                    logger.info(
+                        "candidate observed without paper entry: mint=%s route=%s reasons=%s",
+                        mint,
+                        requested_route,
+                        ",".join(decision_reasons),
+                    )
+                    return
+                if not (
+                    approved_signal_paper_mode_enabled()
+                    and decision.created
+                ):
+                    logger.info(
+                        "observation recorded without paper entry: mint=%s "
+                        "route=%s momentum=%.2f score=%s variants=%s",
+                        mint,
+                        requested_route,
+                        dex_momentum_score,
+                        report.safety_score,
+                        ",".join(decision.strategy_variants),
+                    )
+                    return
+                strategy_version = "broad_discovery_v1"
                 logger.info(
-                    "observation recorded without paper entry: mint=%s "
-                    "route=%s momentum=%.2f score=%s",
+                    "approved observation promoted to paper experiment: "
+                    "mint=%s route=%s momentum=%.2f score=%s",
                     mint,
                     requested_route,
                     dex_momentum_score,
                     report.safety_score,
                 )
-                return
-            await record_paper_buy(
-                mint,
-                paper_cost,
-                paper_tokens,
-                token_decimals,
-                source_wallet=wallet,
-                source_signature=signature,
-                safety_score=int(report.safety_score),
-                entry_reason=(
-                    "whale_route_a"
-                    if requested_route == "A"
-                    else "dex_momentum_unknown_whales"
-                ),
-                signal_detected_at=signal_detected_at,
-                analysis_completed_at=analysis_completed_at,
-                entry_quote_at=entry_quote_at,
-                entry_price_impact_pct=entry_price_impact,
-                exit_price_impact_pct=exit_price_impact,
-                expected_slippage_bps=int(quote.get("slippageBps", 100) or 100),
-                whale_reference_price=whale_reference_price,
-                copy_price_gap_pct=copy_price_gap_pct,
-                entry_latency_ms=entry_latency_ms,
-                route_type=requested_route,
-                dex_momentum_score=dex_momentum_score,
-            )
+            try:
+                position_id = await record_paper_buy(
+                    mint,
+                    paper_cost,
+                    paper_tokens,
+                    token_decimals,
+                    source_wallet=wallet,
+                    source_signature=signature,
+                    safety_score=int(report.safety_score),
+                    entry_reason=(
+                        "broad_discovery_approved_signal"
+                        if strategy_version == "broad_discovery_v1"
+                        else "whale_route_a"
+                        if requested_route == "A"
+                        else "dex_momentum_unknown_whales"
+                    ),
+                    signal_detected_at=signal_detected_at,
+                    analysis_completed_at=analysis_completed_at,
+                    entry_quote_at=entry_quote_at,
+                    entry_price_impact_pct=entry_price_impact,
+                    exit_price_impact_pct=exit_price_impact,
+                    expected_slippage_bps=int(
+                        quote.get("slippageBps", 100) or 100
+                    ),
+                    whale_reference_price=whale_reference_price,
+                    copy_price_gap_pct=copy_price_gap_pct,
+                    entry_latency_ms=entry_latency_ms,
+                    route_type=requested_route,
+                    dex_momentum_score=dex_momentum_score,
+                    strategy_version=strategy_version,
+                    observation_id=observation_id,
+                    max_strategy_open_positions=(
+                        approved_signal_max_open_positions()
+                        if strategy_version == "broad_discovery_v1"
+                        else None
+                    ),
+                )
+            except RuntimeError as exc:
+                if strategy_version == "broad_discovery_v1" and observation_id:
+                    status = (
+                        "SKIPPED_CAPACITY"
+                        if "capacity reached" in str(exc)
+                        else "FAILED"
+                    )
+                    await asyncio.to_thread(
+                        mark_paper_experiment_status,
+                        observation_id,
+                        status,
+                    )
+                    logger.info(
+                        "paper experiment entry skipped: mint=%s status=%s reason=%s",
+                        mint,
+                        status,
+                        redact_sensitive_text(exc),
+                    )
+                    return
+                raise
+            if strategy_version == "broad_discovery_v1" and observation_id:
+                await asyncio.to_thread(
+                    mark_paper_experiment_status,
+                    observation_id,
+                    "OPENED",
+                    position_id=position_id,
+                )
             if requested_route == "A":
                 from src.wallet_performance import record_paper_buy_success
                 await record_paper_buy_success(wallet, mint, signature)
@@ -746,6 +934,23 @@ async def process_paper_signal(
             )
         except RuntimeError as exc:
             reason = redact_sensitive_text(exc)
+            if observation_enabled and observation_id:
+                try:
+                    from src.observation_tracker import finalize_candidate_without_quote
+
+                    await asyncio.to_thread(
+                        finalize_candidate_without_quote,
+                        observation_id,
+                        decision_status="UNAVAILABLE",
+                        decision_reasons=decision_reasons + [reason],
+                        quote_status="PROCESSING_FAILED",
+                        safety_metrics=safety_snapshot,
+                        analysis_completed_at=analysis_completed_at,
+                    )
+                except Exception:
+                    logger.exception(
+                        "candidate terminal status update failed: mint=%s", mint
+                    )
             if (
                 "failed after 3 attempts" in reason
                 or "getTokenSupply failed" in reason
@@ -759,13 +964,40 @@ async def process_paper_signal(
                 redact_sensitive_text(exc),
             )
         except Exception:
+            if observation_enabled and observation_id:
+                try:
+                    from src.observation_tracker import finalize_candidate_without_quote
+
+                    await asyncio.to_thread(
+                        finalize_candidate_without_quote,
+                        observation_id,
+                        decision_status="FAILED",
+                        decision_reasons=decision_reasons + ["PROCESSING_FAILED"],
+                        quote_status="PROCESSING_FAILED",
+                        safety_metrics=safety_snapshot,
+                        analysis_completed_at=analysis_completed_at,
+                    )
+                except Exception:
+                    logger.exception(
+                        "candidate terminal status update failed: mint=%s", mint
+                    )
             logger.exception("paper signal processing failed: mint=%s", mint)
 
 
 def schedule_paper_signal(
     mint: str, acquired_raw: int, token_decimals: int, paid_lamports: int,
-    wallet: str, signature: str
+    wallet: str, signature: str,
+    *,
+    prefilter_reasons: tuple[str, ...] = (),
 ) -> None:
+    if prefilter_reasons and len(_shadow_signal_tasks) >= MAX_PENDING_SHADOW_SIGNALS:
+        logger.warning(
+            "shadow candidate backlog full: mint=%s pending=%s limit=%s",
+            mint,
+            len(_shadow_signal_tasks),
+            MAX_PENDING_SHADOW_SIGNALS,
+        )
+        return
     signal_detected_at = datetime.now(timezone.utc).isoformat()
     task = asyncio.create_task(
         process_paper_signal(
@@ -773,10 +1005,14 @@ def schedule_paper_signal(
             signal_detected_at,
             "A",
             0.0,
+            prefilter_reasons=prefilter_reasons,
         )
     )
     _signal_tasks.add(task)
     task.add_done_callback(_signal_tasks.discard)
+    if prefilter_reasons:
+        _shadow_signal_tasks.add(task)
+        task.add_done_callback(_shadow_signal_tasks.discard)
 
 
 def print_buys(result: dict[str, Any], dex_name: str, watched_wallets: set[str]) -> None:
@@ -843,15 +1079,32 @@ def print_buys(result: dict[str, Any], dex_name: str, watched_wallets: set[str])
                 _signal_tasks.add(observation)
                 observation.add_done_callback(_signal_tasks.discard)
 
-                if not whale_buy_amount_allowed(
+                amount_allowed = whale_buy_amount_allowed(
                     paid_lamports,
                     wallet=wallet,
                     mint=mint,
                     signature=signature,
-                ):
-                    continue
+                )
                 schedule_paper_signal(
-                    mint, raw, decimals, paid_lamports, wallet, signature
+                    mint,
+                    raw,
+                    decimals,
+                    paid_lamports,
+                    wallet,
+                    signature,
+                    prefilter_reasons=(
+                        () if amount_allowed else ("WHALE_AMOUNT_FILTER_REJECTED",)
+                    ),
+                )
+            else:
+                schedule_paper_signal(
+                    mint,
+                    raw,
+                    decimals,
+                    0,
+                    wallet,
+                    signature,
+                    prefilter_reasons=("PAYMENT_UNRESOLVED",),
                 )
 
 
@@ -882,6 +1135,18 @@ def momentum_candidate_from_pair(
     *,
     now_ms: float | None = None,
 ) -> MomentumCandidate | None:
+    evaluated = momentum_shadow_candidate_from_pair(pair, now_ms=now_ms)
+    if evaluated is None or evaluated.rejection_reasons:
+        return None
+    return evaluated.candidate
+
+
+def momentum_shadow_candidate_from_pair(
+    pair: dict[str, Any],
+    *,
+    now_ms: float | None = None,
+) -> MomentumShadowCandidate | None:
+    """유효 Solana 페어를 파싱하고 현행 B 필터 탈락 사유를 분리한다."""
     if pair.get("chainId") != "solana":
         return None
     base = pair.get("baseToken") or {}
@@ -890,30 +1155,52 @@ def momentum_candidate_from_pair(
     if not mint or not pair_address or mint in {WSOL_MINT, USDC_MINT}:
         return None
     txns_m5 = (pair.get("txns") or {}).get("m5") or {}
-    volume_m5 = float((pair.get("volume") or {}).get("m5") or 0)
-    buys_m5 = int(txns_m5.get("buys") or 0)
-    sells_m5 = int(txns_m5.get("sells") or 0)
-    liquidity = float((pair.get("liquidity") or {}).get("usd") or 0)
-    try:
-        pair_created_at_ms = float(pair.get("pairCreatedAt"))
-    except (TypeError, ValueError):
-        return None
+    metric_invalid = False
+
+    def finite_value(value: Any) -> float | None:
+        try:
+            number = float(value)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        return number if math.isfinite(number) else None
+
+    volume_value = finite_value((pair.get("volume") or {}).get("m5"))
+    buys_value = finite_value(txns_m5.get("buys"))
+    sells_value = finite_value(txns_m5.get("sells"))
+    liquidity_value = finite_value((pair.get("liquidity") or {}).get("usd"))
+    created_value = finite_value(pair.get("pairCreatedAt"))
+    if any(value is None for value in (
+        volume_value, buys_value, sells_value, liquidity_value
+    )):
+        metric_invalid = True
+    volume_m5 = max(0.0, volume_value or 0.0)
+    buys_m5 = max(0, int(buys_value or 0))
+    sells_m5 = max(0, int(sells_value or 0))
+    liquidity = max(0.0, liquidity_value or 0.0)
+    pair_created_at_ms = created_value or 0.0
     current_ms = float(now_ms if now_ms is not None else time.time() * 1000)
+    if not math.isfinite(current_ms):
+        return None
     pair_age_seconds = (current_ms - pair_created_at_ms) / 1000
-    if (
-        not 0 < pair_created_at_ms <= current_ms
-        or pair_age_seconds < MOMENTUM_MIN_PAIR_AGE_SECONDS
-    ):
-        return None
     net_buys = buys_m5 - sells_m5
-    if not (
-        liquidity >= MOMENTUM_MIN_LIQUIDITY_USD
-        and volume_m5 >= MOMENTUM_MIN_VOLUME_M5_USD
-        and net_buys >= MOMENTUM_MIN_NET_BUYS_M5
-        and buys_m5 >= sells_m5 * MOMENTUM_MIN_BUY_SELL_RATIO
-    ):
-        return None
-    return MomentumCandidate(
+    reasons: list[str] = []
+    if metric_invalid:
+        reasons.append("MOMENTUM_METRIC_INVALID")
+    if pair_created_at_ms <= 0:
+        reasons.append("PAIR_CREATED_AT_INVALID")
+    elif pair_created_at_ms > current_ms:
+        reasons.append("PAIR_CREATED_IN_FUTURE")
+    elif pair_age_seconds < MOMENTUM_MIN_PAIR_AGE_SECONDS:
+        reasons.append("PAIR_TOO_YOUNG")
+    if liquidity < MOMENTUM_MIN_LIQUIDITY_USD:
+        reasons.append("MOMENTUM_LIQUIDITY_UNDER_MIN")
+    if volume_m5 < MOMENTUM_MIN_VOLUME_M5_USD:
+        reasons.append("MOMENTUM_VOLUME_UNDER_MIN")
+    if net_buys < MOMENTUM_MIN_NET_BUYS_M5:
+        reasons.append("MOMENTUM_NET_BUYS_UNDER_MIN")
+    if buys_m5 < sells_m5 * MOMENTUM_MIN_BUY_SELL_RATIO:
+        reasons.append("MOMENTUM_BUY_SELL_RATIO_UNDER_MIN")
+    candidate = MomentumCandidate(
         mint=mint,
         pair_address=pair_address,
         volume_m5_usd=volume_m5,
@@ -923,6 +1210,7 @@ def momentum_candidate_from_pair(
         momentum_score=momentum_score(volume_m5, buys_m5, sells_m5),
         pair_age_seconds=pair_age_seconds,
     )
+    return MomentumShadowCandidate(candidate, tuple(reasons))
 
 
 async def _dexscreener_json(
@@ -937,20 +1225,22 @@ async def _dexscreener_json(
         return await response.json()
 
 
-async def fetch_momentum_candidates(
+async def fetch_momentum_candidate_cohorts(
     session: aiohttp.ClientSession,
-) -> list[MomentumCandidate]:
-    """Discover and rank a bounded Solana market snapshot via public endpoints."""
+) -> tuple[list[MomentumCandidate], list[MomentumShadowCandidate]]:
+    """승인 후보와 현행 임계값 바로 아래 shadow 후보를 함께 반환한다."""
     search, profiles, boosts = await asyncio.gather(
         _dexscreener_json(session, DEX_SCREENER_SEARCH_URL, q="solana"),
         _dexscreener_json(session, DEX_SCREENER_PROFILES_URL),
         _dexscreener_json(session, DEX_SCREENER_BOOSTS_URL),
     )
-    pairs: list[dict[str, Any]] = [
-        pair
-        for pair in (search.get("pairs") or [])
-        if isinstance(pair, dict)
-    ] if isinstance(search, dict) else []
+    pairs: list[dict[str, Any]] = []
+    if isinstance(search, dict):
+        for pair in search.get("pairs") or []:
+            if isinstance(pair, dict):
+                pairs.append(pair)
+            if len(pairs) >= MOMENTUM_MAX_RAW_PAIRS:
+                break
     discovered_mints: list[str] = []
     for payload in (profiles, boosts):
         rows = payload if isinstance(payload, list) else [payload]
@@ -968,17 +1258,43 @@ async def fetch_momentum_candidates(
             f"{DEX_SCREENER_TOKENS_URL}/{','.join(discovered_mints)}",
         )
         if isinstance(token_pairs, list):
-            pairs.extend(pair for pair in token_pairs if isinstance(pair, dict))
+            remaining = max(0, MOMENTUM_MAX_RAW_PAIRS - len(pairs))
+            pairs.extend(
+                pair
+                for pair in token_pairs[:remaining]
+                if isinstance(pair, dict)
+            )
 
     best_by_mint: dict[str, MomentumCandidate] = {}
+    shadow_by_mint: dict[str, MomentumShadowCandidate] = {}
     for pair in pairs:
-        candidate = momentum_candidate_from_pair(pair)
-        if candidate is None:
+        evaluated = momentum_shadow_candidate_from_pair(pair)
+        if evaluated is None:
+            continue
+        candidate = evaluated.candidate
+        if evaluated.rejection_reasons:
+            incumbent_shadow = shadow_by_mint.get(candidate.mint)
+            if (
+                incumbent_shadow is None
+                or (
+                    len(evaluated.rejection_reasons),
+                    -candidate.momentum_score,
+                    -candidate.volume_m5_usd,
+                )
+                < (
+                    len(incumbent_shadow.rejection_reasons),
+                    -incumbent_shadow.candidate.momentum_score,
+                    -incumbent_shadow.candidate.volume_m5_usd,
+                )
+            ):
+                shadow_by_mint[candidate.mint] = evaluated
             continue
         incumbent = best_by_mint.get(candidate.mint)
         if incumbent is None or candidate.momentum_score > incumbent.momentum_score:
             best_by_mint[candidate.mint] = candidate
-    return sorted(
+    for mint in best_by_mint:
+        shadow_by_mint.pop(mint, None)
+    approved = sorted(
         best_by_mint.values(),
         key=lambda item: (
             item.momentum_score,
@@ -987,6 +1303,23 @@ async def fetch_momentum_candidates(
         ),
         reverse=True,
     )[:MOMENTUM_MAX_CANDIDATES]
+    shadows = sorted(
+        shadow_by_mint.values(),
+        key=lambda item: (
+            len(item.rejection_reasons),
+            -item.candidate.momentum_score,
+            -item.candidate.volume_m5_usd,
+        ),
+    )[:MOMENTUM_MAX_SHADOW_CANDIDATES]
+    return approved, shadows
+
+
+async def fetch_momentum_candidates(
+    session: aiohttp.ClientSession,
+) -> list[MomentumCandidate]:
+    """기존 거래 경로에는 현행 필터 승인 후보만 반환한다."""
+    approved, _ = await fetch_momentum_candidate_cohorts(session)
+    return approved
 
 
 async def _solana_rpc(
@@ -1101,19 +1434,110 @@ async def confirm_unknown_whales(
     )
 
 
+def momentum_observation_metrics(
+    candidate: MomentumCandidate,
+    *,
+    unknown_whale_count: int,
+) -> dict[str, int | float]:
+    return {
+        "volume_m5_usd": candidate.volume_m5_usd,
+        "buys_m5": candidate.buys_m5,
+        "sells_m5": candidate.sells_m5,
+        "net_buys_m5": candidate.buys_m5 - candidate.sells_m5,
+        "buy_sell_ratio_m5": candidate.buys_m5 / max(1, candidate.sells_m5),
+        "liquidity_usd": candidate.liquidity_usd,
+        "pair_age_seconds": candidate.pair_age_seconds,
+        "unknown_whale_count": unknown_whale_count,
+    }
+
+
+def schedule_market_shadow(
+    candidate: MomentumCandidate,
+    rejection_reasons: tuple[str, ...],
+    *,
+    now: float,
+    unknown_whale_count: int = 0,
+) -> bool:
+    """B near-miss를 전역·mint·task 상한 안에서 관찰 전용으로 예약한다."""
+    global _last_market_shadow_capture_at
+    if not rejection_reasons:
+        raise ValueError("market shadow requires at least one rejection reason")
+    if candidate.mint in _market_shadow_cooldowns:
+        return False
+    if len(_shadow_signal_tasks) >= MAX_PENDING_SHADOW_SIGNALS:
+        return False
+    if (
+        _last_market_shadow_capture_at > 0
+        and now - _last_market_shadow_capture_at
+        < MOMENTUM_SHADOW_CAPTURE_INTERVAL_SECONDS
+    ):
+        return False
+    _market_shadow_cooldowns[candidate.mint] = (
+        now + MOMENTUM_ENTRY_COOLDOWN_SECONDS
+    )
+    _last_market_shadow_capture_at = now
+    shadow_signature = (
+        f"dexscreener-shadow:{candidate.pair_address}:"
+        f"{int(time.time() // MOMENTUM_ENTRY_COOLDOWN_SECONDS)}"
+    )
+    task = asyncio.create_task(
+        process_paper_signal(
+            candidate.mint,
+            0,
+            0,
+            0,
+            "market-near-miss",
+            shadow_signature,
+            datetime.now(timezone.utc).isoformat(),
+            "B",
+            candidate.momentum_score,
+            momentum_metrics=momentum_observation_metrics(
+                candidate,
+                unknown_whale_count=unknown_whale_count,
+            ),
+            prefilter_reasons=rejection_reasons,
+        )
+    )
+    _signal_tasks.add(task)
+    task.add_done_callback(_signal_tasks.discard)
+    _shadow_signal_tasks.add(task)
+    task.add_done_callback(_shadow_signal_tasks.discard)
+    return True
+
+
 async def run_market_momentum_route(settings: MonitorSettings) -> None:
     """Lean Route B loop: one bounded snapshot and one candidate scan per tick."""
+    global _last_route_b_health_write_at, _route_b_consecutive_failures
     timeout = aiohttp.ClientTimeout(total=12)
     async with aiohttp.ClientSession(timeout=timeout) as session:
         while True:
             started = time.monotonic()
             try:
                 wallets = set(load_wallets(settings.wallets_path))
-                candidates = await fetch_momentum_candidates(session)
+                candidates, near_misses = await fetch_momentum_candidate_cohorts(
+                    session
+                )
+                _route_b_consecutive_failures = 0
+                health_now = time.time()
+                if (
+                    health_now - _last_route_b_health_write_at
+                    >= HEALTH_WRITE_INTERVAL_SECONDS
+                ):
+                    await asyncio.to_thread(
+                        state_store.set_global_metrics,
+                        {
+                            "route_b_last_poll_success_at": health_now,
+                            "route_b_consecutive_failures": 0,
+                        },
+                    )
+                    _last_route_b_health_write_at = health_now
                 now = time.monotonic()
                 for mint, expires_at in list(_market_entry_cooldowns.items()):
                     if expires_at <= now:
                         _market_entry_cooldowns.pop(mint, None)
+                for mint, expires_at in list(_market_shadow_cooldowns.items()):
+                    if expires_at <= now:
+                        _market_shadow_cooldowns.pop(mint, None)
                 candidate = next(
                     (
                         item
@@ -1122,9 +1546,13 @@ async def run_market_momentum_route(settings: MonitorSettings) -> None:
                     ),
                     None,
                 )
+                shadow_scheduled = False
                 if candidate is not None:
-                    whales = await confirm_unknown_whales(
-                        session, settings.http_url, candidate, wallets
+                    whales = await asyncio.wait_for(
+                        confirm_unknown_whales(
+                            session, settings.http_url, candidate, wallets
+                        ),
+                        timeout=ROUTE_B_CONFIRM_TIMEOUT_SECONDS,
                     )
                     if len(whales) >= UNKNOWN_WHALE_MIN_COUNT:
                         refreshed_candidates = await fetch_momentum_candidates(session)
@@ -1151,6 +1579,25 @@ async def run_market_momentum_route(settings: MonitorSettings) -> None:
                                     else "missing"
                                 ),
                             )
+                            shadow_scheduled = schedule_market_shadow(
+                                candidate,
+                                ((
+                                    "MOMENTUM_REFRESH_MISSING"
+                                    if refreshed is None
+                                    else "MOMENTUM_WEAKENED"
+                                ),),
+                                now=now,
+                                unknown_whale_count=len(whales),
+                            )
+                            if not shadow_scheduled:
+                                for shadow in near_misses:
+                                    if schedule_market_shadow(
+                                        shadow.candidate,
+                                        shadow.rejection_reasons,
+                                        now=now,
+                                    ):
+                                        break
+                            await asyncio.sleep(DEX_SCREENER_POLL_SECONDS)
                             continue
                         candidate = refreshed
                         strongest = whales[0]
@@ -1199,9 +1646,44 @@ async def run_market_momentum_route(settings: MonitorSettings) -> None:
                         )
                         _signal_tasks.add(task)
                         task.add_done_callback(_signal_tasks.discard)
+                    else:
+                        shadow_scheduled = schedule_market_shadow(
+                            candidate,
+                            ("UNKNOWN_WHALES_UNDER_MIN",),
+                            now=now,
+                            unknown_whale_count=len(whales),
+                        )
+                if not shadow_scheduled:
+                    captured = 0
+                    for shadow in near_misses:
+                        if schedule_market_shadow(
+                            shadow.candidate,
+                            shadow.rejection_reasons,
+                            now=now,
+                        ):
+                            captured += 1
+                        if captured >= MOMENTUM_SHADOWS_PER_TICK:
+                            break
             except asyncio.CancelledError:
                 raise
             except Exception:
+                _route_b_consecutive_failures += 1
+                health_now = time.time()
+                if (
+                    _route_b_consecutive_failures == 1
+                    or health_now - _last_route_b_health_write_at
+                    >= HEALTH_WRITE_INTERVAL_SECONDS
+                ):
+                    await asyncio.to_thread(
+                        state_store.set_global_metrics,
+                        {
+                            "route_b_last_poll_failure_at": health_now,
+                            "route_b_consecutive_failures": (
+                                _route_b_consecutive_failures
+                            ),
+                        },
+                    )
+                    _last_route_b_health_write_at = health_now
                 logger.exception("Route B market momentum poll failed")
             elapsed = time.monotonic() - started
             await asyncio.sleep(max(0.0, DEX_SCREENER_POLL_SECONDS - elapsed))
@@ -1256,6 +1738,15 @@ async def monitor_standard_once(
                     raise RuntimeError(f"standard subscription rejected: {message['error']}")
                 acknowledgements += 1
                 if acknowledgements == len(wallets):
+                    await asyncio.to_thread(
+                        state_store.set_global_metrics,
+                        {
+                            "wallet_ws_state": "SUBSCRIBED",
+                            "wallet_ws_subscribed_at": time.time(),
+                            "wallet_ws_mode": "STANDARD",
+                            "wallet_ws_state_changed_at": time.time(),
+                        },
+                    )
                     logger.info("standard fallback subscribed to %s wallets", len(wallets))
                     logger.info(
                         "SUCCESS: actively monitoring %s verified whale wallets in real time",
@@ -1306,6 +1797,16 @@ async def monitor_once(settings: MonitorSettings, wallets: tuple[str, ...]) -> N
                         raise RuntimeError(f"subscription rejected: {message['error']}")
                     request_id = int(message["id"])
                     subscription_to_dex[int(message["result"])] = request_to_dex[request_id]
+                    if len(subscription_to_dex) == len(DEX_PROGRAMS):
+                        await asyncio.to_thread(
+                            state_store.set_global_metrics,
+                            {
+                                "wallet_ws_state": "SUBSCRIBED",
+                                "wallet_ws_subscribed_at": time.time(),
+                                "wallet_ws_mode": "ENHANCED",
+                                "wallet_ws_state_changed_at": time.time(),
+                            },
+                        )
                     logger.info("subscribed: %s", request_to_dex[request_id])
                     continue
 
@@ -1330,6 +1831,13 @@ async def run_forever(settings: MonitorSettings) -> None:
             wallets = load_wallets(settings.wallets_path)
             mtime_ns = settings.wallets_path.stat().st_mtime_ns
             logger.info("loaded %s wallets from %s", len(wallets), settings.wallets_path)
+            await asyncio.to_thread(
+                state_store.set_global_metrics,
+                {
+                    "wallet_ws_state": "CONNECTING",
+                    "wallet_ws_state_changed_at": time.time(),
+                },
+            )
             monitor_task = asyncio.create_task(
                 monitor_standard_once(settings, wallets)
                 if use_standard_fallback else monitor_once(settings, wallets)
@@ -1340,8 +1848,9 @@ async def run_forever(settings: MonitorSettings) -> None:
                 )
             )
             heartbeat_task = asyncio.create_task(monitor_heartbeat(len(wallets)))
+            refresh_task = asyncio.create_task(subscription_refresh_timer())
             done, pending = await asyncio.wait(
-                {monitor_task, watcher_task, heartbeat_task},
+                {monitor_task, watcher_task, heartbeat_task, refresh_task},
                 return_when=asyncio.FIRST_COMPLETED,
             )
             for task in pending:
@@ -1359,6 +1868,19 @@ async def run_forever(settings: MonitorSettings) -> None:
             logger.info("wallet list updated; reloading file and rebuilding RPC subscriptions")
             delay = 3
             continue
+        except SubscriptionRefresh:
+            logger.info(
+                "wallet WebSocket refresh interval reached; rebuilding subscriptions"
+            )
+            await asyncio.to_thread(
+                state_store.set_global_metrics,
+                {
+                    "wallet_ws_state": "REFRESHING",
+                    "wallet_ws_state_changed_at": time.time(),
+                },
+            )
+            delay = 3
+            continue
         except EnhancedSubscriptionUnavailable:
             logger.warning(
                 "enhanced transactionSubscribe unavailable; switching to wallet-filtered logsSubscribe"
@@ -1369,6 +1891,13 @@ async def run_forever(settings: MonitorSettings) -> None:
         except asyncio.CancelledError:
             raise
         except Exception:
+            await asyncio.to_thread(
+                state_store.set_global_metrics,
+                {
+                    "wallet_ws_state": "RECONNECTING",
+                    "wallet_ws_state_changed_at": time.time(),
+                },
+            )
             if time.monotonic() - connected_at >= 60:
                 delay = 3
             logger.exception("connection lost; reconnecting in %s seconds", delay)
@@ -1378,6 +1907,7 @@ async def run_forever(settings: MonitorSettings) -> None:
 
 async def run_service() -> None:
     from src.observation_tracker import (
+        approved_signal_paper_mode_enabled,
         observation_loop,
         observation_mode_enabled,
     )
@@ -1385,10 +1915,26 @@ async def run_service() -> None:
 
     settings = MonitorSettings.from_env()
     observation_mode = observation_mode_enabled()
+    approved_paper_mode = (
+        approved_signal_paper_mode_enabled() if observation_mode else False
+    )
+    paper_entries_enabled = not observation_mode or approved_paper_mode
+    started_at = time.time()
+    await asyncio.to_thread(
+        state_store.set_global_metrics,
+        {
+            "monitor_started_at": started_at,
+            "monitor_process_heartbeat_at": started_at,
+            "wallet_ws_state": "STARTING",
+            "wallet_ws_state_changed_at": started_at,
+        },
+    )
     logger.info(
-        "monitor startup: observation_mode=%s paper_entries=%s",
+        "monitor startup: observation_mode=%s approved_signal_paper_mode=%s "
+        "paper_entries=%s",
         observation_mode,
-        not observation_mode,
+        approved_paper_mode,
+        paper_entries_enabled,
     )
     await asyncio.gather(
         run_forever(settings),

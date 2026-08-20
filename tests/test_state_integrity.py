@@ -6,7 +6,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from src import risk_manager
+from src import risk_manager, state_store
 
 
 def competing_exit_worker(
@@ -124,6 +124,21 @@ class StateIntegrityTests(unittest.TestCase):
         # when reconciling the original cost-basis ledger.
         reconciled_initial = int(ledger["cash_lamports"]) + remaining_cost - realized_pnl
         self.assertEqual(reconciled_initial, risk_manager.INITIAL_PAPER_LAMPORTS)
+
+
+class GlobalMetricsIntegrityTests(unittest.TestCase):
+    def test_multiple_metrics_merge_without_losing_existing_values(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            original = state_store.GLOBAL_METRICS_PATH
+            state_store.GLOBAL_METRICS_PATH = Path(directory) / "global_metrics.json"
+            try:
+                state_store.set_global_metric("existing", 1)
+                state_store.set_global_metrics({"heartbeat": 2, "state": "READY"})
+                self.assertEqual(state_store.get_global_metric("existing"), 1)
+                self.assertEqual(state_store.get_global_metric("heartbeat"), 2)
+                self.assertEqual(state_store.get_global_metric("state"), "READY")
+            finally:
+                state_store.GLOBAL_METRICS_PATH = original
 
 
 if __name__ == "__main__":

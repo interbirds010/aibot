@@ -15,6 +15,8 @@ module.exports = {
         PYTHONDONTWRITEBYTECODE: "1",
         PYTHONPATH: "/var/www/aibot",
         OBSERVATION_MODE: "true",
+        APPROVED_SIGNAL_PAPER_MODE: "true",
+        APPROVED_SIGNAL_MAX_OPEN_POSITIONS: "8",
       },
     },
     {
