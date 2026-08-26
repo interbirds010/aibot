@@ -10,12 +10,18 @@ from typing import Any
 from src.state_store import read_json, update_json
 
 
-ABSOLUTE_MAX_ANALYSIS_ROWS = 5_000
-DEFAULT_MAX_ANALYSIS_ROWS = 1_000
+ABSOLUTE_MAX_ANALYSIS_ROWS = 10_000
+DEFAULT_MAX_ANALYSIS_ROWS = 5_000
 DEFAULT_MIN_SAMPLES = 20
 DEFAULT_HOLDOUT_FRACTION = 0.20
 DEFAULT_OUTCOME_INTERVAL = "15m"
 DEFAULT_MIN_OUTCOME_COVERAGE = 0.80
+SHADOW_STRATEGY_NAMES = (
+    "fixed_hold_1m",
+    "fixed_hold_5m",
+    "fixed_hold_15m",
+    "sampled_route_exit",
+)
 ANALYSIS_PATH = (
     Path(__file__).resolve().parents[1] / "data" / "observation_analysis.json"
 )
@@ -464,6 +470,61 @@ def build_observation_analysis(
     }
 
 
+def build_shadow_strategy_comparisons(
+    rows: list[Any],
+    *,
+    minimum_samples: int = DEFAULT_MIN_SAMPLES,
+) -> dict[str, Any]:
+    """한 shadow 진입의 병렬 청산 전략을 동일 조건 집단으로 비교한다."""
+    comparisons: dict[str, Any] = {}
+    for strategy_name in SHADOW_STRATEGY_NAMES:
+        adapted: list[Any] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                adapted.append(row)
+                continue
+            strategy_results = row.get("strategy_results")
+            result = (
+                strategy_results.get(strategy_name)
+                if isinstance(strategy_results, dict)
+                else None
+            )
+            return_percent = (
+                result.get("return_percent")
+                if isinstance(result, dict)
+                else None
+            )
+            copied = dict(row)
+            copied["samples"] = [{
+                "interval": "15m",
+                "return_percent": return_percent,
+                "error": (
+                    None if return_percent is not None
+                    else str((result or {}).get("status", "MISSING_OUTCOME"))
+                ),
+            }]
+            adapted.append(copied)
+        analysis = build_observation_analysis(
+            adapted,
+            outcome_interval="15m",
+            minimum_samples=minimum_samples,
+        )
+        comparisons[strategy_name] = {
+            "input_row_count": analysis["input_row_count"],
+            "bounded_row_count": analysis["bounded_row_count"],
+            "independent_mint_cohort_count": analysis[
+                "independent_mint_cohort_count"
+            ],
+            "eligible_outcome_count": analysis["eligible_outcome_count"],
+            "excluded": analysis["excluded"],
+            "split": analysis["split"],
+            "overall": analysis["overall"],
+            "conditions": analysis["conditions"],
+            "condition_candidates": analysis["condition_candidates"],
+        }
+    return comparisons
+
+
 def refresh_observation_analysis(
     *,
     observation_path: Path | None = None,
@@ -489,10 +550,31 @@ def refresh_observation_analysis(
     ):
         raise RuntimeError("signal observation ledger is malformed")
     rows = document["observations"]
+    input_source = "signal_observations"
+    if observation_path is None:
+        from src.shadow_trade_ledger import (
+            backfill_completed_shadow_trades,
+            ensure_shadow_trades_migrated,
+        )
+
+        backfill_completed_shadow_trades(rows)
+        shadow_document = ensure_shadow_trades_migrated()
+        shadow_rows = shadow_document.get("trades")
+        if not isinstance(shadow_rows, list):
+            raise RuntimeError("shadow trade ledger is malformed")
+        if shadow_rows:
+            rows = shadow_rows
+            input_source = "shadow_trades"
     report = build_observation_analysis(
         rows if isinstance(rows, list) else [],
         minimum_samples=minimum_samples,
     )
+    report["input_source"] = input_source
+    if input_source == "shadow_trades":
+        report["strategy_comparisons"] = build_shadow_strategy_comparisons(
+            rows,
+            minimum_samples=minimum_samples,
+        )
     report["generated_at"] = datetime.now(timezone.utc).isoformat()
 
     def mutate(current: dict[str, Any]) -> None:

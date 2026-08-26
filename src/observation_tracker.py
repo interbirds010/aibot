@@ -723,7 +723,7 @@ def record_sample(
     if interval not in allowed:
         raise ValueError("unsupported observation interval")
 
-    def mutate(document: dict[str, Any]) -> bool:
+    def mutate(document: dict[str, Any]) -> dict[str, Any] | None:
         migrate_observation_document(document)
         rows = document.get("observations", [])
         target = next((
@@ -732,13 +732,13 @@ def record_sample(
             and row.get("observation_id") == observation_id
         ), None)
         if not isinstance(target, dict):
-            return False
+            return None
         samples = target.setdefault("samples", [])
         if any(
             isinstance(sample, dict) and sample.get("interval") == interval
             for sample in samples
         ):
-            return False
+            return None
         entry_cost = int(target.get("entry_cost_lamports", 0) or 0)
         return_percent = (
             round((int(proceeds_lamports) / entry_cost - 1) * 100, 4)
@@ -775,12 +775,16 @@ def record_sample(
         expire_observation_backlog(rows)
         document["observations"] = retained_observations(rows)
         document["updated_at"] = datetime.now(timezone.utc).isoformat()
-        return True
+        return dict(target)
 
-    recorded, _ = update_json(
+    snapshot, _ = update_json(
         OBSERVATION_PATH, empty_observations(), mutate
     )
-    return bool(recorded)
+    if snapshot is not None and interval == "15m":
+        from src.shadow_trade_ledger import record_completed_shadow_trade
+
+        record_completed_shadow_trade(snapshot)
+    return snapshot is not None
 
 
 async def observation_loop(interval_seconds: float = 15.0) -> None:
@@ -791,6 +795,15 @@ async def observation_loop(interval_seconds: float = 15.0) -> None:
         logger.warning("signal observer disabled: JUPITER_API_KEY is missing")
         return
     from src.executor import JupiterNoRouteError, WSOL_MINT, jupiter_quote
+    from src.shadow_trade_ledger import backfill_completed_shadow_trades
+
+    observation_document = await asyncio.to_thread(ensure_observations_migrated)
+    backfilled = await asyncio.to_thread(
+        backfill_completed_shadow_trades,
+        observation_document.get("observations", []),
+    )
+    if backfilled:
+        logger.info("completed shadow trades backfilled: count=%s", backfilled)
 
     timeout = aiohttp.ClientTimeout(total=15)
     async with aiohttp.ClientSession(timeout=timeout) as session:
