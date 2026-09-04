@@ -16,7 +16,7 @@ import aiohttp
 from dotenv import load_dotenv
 
 from src.logging_utils import redact_sensitive_text
-from src.state_store import migrate_json, read_json, update_json
+from src.state_store import migrate_json, read_json, set_global_metrics, update_json
 
 logger = logging.getLogger("signal-observer")
 
@@ -36,6 +36,8 @@ MAX_ACTIVE_OBSERVATIONS = 200
 OBSERVATION_SAMPLE_BATCH_SIZE = 20
 MAX_SAMPLE_ATTEMPTS = 3
 MAX_HORIZON_SAMPLE_LAG_SECONDS = 60.0
+OBSERVER_HEALTH_INTERVAL_SECONDS = 60.0
+OBSERVER_RESTART_DELAY_SECONDS = 30.0
 OBSERVATION_SCHEMA_VERSION = 5
 TERMINAL_OBSERVATION_STATUSES = {"COMPLETE", "EXPIRED_UNSAMPLED"}
 CANDIDATE_V2_MIN_SCORE = 90.0
@@ -178,6 +180,76 @@ def ensure_observations_migrated() -> dict[str, Any]:
         empty_observations(),
         migrate_observation_document,
     )
+
+
+def _sampled_at_epoch(sample: dict[str, Any]) -> float | None:
+    epoch = _finite_or_none(sample.get("sampled_at_epoch"))
+    if epoch is not None and epoch >= 0:
+        return float(epoch)
+    raw = sample.get("sampled_at")
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return None
+    value = parsed.timestamp()
+    return value if math.isfinite(value) and value >= 0 else None
+
+
+def observation_runtime_metrics(
+    document: dict[str, Any] | None = None,
+) -> dict[str, int | float | None]:
+    """원장을 변경하지 않고 observer 운영 지표를 계산한다."""
+    source = (
+        document
+        if document is not None
+        else read_json(OBSERVATION_PATH, empty_observations())
+    )
+    rows = source.get("observations")
+    if not isinstance(rows, list):
+        raise RuntimeError("signal observation ledger is malformed")
+    pending = 0
+    missed_count = 0
+    last_success: float | None = None
+    last_missed: float | None = None
+    for row in rows:
+        if not isinstance(row, dict):
+            raise RuntimeError("signal observation row is malformed")
+        if str(row.get("status") or "").upper() not in TERMINAL_OBSERVATION_STATUSES:
+            pending += 1
+        samples = row.get("samples")
+        if not isinstance(samples, list):
+            raise RuntimeError("signal observation samples are malformed")
+        for sample in samples:
+            if not isinstance(sample, dict):
+                continue
+            sampled_at = _sampled_at_epoch(sample)
+            outcome = _finite_or_none(sample.get("return_percent"))
+            if outcome is not None and sampled_at is not None:
+                last_success = max(last_success or sampled_at, sampled_at)
+            if "HORIZON_MISSED" in str(sample.get("error") or "").upper():
+                missed_count += 1
+                if sampled_at is not None:
+                    last_missed = max(last_missed or sampled_at, sampled_at)
+    return {
+        "pending_research_observations": pending,
+        "last_successful_horizon_sample_at": last_success,
+        "horizon_missed_count": missed_count,
+        "last_horizon_missed_at": last_missed,
+    }
+
+
+async def _publish_observer_metrics(values: dict[str, Any]) -> None:
+    """관측 지표 저장 실패가 monitor 생명주기에 영향을 주지 않게 한다."""
+    try:
+        await asyncio.to_thread(set_global_metrics, values)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.exception("observer health metric update failed")
 
 
 def normalized_safety_metrics(metrics: dict[str, Any] | None) -> dict[str, Any]:
@@ -917,21 +989,46 @@ def record_sample(
 
 async def observation_loop(interval_seconds: float = 15.0) -> None:
     """기존 bounded Jupiter 경로로 1/3/5/15/30/60분 값을 표본화한다."""
+    started_at = time.time()
+    await _publish_observer_metrics({
+        "observer_state": "STARTING",
+        "observer_started_at": started_at,
+        "observer_heartbeat_at": started_at,
+    })
     load_dotenv()
     api_key = os.getenv("JUPITER_API_KEY", "").strip()
     if not api_key:
+        now = time.time()
+        await _publish_observer_metrics({
+            "observer_state": "DISABLED_MISSING_API_KEY",
+            "observer_heartbeat_at": now,
+            "observer_state_changed_at": now,
+        })
         logger.warning("signal observer disabled: JUPITER_API_KEY is missing")
         return
     from src.executor import JupiterNoRouteError, WSOL_MINT, jupiter_quote
-    from src.shadow_trade_ledger import backfill_completed_shadow_trades
+    from src.shadow_trade_ledger import (
+        backfill_completed_shadow_trades,
+        ensure_shadow_trades_migrated,
+    )
 
     observation_document = await asyncio.to_thread(ensure_observations_migrated)
+    await asyncio.to_thread(ensure_shadow_trades_migrated)
     backfilled = await asyncio.to_thread(
         backfill_completed_shadow_trades,
         observation_document.get("observations", []),
     )
     if backfilled:
         logger.info("completed shadow trades backfilled: count=%s", backfilled)
+
+    now = time.time()
+    await _publish_observer_metrics({
+        "observer_state": "RUNNING",
+        "observer_heartbeat_at": now,
+        "observer_state_changed_at": now,
+        **observation_runtime_metrics(observation_document),
+    })
+    last_health_refresh = time.monotonic()
 
     timeout = aiohttp.ClientTimeout(total=15)
     async with aiohttp.ClientSession(timeout=timeout) as session:
@@ -1024,3 +1121,40 @@ async def observation_loop(interval_seconds: float = 15.0) -> None:
                     await asyncio.to_thread(refresh_observation_analysis)
                 except Exception:
                     logger.exception("observation condition analysis refresh failed")
+            if (
+                analysis_dirty
+                or time.monotonic() - last_health_refresh
+                >= OBSERVER_HEALTH_INTERVAL_SECONDS
+            ):
+                now = time.time()
+                await _publish_observer_metrics({
+                    "observer_state": "RUNNING",
+                    "observer_heartbeat_at": now,
+                    **observation_runtime_metrics(),
+                })
+                last_health_refresh = time.monotonic()
+
+
+async def observation_supervisor(
+    restart_delay_seconds: float = OBSERVER_RESTART_DELAY_SECONDS,
+) -> None:
+    """observer 장애를 monitor의 거래·감시 루프와 격리한다."""
+    while True:
+        try:
+            await observation_loop()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            now = time.time()
+            await _publish_observer_metrics({
+                "observer_state": "RESTARTING",
+                "observer_heartbeat_at": now,
+                "observer_state_changed_at": now,
+                "observer_last_error_at": now,
+                "observer_last_error_type": type(exc).__name__,
+            })
+            logger.exception(
+                "signal observer failed; restarting in %.1f seconds",
+                restart_delay_seconds,
+            )
+        await asyncio.sleep(max(0.0, restart_delay_seconds))

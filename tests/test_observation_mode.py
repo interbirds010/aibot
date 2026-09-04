@@ -1204,5 +1204,78 @@ class ObservationEntryGateTests(unittest.TestCase):
         )
 
 
+class ObservationRuntimeHealthTests(unittest.TestCase):
+    def test_runtime_metrics_report_pending_success_and_missed_samples(self) -> None:
+        metrics = observation_tracker.observation_runtime_metrics({
+            "observations": [
+                {
+                    "status": "PENDING",
+                    "samples": [
+                        {
+                            "return_percent": 2.5,
+                            "sampled_at_epoch": 100.0,
+                        },
+                        {
+                            "return_percent": None,
+                            "error": "HORIZON_MISSED",
+                            "sampled_at_epoch": 200.0,
+                        },
+                    ],
+                },
+                {
+                    "status": "COMPLETE",
+                    "samples": [
+                        {
+                            "return_percent": -1.0,
+                            "sampled_at_epoch": 300.0,
+                        }
+                    ],
+                },
+            ]
+        })
+
+        self.assertEqual(metrics["pending_research_observations"], 1)
+        self.assertEqual(metrics["last_successful_horizon_sample_at"], 300.0)
+        self.assertEqual(metrics["horizon_missed_count"], 1)
+        self.assertEqual(metrics["last_horizon_missed_at"], 200.0)
+
+    def test_observer_supervisor_restarts_without_propagating_failure(self) -> None:
+        observer = AsyncMock(side_effect=[
+            RuntimeError("ledger unavailable"),
+            asyncio.CancelledError(),
+        ])
+        publish = AsyncMock()
+
+        async def run() -> None:
+            with (
+                patch.object(
+                    observation_tracker,
+                    "observation_loop",
+                    new=observer,
+                ),
+                patch.object(
+                    observation_tracker,
+                    "_publish_observer_metrics",
+                    new=publish,
+                ),
+            ):
+                with self.assertRaises(asyncio.CancelledError):
+                    await observation_tracker.observation_supervisor(
+                        restart_delay_seconds=0,
+                    )
+
+        asyncio.run(run())
+        self.assertEqual(observer.await_count, 2)
+        publish.assert_awaited_once()
+        self.assertEqual(
+            publish.await_args.args[0]["observer_state"],
+            "RESTARTING",
+        )
+        self.assertEqual(
+            publish.await_args.args[0]["observer_last_error_type"],
+            "RuntimeError",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

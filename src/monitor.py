@@ -1908,8 +1908,8 @@ async def run_forever(settings: MonitorSettings) -> None:
 async def run_service() -> None:
     from src.observation_tracker import (
         approved_signal_paper_mode_enabled,
-        observation_loop,
         observation_mode_enabled,
+        observation_supervisor,
     )
     from src.wallet_performance import performance_loop
 
@@ -1941,7 +1941,7 @@ async def run_service() -> None:
         performance_loop(),
         run_market_momentum_route(settings),
         monitor_maintenance_loop(),
-        observation_loop() if observation_mode else asyncio.Event().wait(),
+        observation_supervisor() if observation_mode else asyncio.Event().wait(),
     )
 
 

@@ -25,10 +25,11 @@ jobs:
 
       # No fingerprint input is supplied: appleboy connects without pinning the
       # server host key, as required for this password-only deployment.
-      - name: Remove root PM2 leftovers and prepare deploy ownership
+      - name: Back up ledgers and prepare deploy ownership
         uses: appleboy/ssh-action@v1
         env:
           SUDO_PASSWORD: ${{ secrets.SSH_PASSWORD }}
+          DEPLOY_SHA: ${{ github.sha }}
         with:
           host: ${{ secrets.SSH_HOST }}
           username: deploy
@@ -36,7 +37,7 @@ jobs:
           port: 22
           timeout: 30s
           command_timeout: 2m
-          envs: SUDO_PASSWORD
+          envs: SUDO_PASSWORD,DEPLOY_SHA
           script: |
             set -Eeuo pipefail
 
@@ -51,6 +52,114 @@ jobs:
             sudo mkdir -p /var/www/aibot
             sudo chown -R deploy:deploy /var/www/aibot
             test -w /var/www/aibot
+
+            backup_root="/home/deploy/aibot-backups"
+            backup_dir="$backup_root/predeploy-$(date -u +%Y%m%dT%H%M%SZ)-${DEPLOY_SHA:0:12}"
+            mkdir -p "$backup_dir"
+            cd /var/www/aibot
+
+            python3 - "$backup_dir" "$DEPLOY_SHA" <<'PY'
+            import fcntl
+            import hashlib
+            import json
+            import os
+            import sys
+            from datetime import datetime, timezone
+            from pathlib import Path
+
+            root = Path("/var/www/aibot/data")
+            target = Path(sys.argv[1])
+            deploy_sha = sys.argv[2]
+            names = (
+                "signal_observations.json",
+                "shadow_trades.json",
+                "paper_trades.json",
+                "wallet_performance.json",
+            )
+
+            def sized(value):
+                return len(value) if isinstance(value, (dict, list)) else 0
+
+            def summarize(name, document):
+                if name == "signal_observations.json":
+                    rows = document.get("observations")
+                    if not isinstance(rows, list):
+                        raise RuntimeError("observation rows are malformed")
+                    identity = ""
+                    if rows and isinstance(rows[-1], dict):
+                        identity = str(
+                            rows[-1].get("observation_id")
+                            or rows[-1].get("id")
+                            or ""
+                        )
+                    return {
+                        "schema_version": document.get("schema_version"),
+                        "version": document.get("version"),
+                        "observation_count": len(rows),
+                        "latest_observation_id_sha256": (
+                            hashlib.sha256(identity.encode()).hexdigest()
+                            if identity else None
+                        ),
+                    }
+                if name == "shadow_trades.json":
+                    return {"trade_count": sized(document.get("trades"))}
+                if name == "paper_trades.json":
+                    return {
+                        "position_count": sized(document.get("positions")),
+                        "event_count": sized(document.get("events")),
+                    }
+                return {"wallet_count": sized(document.get("wallets"))}
+
+            manifest = {
+                "deploy_sha": deploy_sha,
+                "created_at": datetime.now(timezone.utc).isoformat(),
+                "files": {},
+            }
+            for name in names:
+                source = root / name
+                lock_path = source.with_name(f"{source.name}.lock")
+                lock_path.parent.mkdir(parents=True, exist_ok=True)
+                with lock_path.open("a+b") as lock:
+                    fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+                    try:
+                        if not source.exists():
+                            manifest["files"][name] = {"exists": False}
+                            print(f"BACKUP_FILE name={name} exists=false")
+                            continue
+                        payload = source.read_bytes()
+                        document = json.loads(payload.decode("utf-8"))
+                        if not isinstance(document, dict):
+                            raise RuntimeError(f"{name} is not a JSON object")
+                        destination = target / name
+                        with destination.open("xb") as output:
+                            output.write(payload)
+                            output.flush()
+                            os.fsync(output.fileno())
+                    finally:
+                        fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+                summary = summarize(name, document)
+                manifest["files"][name] = {
+                    "exists": True,
+                    "sha256": hashlib.sha256(payload).hexdigest(),
+                    "size_bytes": len(payload),
+                    "summary": summary,
+                }
+                print(
+                    f"BACKUP_FILE name={name} exists=true summary={summary}"
+                )
+
+            manifest_path = target / "manifest.json"
+            temporary = target / "manifest.json.tmp"
+            with temporary.open("x", encoding="utf-8") as output:
+                json.dump(manifest, output, ensure_ascii=False, indent=2)
+                output.write("\n")
+                output.flush()
+                os.fsync(output.fileno())
+            os.replace(temporary, manifest_path)
+            print(f"BACKUP_MANIFEST={manifest_path}")
+            PY
+
+            printf '%s\n' "$backup_dir" > "$backup_root/latest-${DEPLOY_SHA}.txt"
 
       - name: Upload application source
         uses: appleboy/scp-action@v1
@@ -70,6 +179,7 @@ jobs:
         uses: appleboy/ssh-action@v1
         env:
           SUDO_PASSWORD: ${{ secrets.SSH_PASSWORD }}
+          DEPLOY_SHA: ${{ github.sha }}
         with:
           host: ${{ secrets.SSH_HOST }}
           username: deploy
@@ -77,7 +187,7 @@ jobs:
           port: 22
           timeout: 30s
           command_timeout: 10m
-          envs: SUDO_PASSWORD
+          envs: SUDO_PASSWORD,DEPLOY_SHA
           script: |
             set -Eeuo pipefail
 
@@ -122,7 +232,96 @@ jobs:
               exit 1
             fi
 
+            sleep 20
+            ./venv/bin/python - /tmp/aibot-pm2-before.json <<'PY'
+            import json
+            import subprocess
+            import sys
+            from pathlib import Path
+
+            apps = json.loads(subprocess.check_output(["pm2", "jlist"]))
+            selected = {}
+            for app in apps:
+                name = app.get("name")
+                if name in {
+                    "aibot-monitor",
+                    "aibot-risk-manager",
+                    "aibot-dashboard",
+                    "wallet_feeder",
+                }:
+                    env = app.get("pm2_env", {})
+                    selected[name] = {
+                        "status": env.get("status"),
+                        "pid": app.get("pid"),
+                        "restart_time": env.get("restart_time", 0),
+                    }
+            Path(sys.argv[1]).write_text(json.dumps(selected), encoding="utf-8")
+            PY
+
             sleep 10
+            ./venv/bin/python - /tmp/aibot-pm2-after.json <<'PY'
+            import json
+            import subprocess
+            import sys
+            from pathlib import Path
+
+            apps = json.loads(subprocess.check_output(["pm2", "jlist"]))
+            selected = {}
+            for app in apps:
+                name = app.get("name")
+                if name in {
+                    "aibot-monitor",
+                    "aibot-risk-manager",
+                    "aibot-dashboard",
+                    "wallet_feeder",
+                }:
+                    env = app.get("pm2_env", {})
+                    selected[name] = {
+                        "status": env.get("status"),
+                        "pid": app.get("pid"),
+                        "restart_time": env.get("restart_time", 0),
+                    }
+            Path(sys.argv[1]).write_text(json.dumps(selected), encoding="utf-8")
+            PY
+
+            ./venv/bin/python - <<'PY'
+            import json
+            from pathlib import Path
+
+            before = json.loads(
+                Path("/tmp/aibot-pm2-before.json").read_text(encoding="utf-8")
+            )
+            after = json.loads(
+                Path("/tmp/aibot-pm2-after.json").read_text(encoding="utf-8")
+            )
+            core = (
+                "aibot-monitor",
+                "aibot-risk-manager",
+                "aibot-dashboard",
+            )
+            for name in core:
+                if name not in before or name not in after:
+                    raise SystemExit(f"PM2 process missing: {name}")
+                if after[name]["status"] != "online" or not after[name]["pid"]:
+                    raise SystemExit(f"PM2 process unhealthy: {name}")
+                if after[name]["restart_time"] != before[name]["restart_time"]:
+                    raise SystemExit(f"PM2 restart loop detected: {name}")
+                print(
+                    "PM2_HEALTH "
+                    f"name={name} status=online pid={after[name]['pid']} "
+                    f"restarts={after[name]['restart_time']}"
+                )
+            feeder = after.get("wallet_feeder", {})
+            if feeder.get("status") not in {"online", "stopped"}:
+                raise SystemExit("wallet_feeder PM2 entry is unhealthy")
+            print(
+                "PM2_FEEDER "
+                f"status={feeder.get('status')} pid={feeder.get('pid')} "
+                f"restarts={feeder.get('restart_time')}"
+            )
+            PY
+            rm -f /tmp/aibot-pm2-before.json /tmp/aibot-pm2-after.json
+
             verification_failed=0
             for app in aibot-monitor aibot-risk-manager aibot-dashboard; do
               pid="$(pm2 pid "$app")"
@@ -135,6 +334,132 @@ jobs:
             done
 
             test "$verification_failed" -eq 0
+
+            ./venv/bin/python - "$DEPLOY_SHA" <<'PY'
+            import hashlib
+            import json
+            import time
+            import sys
+            from pathlib import Path
+
+            deploy_sha = sys.argv[1]
+            backup_root = Path("/home/deploy/aibot-backups")
+            marker = backup_root / f"latest-{deploy_sha}.txt"
+            backup_dir = Path(marker.read_text(encoding="utf-8").strip())
+            manifest = json.loads(
+                (backup_dir / "manifest.json").read_text(encoding="utf-8")
+            )
+            if manifest.get("deploy_sha") != deploy_sha:
+                raise SystemExit("backup manifest deploy SHA mismatch")
+            for name, item in manifest["files"].items():
+                if not item.get("exists"):
+                    continue
+                payload = (backup_dir / name).read_bytes()
+                if hashlib.sha256(payload).hexdigest() != item["sha256"]:
+                    raise SystemExit(f"backup checksum mismatch: {name}")
+
+            data = Path("data")
+            current = {}
+            for name in (
+                "signal_observations.json",
+                "shadow_trades.json",
+                "paper_trades.json",
+                "wallet_performance.json",
+            ):
+                document = json.loads((data / name).read_text(encoding="utf-8"))
+                if not isinstance(document, dict):
+                    raise SystemExit(f"production ledger malformed: {name}")
+                current[name] = document
+
+            observations = current["signal_observations.json"]
+            if observations.get("schema_version") != 5:
+                raise SystemExit("signal observation schema v5 migration failed")
+            rows = observations.get("observations")
+            if not isinstance(rows, list):
+                raise SystemExit("signal observation rows are malformed")
+            before_observation = manifest["files"][
+                "signal_observations.json"
+            ]
+            previous_count = (
+                before_observation.get("summary", {}).get("observation_count", 0)
+                if before_observation.get("exists") else 0
+            )
+            if len(rows) < previous_count:
+                raise SystemExit("signal observation count decreased during deploy")
+
+            metrics_document = json.loads(
+                (data / "global_metrics.json").read_text(encoding="utf-8")
+            )
+            metrics = metrics_document.get("metrics", {})
+            heartbeat = metrics.get("observer_heartbeat_at")
+            if metrics.get("observer_state") != "RUNNING":
+                raise SystemExit(
+                    f"observer is not running: {metrics.get('observer_state')}"
+                )
+            if not isinstance(heartbeat, (int, float)) or time.time() - heartbeat > 90:
+                raise SystemExit("observer heartbeat is missing or stale")
+
+            latest_identity = ""
+            if rows and isinstance(rows[-1], dict):
+                latest_identity = str(
+                    rows[-1].get("observation_id")
+                    or rows[-1].get("id")
+                    or ""
+                )
+            latest_hash = (
+                hashlib.sha256(latest_identity.encode()).hexdigest()
+                if latest_identity else None
+            )
+            previous_hash = before_observation.get("summary", {}).get(
+                "latest_observation_id_sha256"
+            )
+            shadow_count = len(current["shadow_trades.json"].get("trades", []))
+            positions = current["paper_trades.json"].get("positions", {})
+            wallets = current["wallet_performance.json"].get("wallets", {})
+            print(
+                "OBSERVER_HEALTH "
+                f"state=RUNNING heartbeat_age_seconds={time.time() - heartbeat:.1f} "
+                f"pending={metrics.get('pending_research_observations')} "
+                f"last_success={metrics.get('last_successful_horizon_sample_at')} "
+                f"horizon_missed={metrics.get('horizon_missed_count')}"
+            )
+            print(
+                "LEDGER_HEALTH schema=5 "
+                f"observations_before={previous_count} observations_after={len(rows)} "
+                f"latest_id_changed={latest_hash != previous_hash} "
+                f"shadow_trades={shadow_count} positions={len(positions)} "
+                f"wallets={len(wallets)} backup={backup_dir}"
+            )
+            PY
+
+            ./venv/bin/python -m src.research.alpha_discovery
+            ./venv/bin/python - <<'PY'
+            import json
+            from pathlib import Path
+
+            report = json.loads(
+                Path("data/alpha_discovery.json").read_text(encoding="utf-8")
+            )
+            if report.get("automatic_trading_changes") is not False:
+                raise SystemExit("Alpha report trading-change guard failed")
+            for family in ("SMART_MONEY", "MOMENTUM"):
+                summary = report["families"][family]["summary"]
+                primary = summary["event_primary_outcome"]
+                print(
+                    "ALPHA_FAMILY "
+                    f"name={family} signals={summary['event_signal_count']} "
+                    f"unique_mints={summary['unique_mint_count']} "
+                    f"trackable_60m={primary['trackable_count']} "
+                    f"sampled_60m={primary['sampled_count']}"
+                )
+            counts = report["candidate_counts"]
+            print(
+                "ALPHA_CANDIDATES "
+                f"promising={counts['PROMISING']} "
+                f"unstable={counts['UNSTABLE']} "
+                f"insufficient={counts['INSUFFICIENT_DATA']}"
+            )
+            PY
 
             upstream_status="$(curl --silent --show-error --output /dev/null \
               --write-out '%{http_code}' http://127.0.0.1:8501/ai-bot/)"
