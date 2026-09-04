@@ -13,8 +13,9 @@ from src.state_store import migrate_json, update_json
 SHADOW_TRADE_PATH = (
     Path(__file__).resolve().parents[1] / "data" / "shadow_trades.json"
 )
-SHADOW_TRADE_SCHEMA_VERSION = 1
+SHADOW_TRADE_SCHEMA_VERSION = 2
 MAX_COMPLETED_SHADOW_TRADES = 10_000
+SHADOW_HORIZONS = ("1m", "3m", "5m", "15m", "30m", "60m")
 
 
 def empty_shadow_trades() -> dict[str, Any]:
@@ -36,6 +37,45 @@ def migrate_shadow_trade_document(document: dict[str, Any]) -> bool:
     ):
         raise RuntimeError("shadow trade ledger is malformed")
     changed = schema_version != SHADOW_TRADE_SCHEMA_VERSION
+    for trade in trades:
+        legacy_returns = [
+            value
+            for sample in trade.get("samples", [])
+            if isinstance(sample, dict)
+            if (value := _finite_number(sample.get("return_percent"))) is not None
+        ] if isinstance(trade.get("samples"), list) else []
+        stored_mfe = _finite_number(trade.get("max_return_percent"))
+        stored_mae = _finite_number(trade.get("min_return_percent"))
+        defaults = {
+            "signal_type": (
+                "MOMENTUM"
+                if str(trade.get("route_type", "A")).upper() == "B"
+                else "SMART_MONEY"
+            ),
+            "research_decision": (
+                "ENTERED"
+                if str(trade.get("paper_experiment_status", "")).upper()
+                in {"OPENED", "CLOSED"}
+                else "REJECTED"
+                if str(trade.get("decision_status", "")).upper()
+                in {"REJECTED", "UNAVAILABLE", "FAILED"}
+                else "SHADOW"
+            ),
+            "mfe_percent": (
+                max(0.0, stored_mfe) if stored_mfe is not None
+                else max([0.0, *legacy_returns]) if legacy_returns else None
+            ),
+            "mae_percent": (
+                min(0.0, stored_mae) if stored_mae is not None
+                else min([0.0, *legacy_returns]) if legacy_returns else None
+            ),
+            "excursion_basis": "scheduled_jupiter_executable_quotes",
+            "tracking_profile": "legacy_15m",
+        }
+        for key, value in defaults.items():
+            if key not in trade:
+                trade[key] = value
+                changed = True
     if changed:
         document["schema_version"] = SHADOW_TRADE_SCHEMA_VERSION
         document["updated_at"] = datetime.now(timezone.utc).isoformat()
@@ -80,7 +120,7 @@ def _strategy_results(row: dict[str, Any]) -> dict[str, Any]:
             "exit_interval": interval,
             "return_percent": by_interval.get(interval),
         }
-        for interval in ("1m", "5m", "15m")
+        for interval in SHADOW_HORIZONS
     }
     route = str(row.get("route_type", "A")).upper()
     stop_percent = -10.0 if route == "B" else -15.0
@@ -92,7 +132,7 @@ def _strategy_results(row: dict[str, Any]) -> dict[str, Any]:
         "return_percent": None,
     }
     last_valid: tuple[str, float] | None = None
-    for interval in ("1m", "5m", "15m"):
+    for interval in SHADOW_HORIZONS:
         value = by_interval.get(interval)
         if value is None:
             continue
@@ -126,10 +166,22 @@ def _strategy_results(row: dict[str, Any]) -> dict[str, Any]:
 
 def completed_shadow_trade(row: dict[str, Any]) -> dict[str, Any] | None:
     """완료된 실행 가능 관찰을 장기 분석용 shadow 거래로 정규화한다."""
-    if str(row.get("quote_status", "")).upper() != "EXECUTABLE":
+    if (
+        str(row.get("status", "")).upper() != "COMPLETE"
+        or str(row.get("quote_status", "")).upper() != "EXECUTABLE"
+    ):
         return None
     samples = _samples(row)
-    if not any(str(sample.get("interval")) == "15m" for sample in samples):
+    required_horizon = (
+        "15m" if row.get("tracking_profile") == "legacy_15m" else SHADOW_HORIZONS[-1]
+    )
+    required_intervals = (
+        {"1m", "5m", "15m"}
+        if required_horizon == "15m"
+        else set(SHADOW_HORIZONS)
+    )
+    completed_intervals = {str(sample.get("interval")) for sample in samples}
+    if not required_intervals <= completed_intervals:
         return None
     observation_id = str(row.get("observation_id", "")).strip()
     if not observation_id:
@@ -146,6 +198,9 @@ def completed_shadow_trade(row: dict[str, Any]) -> dict[str, Any] | None:
         "entry_latency_ms", "started_at_epoch", "started_at",
         "candidate_v2_eligible", "candidate_v2_filter_reasons",
         "paper_experiment_status", "paper_experiment_position_id",
+        "signal_type", "research_decision", "mfe_percent", "mae_percent",
+        "excursion_basis",
+        "tracking_profile",
     )
     trade = {key: row.get(key) for key in copied_keys}
     trade.update({

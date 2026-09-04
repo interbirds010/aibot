@@ -23,12 +23,20 @@ logger = logging.getLogger("signal-observer")
 OBSERVATION_PATH = (
     Path(__file__).resolve().parents[1] / "data" / "signal_observations.json"
 )
-OBSERVATION_INTERVALS = (("1m", 60), ("5m", 300), ("15m", 900))
+OBSERVATION_INTERVALS = (
+    ("1m", 60),
+    ("3m", 180),
+    ("5m", 300),
+    ("15m", 900),
+    ("30m", 1_800),
+    ("60m", 3_600),
+)
 MAX_OBSERVATIONS = 1_000
 MAX_ACTIVE_OBSERVATIONS = 200
 OBSERVATION_SAMPLE_BATCH_SIZE = 20
 MAX_SAMPLE_ATTEMPTS = 3
-OBSERVATION_SCHEMA_VERSION = 4
+MAX_HORIZON_SAMPLE_LAG_SECONDS = 60.0
+OBSERVATION_SCHEMA_VERSION = 5
 TERMINAL_OBSERVATION_STATUSES = {"COMPLETE", "EXPIRED_UNSAMPLED"}
 CANDIDATE_V2_MIN_SCORE = 90.0
 CANDIDATE_V2_MAX_SCORE = 100.0
@@ -44,6 +52,28 @@ class ObservationDecision:
     strategy_variants: tuple[str, ...]
 
 
+def signal_type_for_route(route_type: Any) -> str:
+    """현재 신호 생성 경로를 안정적인 연구 분류명으로 변환한다."""
+    route = str(route_type).upper()
+    if route == "A":
+        return "SMART_MONEY"
+    if route == "B":
+        return "MOMENTUM"
+    return "UNKNOWN"
+
+
+def canonical_research_decision(row: dict[str, Any]) -> str:
+    """기존 세부 상태를 배타적인 연구 판정으로 정규화한다."""
+    paper_status = str(row.get("paper_experiment_status", "")).upper()
+    if paper_status in {"OPENED", "CLOSED"}:
+        return "ENTERED"
+    if str(row.get("decision_status", "")).upper() in {
+        "REJECTED", "UNAVAILABLE", "FAILED",
+    }:
+        return "REJECTED"
+    return "SHADOW"
+
+
 def empty_observations() -> dict[str, Any]:
     return {
         "schema_version": OBSERVATION_SCHEMA_VERSION,
@@ -56,6 +86,7 @@ def empty_observations() -> dict[str, Any]:
 def migrate_observation_document(document: dict[str, Any]) -> bool:
     """기존 관찰 표본을 보존하며 현재 스키마의 분석 필드를 보완한다."""
     schema_version = int(document.get("schema_version", 1) or 1)
+    legacy_schema = schema_version < OBSERVATION_SCHEMA_VERSION
     if schema_version > OBSERVATION_SCHEMA_VERSION:
         raise RuntimeError("signal observation schema is newer than this service")
     rows = document.setdefault("observations", [])
@@ -65,6 +96,8 @@ def migrate_observation_document(document: dict[str, Any]) -> bool:
     for row in rows:
         if not isinstance(row, dict):
             raise RuntimeError("signal observation row is malformed")
+        legacy_mfe = _finite_or_none(row.get("max_return_percent"))
+        legacy_mae = _finite_or_none(row.get("min_return_percent"))
         defaults = {
             "strategy_version": "baseline_v1",
             "strategy_variants": ["baseline_v1"],
@@ -79,6 +112,16 @@ def migrate_observation_document(document: dict[str, Any]) -> bool:
             "decision_reasons": [],
             "quote_status": "EXECUTABLE",
             "discovery_metadata": {},
+            "signal_type": signal_type_for_route(row.get("route_type")),
+            "research_decision": canonical_research_decision(row),
+            "mfe_percent": max(0.0, legacy_mfe) if legacy_mfe is not None else None,
+            "mae_percent": min(0.0, legacy_mae) if legacy_mae is not None else None,
+            "excursion_basis": "scheduled_jupiter_executable_quotes",
+            "tracking_profile": (
+                "legacy_15m"
+                if legacy_schema and str(row.get("status", "")).upper() == "COMPLETE"
+                else "research_v1_60m"
+            ),
         }
         for key, value in defaults.items():
             if key not in row:
@@ -301,6 +344,8 @@ async def record_candidate_discovery(
             "observation_id": observation_id,
             "mint": mint,
             "route_type": str(route_type).upper(),
+            "signal_type": signal_type_for_route(route_type),
+            "research_decision": "SHADOW",
             "source_wallet": source_wallet,
             "source_signature": source_signature,
             "safety_score": None,
@@ -334,6 +379,10 @@ async def record_candidate_discovery(
             "started_at": datetime.now(timezone.utc).isoformat(),
             "samples": [],
             "sample_attempts": {},
+            "mfe_percent": None,
+            "mae_percent": None,
+            "excursion_basis": "scheduled_jupiter_executable_quotes",
+            "tracking_profile": "research_v1_60m",
             "status": "DISCOVERED",
         })
         expire_observation_backlog(rows)
@@ -356,20 +405,34 @@ def _float_or_zero(value: Any) -> float:
     return number if math.isfinite(number) else 0.0
 
 
+def _finite_or_none(value: Any, *, integer: bool = False) -> int | float | None:
+    if isinstance(value, bool) or value is None or value == "":
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(number):
+        return None
+    return int(number) if integer else number
+
+
 def _normalized_momentum_metrics(
     metrics: dict[str, int | float] | None,
-) -> dict[str, int | float] | None:
+) -> dict[str, int | float | None] | None:
     if not isinstance(metrics, dict):
         return None
     return {
-        "volume_m5_usd": _float_or_zero(metrics.get("volume_m5_usd", 0)),
-        "buys_m5": int(_float_or_zero(metrics.get("buys_m5", 0))),
-        "sells_m5": int(_float_or_zero(metrics.get("sells_m5", 0))),
-        "net_buys_m5": int(_float_or_zero(metrics.get("net_buys_m5", 0))),
-        "buy_sell_ratio_m5": _float_or_zero(metrics.get("buy_sell_ratio_m5", 0)),
-        "liquidity_usd": _float_or_zero(metrics.get("liquidity_usd", 0)),
-        "pair_age_seconds": _float_or_zero(metrics.get("pair_age_seconds", 0)),
-        "unknown_whale_count": int(_float_or_zero(metrics.get("unknown_whale_count", 0))),
+        "volume_m5_usd": _finite_or_none(metrics.get("volume_m5_usd")),
+        "buys_m5": _finite_or_none(metrics.get("buys_m5"), integer=True),
+        "sells_m5": _finite_or_none(metrics.get("sells_m5"), integer=True),
+        "net_buys_m5": _finite_or_none(metrics.get("net_buys_m5"), integer=True),
+        "buy_sell_ratio_m5": _finite_or_none(metrics.get("buy_sell_ratio_m5")),
+        "liquidity_usd": _finite_or_none(metrics.get("liquidity_usd")),
+        "pair_age_seconds": _finite_or_none(metrics.get("pair_age_seconds")),
+        "unknown_whale_count": _finite_or_none(
+            metrics.get("unknown_whale_count"), integer=True
+        ),
     }
 
 
@@ -397,6 +460,7 @@ def finalize_candidate_without_quote(
         if not isinstance(target, dict):
             return False
         target["decision_status"] = normalized_decision
+        target["research_decision"] = "REJECTED"
         target["decision_reasons"] = [str(reason)[:200] for reason in decision_reasons[:20]]
         target["quote_status"] = str(quote_status).upper()[:80]
         target["paper_experiment_status"] = "NOT_ELIGIBLE"
@@ -491,6 +555,10 @@ async def record_observation_decision(
             "observation_id": observation_id,
             "mint": mint,
             "route_type": route_type,
+            "signal_type": signal_type_for_route(route_type),
+            "research_decision": (
+                "SHADOW" if normalized_decision == "APPROVED" else "REJECTED"
+            ),
             "source_wallet": source_wallet,
             "source_signature": source_signature,
             "safety_score": int(safety_score),
@@ -528,6 +596,10 @@ async def record_observation_decision(
             "started_at": datetime.now(timezone.utc).isoformat(),
             "samples": [],
             "sample_attempts": {},
+            "mfe_percent": None,
+            "mae_percent": None,
+            "excursion_basis": "scheduled_jupiter_executable_quotes",
+            "tracking_profile": "research_v1_60m",
             "status": "PENDING",
             "decision_status": normalized_decision,
             "decision_reasons": [str(reason)[:200] for reason in decision_reasons[:20]],
@@ -627,6 +699,10 @@ def mark_paper_experiment_status(
         if target.get("candidate_v2_eligible") is True:
             target["candidate_v2_paper_status"] = normalized
             target["candidate_v2_position_id"] = position_id
+        target["research_decision"] = (
+            "ENTERED" if normalized in {"OPENED", "CLOSED"}
+            else canonical_research_decision(target)
+        )
         document["observations"] = retained_observations(
             document.get("observations", [])
         )
@@ -639,8 +715,8 @@ def mark_paper_experiment_status(
     return bool(changed)
 
 
-def due_observation_samples(now: float) -> list[tuple[str, str, str, int, int]]:
-    """Return at most one due interval per observation to bound quote traffic."""
+def due_observation_samples(now: float) -> list[tuple[str, str, str, int, float]]:
+    """정확한 최신 horizon을 우선하며 observation당 하나만 반환한다."""
     document = ensure_observations_migrated()
     due: list[tuple[str, str, str, int, int]] = []
     for row in document.get("observations", []):
@@ -655,14 +731,14 @@ def due_observation_samples(now: float) -> list[tuple[str, str, str, int, int]]:
             if isinstance(sample, dict)
         }
         started_at = float(row.get("started_at_epoch", 0) or 0)
-        for label, delay in OBSERVATION_INTERVALS:
+        for label, delay in reversed(OBSERVATION_INTERVALS):
             if label not in completed and now >= started_at + delay:
                 due.append((
                     str(row.get("observation_id", "")),
                     label,
                     str(row.get("mint", "")),
                     int(row.get("token_amount_raw", 0) or 0),
-                    int(row.get("entry_cost_lamports", 0) or 0),
+                    started_at + delay,
                 ))
                 if len(due) >= OBSERVATION_SAMPLE_BATCH_SIZE:
                     return due
@@ -718,7 +794,7 @@ def record_sample(
     proceeds_lamports: int | None,
     error: str | None = None,
 ) -> bool:
-    """Append one idempotent interval result and complete after 15 minutes."""
+    """한 horizon 결과를 멱등 저장하고 마지막 horizon 뒤 완료한다."""
     allowed = {label for label, _ in OBSERVATION_INTERVALS}
     if interval not in allowed:
         raise ValueError("unsupported observation interval")
@@ -745,12 +821,20 @@ def record_sample(
             if proceeds_lamports is not None and entry_cost > 0
             else None
         )
+        sampled_at_epoch = time.time()
+        delay_seconds = dict(OBSERVATION_INTERVALS)[interval]
+        target_at_epoch = float(target.get("started_at_epoch", 0) or 0) + delay_seconds
         samples.append({
             "interval": interval,
             "proceeds_lamports": proceeds_lamports,
             "return_percent": return_percent,
             "error": error[:500] if error else None,
             "sampled_at": datetime.now(timezone.utc).isoformat(),
+            "target_at_epoch": target_at_epoch,
+            "sampled_at_epoch": sampled_at_epoch,
+            "sample_lag_seconds": round(
+                max(0.0, sampled_at_epoch - target_at_epoch), 4
+            ),
         })
         if interval == "1m" and target.get("candidate_v2_eligible") is True:
             target["candidate_v2_early_failure"] = (
@@ -758,20 +842,34 @@ def record_sample(
                 if return_percent is not None
                 else None
             )
-        if interval == "15m":
+        observed_returns = [
+            float(sample["return_percent"])
+            for sample in samples
+            if isinstance(sample, dict)
+            and sample.get("return_percent") is not None
+        ]
+        excursion_returns = [0.0, *observed_returns]
+        target["mfe_percent"] = (
+            max(excursion_returns) if observed_returns else None
+        )
+        target["mae_percent"] = (
+            min(excursion_returns) if observed_returns else None
+        )
+        # 기존 필드도 호환성을 위해 같은 표본 극값으로 유지한다.
+        target["max_return_percent"] = target["mfe_percent"]
+        target["min_return_percent"] = target["mae_percent"]
+        completed_intervals = {
+            str(sample.get("interval"))
+            for sample in samples
+            if isinstance(sample, dict)
+        }
+        required_intervals = {label for label, _ in OBSERVATION_INTERVALS}
+        if (
+            interval == OBSERVATION_INTERVALS[-1][0]
+            and required_intervals <= completed_intervals
+        ):
             target["status"] = "COMPLETE"
-            valid_returns = [
-                float(sample["return_percent"])
-                for sample in samples
-                if isinstance(sample, dict)
-                and sample.get("return_percent") is not None
-            ]
-            target["max_return_percent"] = (
-                max(valid_returns) if valid_returns else None
-            )
-            target["min_return_percent"] = (
-                min(valid_returns) if valid_returns else None
-            )
+            target["completed_at"] = datetime.now(timezone.utc).isoformat()
         expire_observation_backlog(rows)
         document["observations"] = retained_observations(rows)
         document["updated_at"] = datetime.now(timezone.utc).isoformat()
@@ -780,7 +878,7 @@ def record_sample(
     snapshot, _ = update_json(
         OBSERVATION_PATH, empty_observations(), mutate
     )
-    if snapshot is not None and interval == "15m":
+    if snapshot is not None and interval == OBSERVATION_INTERVALS[-1][0]:
         from src.shadow_trade_ledger import record_completed_shadow_trade
 
         record_completed_shadow_trade(snapshot)
@@ -788,7 +886,7 @@ def record_sample(
 
 
 async def observation_loop(interval_seconds: float = 15.0) -> None:
-    """Sample executable Jupiter exit values at 1, 5, and 15 minutes."""
+    """기존 bounded Jupiter 경로로 1/3/5/15/30/60분 값을 표본화한다."""
     load_dotenv()
     api_key = os.getenv("JUPITER_API_KEY", "").strip()
     if not api_key:
@@ -811,8 +909,25 @@ async def observation_loop(interval_seconds: float = 15.0) -> None:
             await asyncio.sleep(interval_seconds)
             due = await asyncio.to_thread(due_observation_samples, time.time())
             analysis_dirty = False
-            for observation_id, label, mint, amount, _ in due:
+            for observation_id, label, mint, amount, target_at_epoch in due:
                 try:
+                    lag_seconds = max(0.0, time.time() - target_at_epoch)
+                    if lag_seconds > MAX_HORIZON_SAMPLE_LAG_SECONDS:
+                        await asyncio.to_thread(
+                            record_sample,
+                            observation_id,
+                            label,
+                            proceeds_lamports=None,
+                            error="HORIZON_MISSED",
+                        )
+                        analysis_dirty = True
+                        logger.warning(
+                            "observation horizon missed: mint=%s interval=%s lag=%.3f",
+                            mint,
+                            label,
+                            lag_seconds,
+                        )
+                        continue
                     quote = await jupiter_quote(
                         session,
                         api_key,

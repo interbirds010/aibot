@@ -36,6 +36,8 @@ def completed_row(observation_id: str = "OBS-1") -> dict:
         "candidate_v2_filter_reasons": [],
         "paper_experiment_status": "NOT_ELIGIBLE",
         "paper_experiment_position_id": None,
+        "signal_type": "MOMENTUM",
+        "research_decision": "REJECTED",
         "decision_status": "REJECTED",
         "decision_reasons": ["SHADOW_ONLY"],
         "quote_status": "EXECUTABLE",
@@ -48,9 +50,16 @@ def completed_row(observation_id: str = "OBS-1") -> dict:
         "started_at": "2026-08-20T00:00:00+00:00",
         "samples": [
             {"interval": "1m", "return_percent": -5.0},
+            {"interval": "3m", "return_percent": 3.0},
             {"interval": "5m", "return_percent": -12.0},
             {"interval": "15m", "return_percent": 20.0},
+            {"interval": "30m", "return_percent": 8.0},
+            {"interval": "60m", "return_percent": 14.0},
         ],
+        "mfe_percent": 20.0,
+        "mae_percent": -12.0,
+        "excursion_basis": "scheduled_jupiter_executable_quotes",
+        "tracking_profile": "research_v1_60m",
         "sample_attempts": {},
         "status": "COMPLETE",
     }
@@ -69,9 +78,30 @@ class ShadowTradeLedgerTests(unittest.TestCase):
                 self.assertEqual(trade["entry_event"], "SHADOW_BUY")
                 self.assertEqual(trade["exit_event"], "SHADOW_SELL")
                 self.assertEqual(trade["trade_status"], "CLOSED")
+                self.assertEqual(trade["signal_type"], "MOMENTUM")
+                self.assertEqual(trade["research_decision"], "REJECTED")
+                self.assertEqual(trade["mfe_percent"], 20.0)
+                self.assertEqual(trade["mae_percent"], -12.0)
+                self.assertEqual(
+                    trade["excursion_basis"],
+                    "scheduled_jupiter_executable_quotes",
+                )
+                self.assertEqual(trade["tracking_profile"], "research_v1_60m")
+                self.assertEqual(
+                    [
+                        result.removeprefix("fixed_hold_")
+                        for result in trade["strategy_results"]
+                        if result.startswith("fixed_hold_")
+                    ],
+                    ["1m", "3m", "5m", "15m", "30m", "60m"],
+                )
                 self.assertEqual(
                     trade["strategy_results"]["fixed_hold_15m"]["return_percent"],
                     20.0,
+                )
+                self.assertEqual(
+                    trade["strategy_results"]["fixed_hold_60m"]["return_percent"],
+                    14.0,
                 )
                 self.assertEqual(
                     trade["strategy_results"]["sampled_route_exit"]["exit_reason"],
@@ -107,12 +137,12 @@ class ShadowTradeLedgerTests(unittest.TestCase):
                 saved = json.loads(path.read_text(encoding="utf-8"))
                 self.assertEqual(len(saved["trades"]), 2)
 
-    def test_fifteen_minute_sample_archives_trade(self) -> None:
+    def test_only_sixty_minute_sample_completes_and_archives_trade(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             observation_path = Path(tmp) / "signal_observations.json"
             shadow_path = Path(tmp) / "shadow_trades.json"
             row = completed_row()
-            row["samples"] = row["samples"][:2]
+            row["samples"] = row["samples"][:3]
             row["status"] = "PENDING"
             document = observation_tracker.empty_observations()
             document["observations"] = [row]
@@ -126,6 +156,19 @@ class ShadowTradeLedgerTests(unittest.TestCase):
                     "15m",
                     proceeds_lamports=1_200,
                 ))
+                pending = json.loads(observation_path.read_text(encoding="utf-8"))
+                self.assertEqual(pending["observations"][0]["status"], "PENDING")
+                self.assertFalse(shadow_path.exists())
+                self.assertTrue(observation_tracker.record_sample(
+                    row["observation_id"],
+                    "30m",
+                    proceeds_lamports=1_100,
+                ))
+                self.assertTrue(observation_tracker.record_sample(
+                    row["observation_id"],
+                    "60m",
+                    proceeds_lamports=1_140,
+                ))
             saved = json.loads(shadow_path.read_text(encoding="utf-8"))
             self.assertEqual(len(saved["trades"]), 1)
             self.assertEqual(
@@ -134,6 +177,40 @@ class ShadowTradeLedgerTests(unittest.TestCase):
                 ],
                 20.0,
             )
+            self.assertEqual(
+                saved["trades"][0]["strategy_results"]["fixed_hold_60m"][
+                    "return_percent"
+                ],
+                14.0,
+            )
+
+    def test_completed_shadow_trade_requires_sixty_minute_horizon(self) -> None:
+        row = completed_row()
+        row["samples"] = [
+            sample for sample in row["samples"]
+            if sample["interval"] != "60m"
+        ]
+        self.assertIsNone(shadow_trade_ledger.completed_shadow_trade(row))
+
+    def test_shadow_migration_fails_closed_for_malformed_trade(self) -> None:
+        document = {"schema_version": 1, "trades": ["corrupt-trade"]}
+        with self.assertRaisesRegex(RuntimeError, "ledger is malformed"):
+            shadow_trade_ledger.migrate_shadow_trade_document(document)
+
+    def test_legacy_completed_trade_keeps_fifteen_minute_terminal_horizon(self) -> None:
+        row = completed_row()
+        row["samples"] = [
+            sample for sample in row["samples"]
+            if sample["interval"] in {"1m", "5m", "15m"}
+        ]
+        row.pop("tracking_profile")
+        document = {"schema_version": 1, "trades": [row]}
+        self.assertTrue(shadow_trade_ledger.migrate_shadow_trade_document(document))
+        migrated = document["trades"][0]
+        self.assertEqual(migrated["tracking_profile"], "legacy_15m")
+        self.assertEqual(migrated["mfe_percent"], 20.0)
+        self.assertEqual(migrated["mae_percent"], -12.0)
+        self.assertIsNotNone(shadow_trade_ledger.completed_shadow_trade(migrated))
 
     def test_refresh_prefers_long_lived_shadow_trades(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -159,6 +236,10 @@ class ShadowTradeLedgerTests(unittest.TestCase):
                 )
             self.assertEqual(report["input_source"], "shadow_trades")
             self.assertEqual(report["input_row_count"], 1)
+            self.assertEqual(report["research_metrics"]["signal_count"], 0)
+            self.assertEqual(
+                report["long_term_outcome_metrics"]["signal_count"], 1
+            )
             self.assertEqual(
                 report["strategy_comparisons"]["sampled_route_exit"]["overall"]
                 ["train"]["mean_roi_percent"],

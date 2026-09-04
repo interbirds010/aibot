@@ -18,10 +18,15 @@ DEFAULT_OUTCOME_INTERVAL = "15m"
 DEFAULT_MIN_OUTCOME_COVERAGE = 0.80
 SHADOW_STRATEGY_NAMES = (
     "fixed_hold_1m",
+    "fixed_hold_3m",
     "fixed_hold_5m",
     "fixed_hold_15m",
+    "fixed_hold_30m",
+    "fixed_hold_60m",
     "sampled_route_exit",
 )
+RESEARCH_HORIZONS = ("1m", "3m", "5m", "15m", "30m", "60m")
+RESEARCH_PRIMARY_HORIZON = "60m"
 ANALYSIS_PATH = (
     Path(__file__).resolve().parents[1] / "data" / "observation_analysis.json"
 )
@@ -103,6 +108,10 @@ def performance_metrics(
     ordered = sorted(finite)
     count = len(ordered)
     wins = sum(value > 0 for value in ordered)
+    winning_returns = [value for value in ordered if value > 0]
+    losing_returns = [value for value in ordered if value < 0]
+    gross_profit = math.fsum(winning_returns)
+    gross_loss = abs(math.fsum(losing_returns))
     median = _quantile(ordered, 0.50)
     downside_tail = _quantile(ordered, 0.10)
     worst_count = max(1, math.ceil(count * 0.10)) if count else 0
@@ -115,9 +124,153 @@ def performance_metrics(
         "win_rate_percent": round(wins / count * 100, 4) if count else None,
         "mean_roi_percent": _rounded(_stable_mean(ordered)),
         "median_roi_percent": _rounded(median),
+        "average_win_percent": _rounded(_stable_mean(winning_returns)),
+        "average_loss_percent": _rounded(_stable_mean(losing_returns)),
+        "expectancy_percent": _rounded(_stable_mean(ordered)),
+        "profit_factor": (
+            _rounded(gross_profit / gross_loss) if gross_loss > 0 else None
+        ),
         "downside_p10_roi_percent": _rounded(downside_tail),
         "worst_decile_mean_roi_percent": _rounded(worst_decile),
     }
+
+
+def _research_decision(row: dict[str, Any]) -> str:
+    decision = str(row.get("research_decision") or "").strip().upper()
+    if decision in {"ENTERED", "REJECTED", "SHADOW"}:
+        return decision
+    paper_status = str(row.get("paper_experiment_status") or "").strip().upper()
+    if paper_status in {"OPENED", "CLOSED"}:
+        return "ENTERED"
+    entry_status = str(row.get("decision_status") or "").strip().upper()
+    if entry_status in {"REJECTED", "UNAVAILABLE", "FAILED"}:
+        return "REJECTED"
+    if entry_status == "APPROVED":
+        return "SHADOW"
+    return "UNKNOWN"
+
+
+def _research_group_value(value: Any, *, uppercase: bool = False) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return "UNKNOWN"
+    return text.upper() if uppercase else text[:120]
+
+
+def _sampled_excursions(row: dict[str, Any]) -> tuple[float | None, float | None]:
+    mfe = _finite_number(row.get("mfe_percent"))
+    mae = _finite_number(row.get("mae_percent"))
+    if mfe is not None and mae is not None:
+        return mfe, mae
+    returns = [
+        value
+        for interval in RESEARCH_HORIZONS
+        if (value := _interval_return(row, interval)) is not None
+    ]
+    return (
+        max(0.0, mfe) if mfe is not None
+        else (max([0.0, *returns]) if returns else None),
+        min(0.0, mae) if mae is not None
+        else (min([0.0, *returns]) if returns else None),
+    )
+
+
+def _research_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    decisions = [_research_decision(row) for row in rows]
+    horizons: dict[str, Any] = {}
+    for horizon in RESEARCH_HORIZONS:
+        metrics = performance_metrics(
+            [_interval_return(row, horizon) for row in rows],
+            minimum_samples=1,
+        )
+        metrics["completed_outcome_count"] = metrics["sample_count"]
+        metrics["average_return_percent"] = metrics["mean_roi_percent"]
+        horizons[horizon] = metrics
+
+    excursions = [_sampled_excursions(row) for row in rows]
+    mfe_values = [mfe for mfe, _ in excursions if mfe is not None]
+    mae_values = [mae for _, mae in excursions if mae is not None]
+    return {
+        "signal_count": len(rows),
+        "entered_count": decisions.count("ENTERED"),
+        "rejected_count": decisions.count("REJECTED"),
+        "shadow_count": decisions.count("SHADOW"),
+        "unknown_decision_count": decisions.count("UNKNOWN"),
+        "expired_count": sum(
+            str(row.get("status") or "").upper() == "EXPIRED_UNSAMPLED"
+            for row in rows
+        ),
+        "horizons": horizons,
+        "sampled_mfe_count": len(mfe_values),
+        "sampled_mae_count": len(mae_values),
+        "average_sampled_mfe_percent": _rounded(_stable_mean(mfe_values)),
+        "average_sampled_mae_percent": _rounded(_stable_mean(mae_values)),
+    }
+
+
+def build_research_metrics(rows: list[Any]) -> dict[str, Any]:
+    """원본 signal event를 삭제하지 않고 Research V1 집계를 만든다."""
+    if not isinstance(rows, list):
+        raise TypeError("research rows must be a list")
+    valid_rows = [row for row in rows if isinstance(row, dict)]
+    summary = _research_summary(valid_rows)
+    summary["invalid_row_count"] = len(rows) - len(valid_rows)
+    summary["excursion_basis"] = "scheduled_jupiter_executable_quotes"
+
+    grouped: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
+    for row in valid_rows:
+        key = (
+            _research_group_value(row.get("strategy_version")),
+            _research_group_value(row.get("route_type"), uppercase=True),
+            _research_group_value(row.get("signal_type"), uppercase=True),
+        )
+        grouped.setdefault(key, []).append(row)
+    summary["groups"] = [
+        {
+            "strategy_version": key[0],
+            "route_type": key[1],
+            "signal_type": key[2],
+            **_research_summary(group_rows),
+        }
+        for key, group_rows in sorted(grouped.items())
+    ]
+
+    rejected_by_reason: dict[str, list[dict[str, Any]]] = {}
+    for row in valid_rows:
+        if _research_decision(row) != "REJECTED":
+            continue
+        raw_reasons = row.get("decision_reasons")
+        reasons = (
+            {
+                str(reason).strip().upper()[:200]
+                for reason in raw_reasons
+                if str(reason).strip()
+            }
+            if isinstance(raw_reasons, list)
+            else set()
+        )
+        for reason in reasons or {"UNKNOWN"}:
+            rejected_by_reason.setdefault(reason, []).append(row)
+    rejection_rows = []
+    for reason, reason_rows in sorted(rejected_by_reason.items()):
+        returns = [
+            _interval_return(row, RESEARCH_PRIMARY_HORIZON)
+            for row in reason_rows
+        ]
+        finite = [value for value in returns if value is not None]
+        rejection_rows.append({
+            "reason": reason,
+            "outcome_interval": RESEARCH_PRIMARY_HORIZON,
+            "signal_count": len(reason_rows),
+            "completed_outcome_count": len(finite),
+            "average_return_percent": _rounded(_stable_mean(finite)),
+            "positive_rate_percent": (
+                round(sum(value > 0 for value in finite) / len(finite) * 100, 4)
+                if finite else None
+            ),
+        })
+    summary["rejection_reasons"] = rejection_rows
+    return summary
 
 
 def _rounded(value: float | None) -> float | None:
@@ -317,8 +470,10 @@ def build_observation_analysis(
     """최신 bounded 관찰을 시간순 train/holdout으로 나눠 조건별 성과를 계산한다."""
     if not isinstance(rows, list):
         raise TypeError("observation rows must be a list")
-    if outcome_interval not in {"1m", "5m", "15m"}:
-        raise ValueError("outcome_interval must be 1m, 5m, or 15m")
+    if outcome_interval not in set(RESEARCH_HORIZONS):
+        raise ValueError(
+            "outcome_interval must be 1m, 3m, 5m, 15m, 30m, or 60m"
+        )
     fraction = _finite_number(holdout_fraction)
     if fraction is None or not 0 < fraction < 1:
         raise ValueError("holdout_fraction must be finite and between 0 and 1")
@@ -550,6 +705,7 @@ def refresh_observation_analysis(
     ):
         raise RuntimeError("signal observation ledger is malformed")
     rows = document["observations"]
+    research_rows = rows
     input_source = "signal_observations"
     if observation_path is None:
         from src.shadow_trade_ledger import (
@@ -570,7 +726,9 @@ def refresh_observation_analysis(
         minimum_samples=minimum_samples,
     )
     report["input_source"] = input_source
+    report["research_metrics"] = build_research_metrics(research_rows)
     if input_source == "shadow_trades":
+        report["long_term_outcome_metrics"] = build_research_metrics(rows)
         report["strategy_comparisons"] = build_shadow_strategy_comparisons(
             rows,
             minimum_samples=minimum_samples,

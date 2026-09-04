@@ -8,6 +8,7 @@ from pathlib import Path
 from src.observation_analysis import (
     ABSOLUTE_MAX_ANALYSIS_ROWS,
     build_observation_analysis,
+    build_research_metrics,
     performance_metrics,
     refresh_observation_analysis,
 )
@@ -74,6 +75,135 @@ class PerformanceMetricsTests(unittest.TestCase):
         self.assertEqual(metrics["sample_count"], 1)
         self.assertFalse(metrics["sufficient_samples"])
         self.assertEqual(metrics["mean_roi_percent"], 1.0)
+
+    def test_expectancy_profit_factor_and_win_loss_averages(self) -> None:
+        metrics = performance_metrics(
+            [-20.0, 0.0, 10.0, 30.0], minimum_samples=1
+        )
+        self.assertEqual(metrics["average_win_percent"], 20.0)
+        self.assertEqual(metrics["average_loss_percent"], -20.0)
+        self.assertEqual(metrics["expectancy_percent"], 5.0)
+        self.assertEqual(metrics["profit_factor"], 2.0)
+
+    def test_profit_factor_edges_are_json_safe(self) -> None:
+        empty = performance_metrics([], minimum_samples=1)
+        wins = performance_metrics([10.0, 20.0], minimum_samples=1)
+        losses = performance_metrics([-10.0, -20.0], minimum_samples=1)
+        self.assertIsNone(empty["profit_factor"])
+        self.assertIsNone(wins["profit_factor"])
+        self.assertEqual(losses["profit_factor"], 0.0)
+        self.assertIsNone(wins["average_loss_percent"])
+        self.assertIsNone(losses["average_win_percent"])
+
+
+class ResearchMetricsTests(unittest.TestCase):
+    @staticmethod
+    def event(
+        mint: str,
+        decision: str,
+        return_60m: float | None,
+        *,
+        reason: str | None = None,
+        strategy: str = "baseline_v1",
+        route: str = "A",
+        signal_type: str = "SMART_MONEY",
+        status: str = "COMPLETE",
+    ) -> dict:
+        samples = []
+        if return_60m is not None:
+            samples = [
+                {"interval": "1m", "return_percent": -5.0},
+                {"interval": "60m", "return_percent": return_60m},
+            ]
+        return {
+            "observation_id": f"OBS-{mint}-{decision}",
+            "mint": mint,
+            "research_decision": decision,
+            "decision_reasons": [reason] if reason else [],
+            "strategy_version": strategy,
+            "route_type": route,
+            "signal_type": signal_type,
+            "status": status,
+            "samples": samples,
+        }
+
+    def test_empty_and_malformed_rows_are_fail_safe(self) -> None:
+        empty = build_research_metrics([])
+        malformed = build_research_metrics([
+            "bad",
+            {"research_decision": "invalid", "samples": "bad"},
+        ])
+        self.assertEqual(empty["signal_count"], 0)
+        self.assertIsNone(empty["horizons"]["60m"]["average_return_percent"])
+        self.assertEqual(malformed["invalid_row_count"], 1)
+        self.assertEqual(malformed["signal_count"], 1)
+        self.assertEqual(malformed["unknown_decision_count"], 1)
+        self.assertEqual(malformed["groups"][0]["route_type"], "UNKNOWN")
+
+    def test_counts_all_events_without_deduplicating_mints(self) -> None:
+        rows = [
+            self.event("SAME", "ENTERED", 10.0),
+            self.event("SAME", "REJECTED", 20.0, reason="LOW_SCORE"),
+            self.event("OTHER", "SHADOW", None, status="EXPIRED_UNSAMPLED"),
+        ]
+        metrics = build_research_metrics(rows)
+        self.assertEqual(metrics["signal_count"], 3)
+        self.assertEqual(metrics["entered_count"], 1)
+        self.assertEqual(metrics["rejected_count"], 1)
+        self.assertEqual(metrics["shadow_count"], 1)
+        self.assertEqual(metrics["expired_count"], 1)
+        self.assertEqual(metrics["horizons"]["60m"]["completed_outcome_count"], 2)
+        self.assertEqual(metrics["horizons"]["60m"]["average_return_percent"], 15.0)
+
+    def test_grouping_and_sampled_excursions(self) -> None:
+        rows = [
+            self.event("A", "ENTERED", 20.0),
+            self.event("B", "SHADOW", -10.0),
+            self.event(
+                "C", "SHADOW", 30.0,
+                strategy="momentum_v1", route="B", signal_type="MOMENTUM",
+            ),
+        ]
+        metrics = build_research_metrics(rows)
+        groups = {
+            (row["strategy_version"], row["route_type"], row["signal_type"]): row
+            for row in metrics["groups"]
+        }
+        self.assertEqual(groups[("baseline_v1", "A", "SMART_MONEY")]["signal_count"], 2)
+        self.assertEqual(groups[("momentum_v1", "B", "MOMENTUM")]["signal_count"], 1)
+        self.assertEqual(metrics["average_sampled_mfe_percent"], 16.6667)
+        self.assertEqual(metrics["average_sampled_mae_percent"], -6.6667)
+
+    def test_sampled_excursions_include_entry_baseline(self) -> None:
+        winner = self.event("WIN", "SHADOW", 20.0)
+        winner["samples"] = [{"interval": "60m", "return_percent": 20.0}]
+        loser = self.event("LOSS", "SHADOW", -20.0)
+        loser["samples"] = [{"interval": "60m", "return_percent": -20.0}]
+        metrics = build_research_metrics([winner, loser])
+        self.assertEqual(metrics["average_sampled_mfe_percent"], 10.0)
+        self.assertEqual(metrics["average_sampled_mae_percent"], -10.0)
+
+    def test_rejection_reason_uses_sixty_minute_outcome(self) -> None:
+        rows = [
+            self.event("A", "REJECTED", 20.0, reason="low_score"),
+            self.event("B", "REJECTED", -10.0, reason="LOW_SCORE"),
+            self.event("C", "REJECTED", None, reason="LOW_SCORE"),
+        ]
+        rejection = build_research_metrics(rows)["rejection_reasons"][0]
+        self.assertEqual(rejection["reason"], "LOW_SCORE")
+        self.assertEqual(rejection["signal_count"], 3)
+        self.assertEqual(rejection["completed_outcome_count"], 2)
+        self.assertEqual(rejection["average_return_percent"], 5.0)
+        self.assertEqual(rejection["positive_rate_percent"], 50.0)
+
+    def test_all_research_horizons_are_supported(self) -> None:
+        for horizon in ("1m", "3m", "5m", "15m", "30m", "60m"):
+            report = build_observation_analysis(
+                [observation(1, 10), observation(2, 20)],
+                outcome_interval=horizon,
+                minimum_samples=1,
+            )
+            self.assertEqual(report["outcome_interval"], horizon)
 
 
 class ObservationAnalysisTests(unittest.TestCase):
@@ -233,6 +363,7 @@ class ObservationAnalysisTests(unittest.TestCase):
             )
         self.assertTrue(saved["condition_candidates"])
         self.assertFalse(saved["automatic_config_changes"])
+        self.assertEqual(saved["research_metrics"]["signal_count"], 4)
         self.assertEqual(saved["version"], 1)
 
     def test_refresh_fails_closed_and_preserves_prior_report(self) -> None:

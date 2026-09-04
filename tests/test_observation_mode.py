@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -30,6 +31,7 @@ class ObservationLedgerTests(unittest.TestCase):
         signature: str = "SIGNATURE",
         route: str = "B",
         score: float = 95.0,
+        momentum_metrics: dict[str, int | float] | None = None,
     ) -> bool:
         return asyncio.run(observation_tracker.record_observation(
             mint=mint,
@@ -48,7 +50,7 @@ class ObservationLedgerTests(unittest.TestCase):
             analysis_completed_at="2026-07-30T00:00:01+00:00",
             entry_quote_at="2026-07-30T00:00:02+00:00",
             entry_latency_ms=2_000,
-            momentum_metrics={
+            momentum_metrics=momentum_metrics or {
                 "volume_m5_usd": 20_000,
                 "buys_m5": 30,
                 "sells_m5": 10,
@@ -98,6 +100,83 @@ class ObservationLedgerTests(unittest.TestCase):
             document["observations"][0]["safety_metrics"]["lp_locked_percent"],
             82.5,
         )
+
+    def test_canonical_research_event_serializes_signal_type_and_shadow(self) -> None:
+        self.assertTrue(self.record(route="B"))
+        document = observation_tracker.read_json(
+            observation_tracker.OBSERVATION_PATH,
+            observation_tracker.empty_observations(),
+        )
+        serialized = json.loads(json.dumps(document, ensure_ascii=False))
+        row = serialized["observations"][0]
+        self.assertEqual(row["signal_type"], "MOMENTUM")
+        self.assertEqual(row["research_decision"], "SHADOW")
+        self.assertEqual(row["observation_id"], "SIGNATURE:WALLET:MINT")
+
+    def test_research_decision_transitions_are_explicit(self) -> None:
+        discovery = asyncio.run(observation_tracker.record_candidate_discovery(
+            mint="DISCOVERED",
+            route_type="A",
+            source_wallet="WALLET",
+            source_signature="DISCOVERY",
+            token_amount_raw=100,
+            token_decimals=6,
+            signal_detected_at="2026-07-30T00:00:00+00:00",
+        ))
+        rows = observation_tracker.read_json(
+            observation_tracker.OBSERVATION_PATH,
+            observation_tracker.empty_observations(),
+        )["observations"]
+        self.assertEqual(rows[0]["signal_type"], "SMART_MONEY")
+        self.assertEqual(rows[0]["research_decision"], "SHADOW")
+        self.assertTrue(observation_tracker.finalize_candidate_without_quote(
+            discovery.observation_id,
+            decision_status="UNAVAILABLE",
+            decision_reasons=("ENTRY_QUOTE_NO_ROUTE",),
+            quote_status="NO_ROUTE",
+        ))
+        rows = observation_tracker.read_json(
+            observation_tracker.OBSERVATION_PATH,
+            observation_tracker.empty_observations(),
+        )["observations"]
+        self.assertEqual(rows[0]["research_decision"], "REJECTED")
+
+        self.assertTrue(self.record(mint="ENTERED", signature="ENTERED"))
+        entered = next(row for row in observation_tracker.read_json(
+            observation_tracker.OBSERVATION_PATH,
+            observation_tracker.empty_observations(),
+        )["observations"] if row["mint"] == "ENTERED")
+        self.assertEqual(entered["research_decision"], "SHADOW")
+        self.assertTrue(observation_tracker.mark_paper_experiment_status(
+            entered["observation_id"], "OPENED", position_id="POSITION"
+        ))
+        self.assertTrue(observation_tracker.mark_paper_experiment_status(
+            entered["observation_id"], "CLOSED", position_id="POSITION"
+        ))
+        entered = next(row for row in observation_tracker.read_json(
+            observation_tracker.OBSERVATION_PATH,
+            observation_tracker.empty_observations(),
+        )["observations"] if row["mint"] == "ENTERED")
+        self.assertEqual(entered["research_decision"], "ENTERED")
+
+    def test_missing_momentum_features_remain_none(self) -> None:
+        self.assertTrue(self.record(momentum_metrics={"volume_m5_usd": 20_000}))
+        row = observation_tracker.read_json(
+            observation_tracker.OBSERVATION_PATH,
+            observation_tracker.empty_observations(),
+        )["observations"][0]
+        metrics = row["momentum_metrics"]
+        self.assertEqual(metrics["volume_m5_usd"], 20_000.0)
+        for name in (
+            "buys_m5",
+            "sells_m5",
+            "net_buys_m5",
+            "buy_sell_ratio_m5",
+            "liquidity_usd",
+            "pair_age_seconds",
+            "unknown_whale_count",
+        ):
+            self.assertIsNone(metrics[name])
 
     def test_discovered_rejected_candidate_keeps_executable_shadow_samples(self) -> None:
         discovery = asyncio.run(observation_tracker.record_candidate_discovery(
@@ -224,6 +303,7 @@ class ObservationLedgerTests(unittest.TestCase):
         )
         self.assertEqual(row["samples"], original_samples)
         self.assertEqual(row["safety_metrics"], {})
+        self.assertEqual(row["tracking_profile"], "research_v1_60m")
         self.assertEqual(
             row["paper_experiment_status"],
             "LEGACY_OBSERVATION",
@@ -289,6 +369,7 @@ class ObservationLedgerTests(unittest.TestCase):
         with patch.object(observation_tracker, "OBSERVATION_SAMPLE_BATCH_SIZE", 2):
             due = observation_tracker.due_observation_samples(2_000)
         self.assertEqual(len(due), 2)
+        self.assertTrue(all(item[1] == "15m" for item in due))
 
     def test_active_backlog_expires_oldest_unopened_observation(self) -> None:
         with patch.object(observation_tracker, "MAX_ACTIVE_OBSERVATIONS", 2):
@@ -391,7 +472,18 @@ class ObservationLedgerTests(unittest.TestCase):
             1,
         )
 
-    def test_samples_capture_interval_returns_and_extremes(self) -> None:
+    def test_horizons_complete_only_at_sixty_minutes_and_capture_excursions(self) -> None:
+        self.assertEqual(
+            observation_tracker.OBSERVATION_INTERVALS,
+            (
+                ("1m", 60),
+                ("3m", 180),
+                ("5m", 300),
+                ("15m", 900),
+                ("30m", 1_800),
+                ("60m", 3_600),
+            ),
+        )
         self.record()
         row = observation_tracker.read_json(
             observation_tracker.OBSERVATION_PATH,
@@ -402,19 +494,85 @@ class ObservationLedgerTests(unittest.TestCase):
             observation_id, "1m", proceeds_lamports=900
         ))
         self.assertTrue(observation_tracker.record_sample(
+            observation_id, "3m", proceeds_lamports=800
+        ))
+        self.assertTrue(observation_tracker.record_sample(
             observation_id, "5m", proceeds_lamports=1_200
         ))
         self.assertTrue(observation_tracker.record_sample(
             observation_id, "15m", proceeds_lamports=1_100
         ))
+        after_fifteen = observation_tracker.read_json(
+            observation_tracker.OBSERVATION_PATH,
+            observation_tracker.empty_observations(),
+        )["observations"][0]
+        self.assertEqual(after_fifteen["status"], "PENDING")
+        self.assertEqual(after_fifteen["mfe_percent"], 20.0)
+        self.assertEqual(after_fifteen["mae_percent"], -20.0)
+        self.assertTrue(observation_tracker.record_sample(
+            observation_id, "30m", proceeds_lamports=1_050
+        ))
+        with patch("src.shadow_trade_ledger.record_completed_shadow_trade") as archive:
+            self.assertTrue(observation_tracker.record_sample(
+                observation_id, "60m", proceeds_lamports=1_150
+            ))
+        archive.assert_called_once()
         updated = observation_tracker.read_json(
             observation_tracker.OBSERVATION_PATH,
             observation_tracker.empty_observations(),
         )["observations"][0]
         self.assertEqual(updated["status"], "COMPLETE")
-        self.assertEqual(updated["min_return_percent"], -10.0)
+        self.assertEqual(updated["min_return_percent"], -20.0)
         self.assertEqual(updated["max_return_percent"], 20.0)
+        self.assertEqual(updated["mfe_percent"], 20.0)
+        self.assertEqual(updated["mae_percent"], -20.0)
+        self.assertEqual(updated["tracking_profile"], "research_v1_60m")
+        self.assertEqual(
+            updated["excursion_basis"],
+            "scheduled_jupiter_executable_quotes",
+        )
         self.assertTrue(updated["candidate_v2_early_failure"])
+
+    def test_sixty_minute_sample_requires_all_prior_horizons(self) -> None:
+        self.record()
+        row = observation_tracker.read_json(
+            observation_tracker.OBSERVATION_PATH,
+            observation_tracker.empty_observations(),
+        )["observations"][0]
+        self.assertTrue(observation_tracker.record_sample(
+            row["observation_id"], "60m", proceeds_lamports=1_100
+        ))
+        updated = observation_tracker.read_json(
+            observation_tracker.OBSERVATION_PATH,
+            observation_tracker.empty_observations(),
+        )["observations"][0]
+        self.assertEqual(updated["status"], "PENDING")
+
+    def test_excursions_include_zero_percent_entry_baseline(self) -> None:
+        self.record(mint="WIN", signature="WIN")
+        self.record(mint="LOSS", signature="LOSS")
+        rows = observation_tracker.read_json(
+            observation_tracker.OBSERVATION_PATH,
+            observation_tracker.empty_observations(),
+        )["observations"]
+        ids = {row["mint"]: row["observation_id"] for row in rows}
+        observation_tracker.record_sample(
+            ids["WIN"], "1m", proceeds_lamports=1_100
+        )
+        observation_tracker.record_sample(
+            ids["LOSS"], "1m", proceeds_lamports=900
+        )
+        rows = observation_tracker.read_json(
+            observation_tracker.OBSERVATION_PATH,
+            observation_tracker.empty_observations(),
+        )["observations"]
+        by_mint = {row["mint"]: row for row in rows}
+        self.assertEqual(by_mint["WIN"]["mae_percent"], 0.0)
+        self.assertEqual(by_mint["LOSS"]["mfe_percent"], 0.0)
+
+    def test_unknown_route_is_not_mislabeled_as_smart_money(self) -> None:
+        self.assertEqual(observation_tracker.signal_type_for_route(None), "UNKNOWN")
+        self.assertEqual(observation_tracker.signal_type_for_route("C"), "UNKNOWN")
 
     def test_no_route_at_one_minute_is_not_an_early_failure(self) -> None:
         self.record()
@@ -471,6 +629,7 @@ class ObservationLedgerTests(unittest.TestCase):
         self.assertEqual(updated["paper_experiment_position_id"], "POSITION")
         self.assertEqual(updated["candidate_v2_paper_status"], "OPENED")
         self.assertEqual(updated["candidate_v2_position_id"], "POSITION")
+        self.assertEqual(updated["research_decision"], "ENTERED")
 
 
 class ObservationEntryGateTests(unittest.TestCase):
