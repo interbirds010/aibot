@@ -312,6 +312,42 @@ class ObservationLedgerTests(unittest.TestCase):
             observation_tracker.migrate_observation_document(migrated)
         )
 
+    def test_migration_recovers_stranded_complete_horizon_set(self) -> None:
+        samples = [
+            {
+                "interval": interval,
+                "return_percent": None if interval == "3m" else 1.0,
+                "error": "HORIZON_MISSED" if interval == "3m" else None,
+                "sampled_at": f"2026-07-30T00:{index:02d}:00+00:00",
+            }
+            for index, (interval, _) in enumerate(
+                observation_tracker.OBSERVATION_INTERVALS,
+                start=1,
+            )
+        ]
+
+        def seed(document: dict) -> None:
+            document.update({
+                "schema_version": observation_tracker.OBSERVATION_SCHEMA_VERSION,
+                "observations": [{
+                    "observation_id": "STRANDED",
+                    "status": "PENDING",
+                    "tracking_profile": "research_v1_60m",
+                    "samples": samples,
+                }],
+            })
+
+        observation_tracker.update_json(
+            observation_tracker.OBSERVATION_PATH,
+            observation_tracker.empty_observations(),
+            seed,
+        )
+        recovered = observation_tracker.ensure_observations_migrated()
+        row = recovered["observations"][0]
+        self.assertEqual(row["status"], "COMPLETE")
+        self.assertEqual(row["completed_at"], "2026-07-30T00:06:00+00:00")
+        self.assertFalse(observation_tracker.migrate_observation_document(recovered))
+
     def test_migration_fails_closed_for_malformed_observation_row(self) -> None:
         document = {"schema_version": 2, "observations": ["corrupt-row"]}
         with self.assertRaisesRegex(RuntimeError, "row is malformed"):
@@ -472,7 +508,7 @@ class ObservationLedgerTests(unittest.TestCase):
             1,
         )
 
-    def test_horizons_complete_only_at_sixty_minutes_and_capture_excursions(self) -> None:
+    def test_horizons_complete_in_normal_order_and_capture_excursions(self) -> None:
         self.assertEqual(
             observation_tracker.OBSERVATION_INTERVALS,
             (
@@ -533,20 +569,156 @@ class ObservationLedgerTests(unittest.TestCase):
         )
         self.assertTrue(updated["candidate_v2_early_failure"])
 
-    def test_sixty_minute_sample_requires_all_prior_horizons(self) -> None:
+    def test_five_horizons_without_one_required_interval_remain_pending(self) -> None:
         self.record()
         row = observation_tracker.read_json(
             observation_tracker.OBSERVATION_PATH,
             observation_tracker.empty_observations(),
         )["observations"][0]
-        self.assertTrue(observation_tracker.record_sample(
-            row["observation_id"], "60m", proceeds_lamports=1_100
-        ))
+        with patch("src.shadow_trade_ledger.record_completed_shadow_trade") as archive:
+            for interval in ("1m", "5m", "15m", "30m", "60m"):
+                self.assertTrue(observation_tracker.record_sample(
+                    row["observation_id"],
+                    interval,
+                    proceeds_lamports=1_100,
+                ))
         updated = observation_tracker.read_json(
             observation_tracker.OBSERVATION_PATH,
             observation_tracker.empty_observations(),
         )["observations"][0]
         self.assertEqual(updated["status"], "PENDING")
+        self.assertEqual(len(updated["samples"]), 5)
+        archive.assert_not_called()
+
+    def test_horizons_complete_after_reverse_order_backlog(self) -> None:
+        self.record()
+        row = observation_tracker.read_json(
+            observation_tracker.OBSERVATION_PATH,
+            observation_tracker.empty_observations(),
+        )["observations"][0]
+        observation_id = row["observation_id"]
+        reverse_order = ("60m", "30m", "15m", "5m", "3m", "1m")
+        with patch("src.shadow_trade_ledger.record_completed_shadow_trade") as archive:
+            for interval in reverse_order[:-1]:
+                self.assertTrue(observation_tracker.record_sample(
+                    observation_id,
+                    interval,
+                    proceeds_lamports=1_100,
+                ))
+            pending = observation_tracker.read_json(
+                observation_tracker.OBSERVATION_PATH,
+                observation_tracker.empty_observations(),
+            )["observations"][0]
+            self.assertEqual(pending["status"], "PENDING")
+            archive.assert_not_called()
+            self.assertTrue(observation_tracker.record_sample(
+                observation_id,
+                reverse_order[-1],
+                proceeds_lamports=1_100,
+            ))
+        completed = observation_tracker.read_json(
+            observation_tracker.OBSERVATION_PATH,
+            observation_tracker.empty_observations(),
+        )["observations"][0]
+        self.assertEqual(completed["status"], "COMPLETE")
+        archive.assert_called_once()
+
+    def test_missing_outcome_samples_still_complete_all_horizons(self) -> None:
+        self.record()
+        row = observation_tracker.read_json(
+            observation_tracker.OBSERVATION_PATH,
+            observation_tracker.empty_observations(),
+        )["observations"][0]
+        observation_id = row["observation_id"]
+        with patch("src.shadow_trade_ledger.record_completed_shadow_trade") as archive:
+            for interval, _ in observation_tracker.OBSERVATION_INTERVALS:
+                missing = interval in {"3m", "30m"}
+                self.assertTrue(observation_tracker.record_sample(
+                    observation_id,
+                    interval,
+                    proceeds_lamports=None if missing else 1_100,
+                    error="HORIZON_MISSED" if missing else None,
+                ))
+        completed = observation_tracker.read_json(
+            observation_tracker.OBSERVATION_PATH,
+            observation_tracker.empty_observations(),
+        )["observations"][0]
+        self.assertEqual(completed["status"], "COMPLETE")
+        self.assertEqual(len(completed["samples"]), 6)
+        self.assertEqual(
+            {
+                sample["interval"]
+                for sample in completed["samples"]
+                if sample["return_percent"] is None
+            },
+            {"3m", "30m"},
+        )
+        archive.assert_called_once()
+
+    def test_complete_observation_rejects_duplicate_horizon_idempotently(self) -> None:
+        self.record()
+        row = observation_tracker.read_json(
+            observation_tracker.OBSERVATION_PATH,
+            observation_tracker.empty_observations(),
+        )["observations"][0]
+        observation_id = row["observation_id"]
+        with patch("src.shadow_trade_ledger.record_completed_shadow_trade") as archive:
+            for interval, _ in observation_tracker.OBSERVATION_INTERVALS:
+                self.assertTrue(observation_tracker.record_sample(
+                    observation_id,
+                    interval,
+                    proceeds_lamports=1_100,
+                ))
+            archive.reset_mock()
+            self.assertFalse(observation_tracker.record_sample(
+                observation_id,
+                "60m",
+                proceeds_lamports=900,
+            ))
+        completed = observation_tracker.read_json(
+            observation_tracker.OBSERVATION_PATH,
+            observation_tracker.empty_observations(),
+        )["observations"][0]
+        self.assertEqual(completed["status"], "COMPLETE")
+        self.assertEqual(len(completed["samples"]), 6)
+        sixty_minute = next(
+            sample for sample in completed["samples"]
+            if sample["interval"] == "60m"
+        )
+        self.assertEqual(sixty_minute["return_percent"], 10.0)
+        archive.assert_not_called()
+
+    def test_legacy_profile_completes_at_its_fifteen_minute_horizon(self) -> None:
+        self.record()
+        row = observation_tracker.read_json(
+            observation_tracker.OBSERVATION_PATH,
+            observation_tracker.empty_observations(),
+        )["observations"][0]
+        observation_id = row["observation_id"]
+
+        def mark_legacy(document: dict) -> None:
+            target = document["observations"][0]
+            target["tracking_profile"] = "legacy_15m"
+
+        observation_tracker.update_json(
+            observation_tracker.OBSERVATION_PATH,
+            observation_tracker.empty_observations(),
+            mark_legacy,
+        )
+        with patch("src.shadow_trade_ledger.record_completed_shadow_trade") as archive:
+            for interval in ("15m", "5m", "1m"):
+                self.assertTrue(observation_tracker.record_sample(
+                    observation_id,
+                    interval,
+                    proceeds_lamports=1_100,
+                ))
+        completed = observation_tracker.read_json(
+            observation_tracker.OBSERVATION_PATH,
+            observation_tracker.empty_observations(),
+        )["observations"][0]
+        self.assertEqual(completed["status"], "COMPLETE")
+        self.assertEqual(len(completed["samples"]), 3)
+        archive.assert_called_once()
 
     def test_excursions_include_zero_percent_entry_baseline(self) -> None:
         self.record(mint="WIN", signature="WIN")

@@ -44,6 +44,13 @@ CANDIDATE_V2_MINT_COOLDOWN_SECONDS = 86_400.0
 CANDIDATE_V2_EARLY_FAILURE_PERCENT = -10.0
 
 
+def required_observation_intervals(row: dict[str, Any]) -> set[str]:
+    """추적 profile별 완료에 필요한 horizon 집합을 반환한다."""
+    if row.get("tracking_profile") == "legacy_15m":
+        return {"1m", "5m", "15m"}
+    return {label for label, _ in OBSERVATION_INTERVALS}
+
+
 @dataclass(frozen=True, slots=True)
 class ObservationDecision:
     created: bool
@@ -137,6 +144,28 @@ def migrate_observation_document(document: dict[str, Any]) -> bool:
             raise RuntimeError("signal observation decision reasons are malformed")
         if not isinstance(row.get("discovery_metadata"), dict):
             raise RuntimeError("signal observation discovery metadata is malformed")
+        completed_intervals = {
+            str(sample.get("interval"))
+            for sample in row["samples"]
+            if isinstance(sample, dict)
+        }
+        if (
+            str(row.get("status", "")).upper() == "PENDING"
+            and required_observation_intervals(row) <= completed_intervals
+        ):
+            row["status"] = "COMPLETE"
+            sampled_at_values = [
+                str(sample.get("sampled_at"))
+                for sample in row["samples"]
+                if isinstance(sample, dict) and sample.get("sampled_at")
+            ]
+            if not row.get("completed_at"):
+                row["completed_at"] = (
+                    max(sampled_at_values)
+                    if sampled_at_values
+                    else datetime.now(timezone.utc).isoformat()
+                )
+            changed = True
     if changed:
         document["schema_version"] = OBSERVATION_SCHEMA_VERSION
         document["updated_at"] = datetime.now(timezone.utc).isoformat()
@@ -794,7 +823,7 @@ def record_sample(
     proceeds_lamports: int | None,
     error: str | None = None,
 ) -> bool:
-    """한 horizon 결과를 멱등 저장하고 마지막 horizon 뒤 완료한다."""
+    """한 horizon 결과를 멱등 저장하고 필수 horizon이 모이면 완료한다."""
     allowed = {label for label, _ in OBSERVATION_INTERVALS}
     if interval not in allowed:
         raise ValueError("unsupported observation interval")
@@ -863,13 +892,11 @@ def record_sample(
             for sample in samples
             if isinstance(sample, dict)
         }
-        required_intervals = {label for label, _ in OBSERVATION_INTERVALS}
-        if (
-            interval == OBSERVATION_INTERVALS[-1][0]
-            and required_intervals <= completed_intervals
-        ):
+        required_intervals = required_observation_intervals(target)
+        if required_intervals <= completed_intervals:
             target["status"] = "COMPLETE"
-            target["completed_at"] = datetime.now(timezone.utc).isoformat()
+            if not target.get("completed_at"):
+                target["completed_at"] = datetime.now(timezone.utc).isoformat()
         expire_observation_backlog(rows)
         document["observations"] = retained_observations(rows)
         document["updated_at"] = datetime.now(timezone.utc).isoformat()
@@ -878,7 +905,10 @@ def record_sample(
     snapshot, _ = update_json(
         OBSERVATION_PATH, empty_observations(), mutate
     )
-    if snapshot is not None and interval == OBSERVATION_INTERVALS[-1][0]:
+    if (
+        snapshot is not None
+        and str(snapshot.get("status", "")).upper() == "COMPLETE"
+    ):
         from src.shadow_trade_ledger import record_completed_shadow_trade
 
         record_completed_shadow_trade(snapshot)

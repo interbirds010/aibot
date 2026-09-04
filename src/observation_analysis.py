@@ -27,6 +27,9 @@ SHADOW_STRATEGY_NAMES = (
 )
 RESEARCH_HORIZONS = ("1m", "3m", "5m", "15m", "30m", "60m")
 RESEARCH_PRIMARY_HORIZON = "60m"
+UNTRACKABLE_QUOTE_STATUSES = {
+    "NO_ROUTE", "NOT_REQUESTED", "SIZE_UNUSABLE", "PROCESSING_FAILED",
+}
 ANALYSIS_PATH = (
     Path(__file__).resolve().parents[1] / "data" / "observation_analysis.json"
 )
@@ -58,14 +61,60 @@ def _started_at_epoch(row: dict[str, Any]) -> float | None:
 
 
 def _interval_return(row: dict[str, Any], interval: str) -> float | None:
+    sample = _interval_sample(row, interval)
+    return _finite_number(sample.get("return_percent")) if sample else None
+
+
+def _interval_sample(
+    row: dict[str, Any], interval: str
+) -> dict[str, Any] | None:
     samples = row.get("samples")
     if not isinstance(samples, list):
         return None
     for sample in samples:
         if not isinstance(sample, dict) or str(sample.get("interval")) != interval:
             continue
-        return _finite_number(sample.get("return_percent"))
+        return sample
     return None
+
+
+def _outcome_trackable(row: dict[str, Any]) -> bool:
+    """진입 견적 부재로 outcome을 만들 수 없는 신호를 구분한다."""
+    quote_status = str(row.get("quote_status") or "").strip().upper()
+    return quote_status not in UNTRACKABLE_QUOTE_STATUSES
+
+
+def _missing_outcome_reason(
+    row: dict[str, Any], sample: dict[str, Any] | None
+) -> str:
+    if not _outcome_trackable(row):
+        return "NO_ROUTE"
+    if sample is None:
+        return "NOT_SAMPLED"
+    error = str(sample.get("error") or "").strip().upper()
+    if "HORIZON_MISSED" in error:
+        return "HORIZON_MISSED"
+    if "NO_ROUTE" in error or ("NO " in error and "ROUTE" in error):
+        return "NO_ROUTE"
+    if error:
+        return "API_FAILURE"
+    return "UNKNOWN"
+
+
+def _lag_metrics(samples: list[dict[str, Any]]) -> dict[str, Any]:
+    lags = sorted(
+        lag
+        for sample in samples
+        if (lag := _finite_number(sample.get("sample_lag_seconds"))) is not None
+        and lag >= 0
+    )
+    return {
+        "lag_sample_count": len(lags),
+        "mean_sample_lag_seconds": _rounded(_stable_mean(lags)),
+        "median_sample_lag_seconds": _rounded(_quantile(lags, 0.50)),
+        "p90_sample_lag_seconds": _rounded(_quantile(lags, 0.90)),
+        "max_sample_lag_seconds": _rounded(max(lags) if lags else None),
+    }
 
 
 def _stable_mean(values: list[float]) -> float | None:
@@ -179,10 +228,39 @@ def _research_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
     decisions = [_research_decision(row) for row in rows]
     horizons: dict[str, Any] = {}
     for horizon in RESEARCH_HORIZONS:
+        samples = [_interval_sample(row, horizon) for row in rows]
+        returns = [
+            _finite_number(sample.get("return_percent")) if sample else None
+            for sample in samples
+        ]
         metrics = performance_metrics(
-            [_interval_return(row, horizon) for row in rows],
+            returns,
             minimum_samples=1,
         )
+        signal_count = len(rows)
+        sampled_count = metrics["sample_count"]
+        trackable_count = sum(_outcome_trackable(row) for row in rows)
+        missing_reasons: dict[str, int] = {}
+        for row, sample, outcome in zip(rows, samples, returns):
+            if outcome is not None:
+                continue
+            reason = _missing_outcome_reason(row, sample)
+            missing_reasons[reason] = missing_reasons.get(reason, 0) + 1
+        metrics.update({
+            "signal_count": signal_count,
+            "sampled_count": sampled_count,
+            "missing_count": signal_count - sampled_count,
+            "coverage_rate_percent": (
+                round(sampled_count / signal_count * 100, 4)
+                if signal_count else None
+            ),
+            "outcome_trackable_count": trackable_count,
+            "outcome_untrackable_count": signal_count - trackable_count,
+            "missing_reasons": dict(sorted(missing_reasons.items())),
+            **_lag_metrics([
+                sample for sample in samples if isinstance(sample, dict)
+            ]),
+        })
         metrics["completed_outcome_count"] = metrics["sample_count"]
         metrics["average_return_percent"] = metrics["mean_roi_percent"]
         horizons[horizon] = metrics
@@ -190,8 +268,11 @@ def _research_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
     excursions = [_sampled_excursions(row) for row in rows]
     mfe_values = [mfe for mfe, _ in excursions if mfe is not None]
     mae_values = [mae for _, mae in excursions if mae is not None]
+    trackable_count = sum(_outcome_trackable(row) for row in rows)
     return {
         "signal_count": len(rows),
+        "outcome_trackable_count": trackable_count,
+        "outcome_untrackable_count": len(rows) - trackable_count,
         "entered_count": decisions.count("ENTERED"),
         "rejected_count": decisions.count("REJECTED"),
         "shadow_count": decisions.count("SHADOW"),
@@ -258,11 +339,25 @@ def build_research_metrics(rows: list[Any]) -> dict[str, Any]:
             for row in reason_rows
         ]
         finite = [value for value in returns if value is not None]
+        sampled_count = len(finite)
+        signal_count = len(reason_rows)
         rejection_rows.append({
             "reason": reason,
             "outcome_interval": RESEARCH_PRIMARY_HORIZON,
-            "signal_count": len(reason_rows),
-            "completed_outcome_count": len(finite),
+            "signal_count": signal_count,
+            "outcome_sample_count": sampled_count,
+            "outcome_missing_count": signal_count - sampled_count,
+            "coverage_rate_percent": (
+                round(sampled_count / signal_count * 100, 4)
+                if signal_count else None
+            ),
+            "outcome_trackable_count": sum(
+                _outcome_trackable(row) for row in reason_rows
+            ),
+            "outcome_untrackable_count": sum(
+                not _outcome_trackable(row) for row in reason_rows
+            ),
+            "completed_outcome_count": sampled_count,
             "average_return_percent": _rounded(_stable_mean(finite)),
             "positive_rate_percent": (
                 round(sum(value > 0 for value in finite) / len(finite) * 100, 4)

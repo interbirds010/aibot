@@ -123,6 +123,17 @@ class ShadowTradeLedgerTests(unittest.TestCase):
                 )
                 self.assertFalse(path.exists())
 
+    def test_pending_observation_is_not_shadow_traded(self) -> None:
+        row = completed_row()
+        row["status"] = "PENDING"
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "shadow_trades.json"
+            with patch.object(shadow_trade_ledger, "SHADOW_TRADE_PATH", path):
+                self.assertFalse(
+                    shadow_trade_ledger.record_completed_shadow_trade(row)
+                )
+                self.assertFalse(path.exists())
+
     def test_backfill_is_idempotent(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "shadow_trades.json"

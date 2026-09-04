@@ -154,6 +154,10 @@ class ResearchMetricsTests(unittest.TestCase):
         self.assertEqual(metrics["expired_count"], 1)
         self.assertEqual(metrics["horizons"]["60m"]["completed_outcome_count"], 2)
         self.assertEqual(metrics["horizons"]["60m"]["average_return_percent"], 15.0)
+        self.assertEqual(metrics["horizons"]["60m"]["signal_count"], 3)
+        self.assertEqual(metrics["horizons"]["60m"]["sampled_count"], 2)
+        self.assertEqual(metrics["horizons"]["60m"]["missing_count"], 1)
+        self.assertEqual(metrics["horizons"]["60m"]["coverage_rate_percent"], 66.6667)
 
     def test_grouping_and_sampled_excursions(self) -> None:
         rows = [
@@ -193,8 +197,101 @@ class ResearchMetricsTests(unittest.TestCase):
         self.assertEqual(rejection["reason"], "LOW_SCORE")
         self.assertEqual(rejection["signal_count"], 3)
         self.assertEqual(rejection["completed_outcome_count"], 2)
+        self.assertEqual(rejection["outcome_sample_count"], 2)
+        self.assertEqual(rejection["outcome_missing_count"], 1)
+        self.assertEqual(rejection["coverage_rate_percent"], 66.6667)
+        self.assertEqual(rejection["outcome_trackable_count"], 3)
+        self.assertEqual(rejection["outcome_untrackable_count"], 0)
         self.assertEqual(rejection["average_return_percent"], 5.0)
         self.assertEqual(rejection["positive_rate_percent"], 50.0)
+
+    def test_data_quality_normalizes_missing_reasons_and_keeps_no_route(self) -> None:
+        sampled = self.event("OK", "SHADOW", 12.0)
+        sampled["samples"][-1]["sample_lag_seconds"] = 1.0
+        missed = self.event("MISSED", "SHADOW", None)
+        missed["samples"] = [{
+            "interval": "60m",
+            "return_percent": None,
+            "error": "HORIZON_MISSED",
+            "sample_lag_seconds": 61.0,
+        }]
+        no_route = self.event("NO-ROUTE", "REJECTED", None)
+        no_route["quote_status"] = "NO_ROUTE"
+        api_failure = self.event("API", "SHADOW", None)
+        api_failure["samples"] = [{
+            "interval": "60m",
+            "return_percent": None,
+            "error": "HTTP 503: changing provider detail",
+            "sample_lag_seconds": 3.0,
+        }]
+        unknown = self.event("UNKNOWN", "SHADOW", None)
+        unknown["samples"] = [{
+            "interval": "60m",
+            "return_percent": math.nan,
+            "error": None,
+            "sample_lag_seconds": math.inf,
+        }]
+
+        metrics = build_research_metrics(
+            [sampled, missed, no_route, api_failure, unknown]
+        )
+        horizon = metrics["horizons"]["60m"]
+        self.assertEqual(horizon["signal_count"], 5)
+        self.assertEqual(horizon["sampled_count"], 1)
+        self.assertEqual(horizon["missing_count"], 4)
+        self.assertEqual(horizon["coverage_rate_percent"], 20.0)
+        self.assertEqual(horizon["missing_reasons"], {
+            "API_FAILURE": 1,
+            "HORIZON_MISSED": 1,
+            "NO_ROUTE": 1,
+            "UNKNOWN": 1,
+        })
+        self.assertEqual(metrics["outcome_trackable_count"], 4)
+        self.assertEqual(metrics["outcome_untrackable_count"], 1)
+        self.assertEqual(horizon["outcome_trackable_count"], 4)
+        self.assertEqual(horizon["outcome_untrackable_count"], 1)
+        self.assertEqual(horizon["lag_sample_count"], 3)
+        self.assertEqual(horizon["mean_sample_lag_seconds"], 21.6667)
+        self.assertEqual(horizon["median_sample_lag_seconds"], 3.0)
+        self.assertEqual(horizon["p90_sample_lag_seconds"], 49.4)
+        self.assertEqual(horizon["max_sample_lag_seconds"], 61.0)
+
+    def test_group_horizons_include_coverage_and_lag_metrics(self) -> None:
+        first = self.event("A", "ENTERED", 10.0)
+        first["samples"][-1]["sample_lag_seconds"] = 2.0
+        second = self.event("B", "SHADOW", None)
+        second["samples"] = [{
+            "interval": "60m",
+            "return_percent": None,
+            "error": "Jupiter returned no executable route",
+            "sample_lag_seconds": 6.0,
+        }]
+        metrics = build_research_metrics([first, second])
+        group = metrics["groups"][0]
+        horizon = group["horizons"]["60m"]
+        self.assertEqual(horizon["signal_count"], 2)
+        self.assertEqual(horizon["sampled_count"], 1)
+        self.assertEqual(horizon["coverage_rate_percent"], 50.0)
+        self.assertEqual(horizon["missing_reasons"], {"NO_ROUTE": 1})
+        self.assertEqual(horizon["lag_sample_count"], 2)
+        self.assertEqual(horizon["mean_sample_lag_seconds"], 4.0)
+
+    def test_non_executable_quote_statuses_are_untrackable_not_zero_return(self) -> None:
+        rows = []
+        for quote_status in (
+            "NO_ROUTE", "NOT_REQUESTED", "SIZE_UNUSABLE", "PROCESSING_FAILED",
+        ):
+            row = self.event(quote_status, "REJECTED", None, reason="NO_ENTRY")
+            row["quote_status"] = quote_status
+            rows.append(row)
+        metrics = build_research_metrics(rows)
+        horizon = metrics["horizons"]["60m"]
+        self.assertEqual(metrics["signal_count"], 4)
+        self.assertEqual(metrics["outcome_untrackable_count"], 4)
+        self.assertEqual(horizon["sampled_count"], 0)
+        self.assertEqual(horizon["missing_count"], 4)
+        self.assertEqual(horizon["coverage_rate_percent"], 0.0)
+        self.assertIsNone(horizon["average_return_percent"])
 
     def test_all_research_horizons_are_supported(self) -> None:
         for horizon in ("1m", "3m", "5m", "15m", "30m", "60m"):
