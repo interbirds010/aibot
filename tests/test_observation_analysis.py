@@ -158,6 +158,10 @@ class ResearchMetricsTests(unittest.TestCase):
         self.assertEqual(metrics["horizons"]["60m"]["sampled_count"], 2)
         self.assertEqual(metrics["horizons"]["60m"]["missing_count"], 1)
         self.assertEqual(metrics["horizons"]["60m"]["coverage_rate_percent"], 66.6667)
+        self.assertEqual(
+            metrics["horizons"]["60m"]["trackable_coverage_rate_percent"],
+            66.6667,
+        )
 
     def test_grouping_and_sampled_excursions(self) -> None:
         rows = [
@@ -202,6 +206,7 @@ class ResearchMetricsTests(unittest.TestCase):
         self.assertEqual(rejection["coverage_rate_percent"], 66.6667)
         self.assertEqual(rejection["outcome_trackable_count"], 3)
         self.assertEqual(rejection["outcome_untrackable_count"], 0)
+        self.assertEqual(rejection["trackable_coverage_rate_percent"], 66.6667)
         self.assertEqual(rejection["average_return_percent"], 5.0)
         self.assertEqual(rejection["positive_rate_percent"], 50.0)
 
@@ -240,10 +245,11 @@ class ResearchMetricsTests(unittest.TestCase):
         self.assertEqual(horizon["sampled_count"], 1)
         self.assertEqual(horizon["missing_count"], 4)
         self.assertEqual(horizon["coverage_rate_percent"], 20.0)
+        self.assertEqual(horizon["trackable_coverage_rate_percent"], 25.0)
         self.assertEqual(horizon["missing_reasons"], {
             "API_FAILURE": 1,
+            "ENTRY_NO_ROUTE": 1,
             "HORIZON_MISSED": 1,
-            "NO_ROUTE": 1,
             "UNKNOWN": 1,
         })
         self.assertEqual(metrics["outcome_trackable_count"], 4)
@@ -272,7 +278,8 @@ class ResearchMetricsTests(unittest.TestCase):
         self.assertEqual(horizon["signal_count"], 2)
         self.assertEqual(horizon["sampled_count"], 1)
         self.assertEqual(horizon["coverage_rate_percent"], 50.0)
-        self.assertEqual(horizon["missing_reasons"], {"NO_ROUTE": 1})
+        self.assertEqual(horizon["trackable_coverage_rate_percent"], 50.0)
+        self.assertEqual(horizon["missing_reasons"], {"EXIT_NO_ROUTE": 1})
         self.assertEqual(horizon["lag_sample_count"], 2)
         self.assertEqual(horizon["mean_sample_lag_seconds"], 4.0)
 
@@ -291,7 +298,33 @@ class ResearchMetricsTests(unittest.TestCase):
         self.assertEqual(horizon["sampled_count"], 0)
         self.assertEqual(horizon["missing_count"], 4)
         self.assertEqual(horizon["coverage_rate_percent"], 0.0)
+        self.assertIsNone(horizon["trackable_coverage_rate_percent"])
+        self.assertEqual(horizon["missing_reasons"], {
+            "ENTRY_NOT_REQUESTED": 1,
+            "ENTRY_NO_ROUTE": 1,
+            "ENTRY_SIZE_UNUSABLE": 1,
+            "PROCESSING_FAILED": 1,
+        })
         self.assertIsNone(horizon["average_return_percent"])
+
+        rejection = metrics["rejection_reasons"][0]
+        self.assertEqual(rejection["coverage_rate_percent"], 0.0)
+        self.assertIsNone(rejection["trackable_coverage_rate_percent"])
+
+    def test_rejection_reason_separates_raw_and_trackable_coverage(self) -> None:
+        sampled = self.event("SAMPLED", "REJECTED", 10.0, reason="LOW_SCORE")
+        missing = self.event("MISSING", "REJECTED", None, reason="LOW_SCORE")
+        no_entry = self.event("NO-ENTRY", "REJECTED", None, reason="LOW_SCORE")
+        no_entry["quote_status"] = "NO_ROUTE"
+
+        rejection = build_research_metrics(
+            [sampled, missing, no_entry]
+        )["rejection_reasons"][0]
+        self.assertEqual(rejection["signal_count"], 3)
+        self.assertEqual(rejection["outcome_sample_count"], 1)
+        self.assertEqual(rejection["outcome_trackable_count"], 2)
+        self.assertEqual(rejection["coverage_rate_percent"], 33.3333)
+        self.assertEqual(rejection["trackable_coverage_rate_percent"], 50.0)
 
     def test_all_research_horizons_are_supported(self) -> None:
         for horizon in ("1m", "3m", "5m", "15m", "30m", "60m"):

@@ -27,9 +27,13 @@ SHADOW_STRATEGY_NAMES = (
 )
 RESEARCH_HORIZONS = ("1m", "3m", "5m", "15m", "30m", "60m")
 RESEARCH_PRIMARY_HORIZON = "60m"
-UNTRACKABLE_QUOTE_STATUSES = {
-    "NO_ROUTE", "NOT_REQUESTED", "SIZE_UNUSABLE", "PROCESSING_FAILED",
+UNTRACKABLE_QUOTE_STATUS_REASONS = {
+    "NO_ROUTE": "ENTRY_NO_ROUTE",
+    "NOT_REQUESTED": "ENTRY_NOT_REQUESTED",
+    "SIZE_UNUSABLE": "ENTRY_SIZE_UNUSABLE",
+    "PROCESSING_FAILED": "PROCESSING_FAILED",
 }
+UNTRACKABLE_QUOTE_STATUSES = set(UNTRACKABLE_QUOTE_STATUS_REASONS)
 ANALYSIS_PATH = (
     Path(__file__).resolve().parents[1] / "data" / "observation_analysis.json"
 )
@@ -87,15 +91,17 @@ def _outcome_trackable(row: dict[str, Any]) -> bool:
 def _missing_outcome_reason(
     row: dict[str, Any], sample: dict[str, Any] | None
 ) -> str:
-    if not _outcome_trackable(row):
-        return "NO_ROUTE"
+    quote_status = str(row.get("quote_status") or "").strip().upper()
+    entry_reason = UNTRACKABLE_QUOTE_STATUS_REASONS.get(quote_status)
+    if entry_reason is not None:
+        return entry_reason
     if sample is None:
         return "NOT_SAMPLED"
     error = str(sample.get("error") or "").strip().upper()
     if "HORIZON_MISSED" in error:
         return "HORIZON_MISSED"
     if "NO_ROUTE" in error or ("NO " in error and "ROUTE" in error):
-        return "NO_ROUTE"
+        return "EXIT_NO_ROUTE"
     if error:
         return "API_FAILURE"
     return "UNKNOWN"
@@ -256,6 +262,10 @@ def _research_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
             ),
             "outcome_trackable_count": trackable_count,
             "outcome_untrackable_count": signal_count - trackable_count,
+            "trackable_coverage_rate_percent": (
+                round(sampled_count / trackable_count * 100, 4)
+                if trackable_count else None
+            ),
             "missing_reasons": dict(sorted(missing_reasons.items())),
             **_lag_metrics([
                 sample for sample in samples if isinstance(sample, dict)
@@ -341,6 +351,9 @@ def build_research_metrics(rows: list[Any]) -> dict[str, Any]:
         finite = [value for value in returns if value is not None]
         sampled_count = len(finite)
         signal_count = len(reason_rows)
+        trackable_count = sum(
+            _outcome_trackable(row) for row in reason_rows
+        )
         rejection_rows.append({
             "reason": reason,
             "outcome_interval": RESEARCH_PRIMARY_HORIZON,
@@ -351,11 +364,11 @@ def build_research_metrics(rows: list[Any]) -> dict[str, Any]:
                 round(sampled_count / signal_count * 100, 4)
                 if signal_count else None
             ),
-            "outcome_trackable_count": sum(
-                _outcome_trackable(row) for row in reason_rows
-            ),
-            "outcome_untrackable_count": sum(
-                not _outcome_trackable(row) for row in reason_rows
+            "outcome_trackable_count": trackable_count,
+            "outcome_untrackable_count": signal_count - trackable_count,
+            "trackable_coverage_rate_percent": (
+                round(sampled_count / trackable_count * 100, 4)
+                if trackable_count else None
             ),
             "completed_outcome_count": sampled_count,
             "average_return_percent": _rounded(_stable_mean(finite)),
