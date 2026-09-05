@@ -28,6 +28,15 @@ class DeployWorkflowTests(unittest.TestCase):
         self.assertIn("--baseline", workflow)
         self.assertIn("RESEARCH_REPORT_SCOPE=cumulative", workflow)
         self.assertIn("RESEARCH_REPORT_SCOPE=observation_window", workflow)
+        self.assertIn("ALPHA_SMART_MONEY_SOURCES", workflow)
+        self.assertIn("src.research.restart_forensics", workflow)
+        self.assertIn("MONITOR_RESTART_FORENSICS", (
+            ROOT / "src" / "research" / "restart_forensics.py"
+        ).read_text(encoding="utf-8"))
+        self.assertLess(
+            workflow.index("src.research.restart_forensics"),
+            workflow.index('exit "$pm2_health_status"'),
+        )
 
 
 if __name__ == "__main__":

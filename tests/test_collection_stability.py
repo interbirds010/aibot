@@ -5,6 +5,8 @@ import unittest
 from src.research.collection_stability import (
     assess_alchemy_need,
     build_research_lifecycle,
+    build_smart_money_source_funnels,
+    canonical_smart_money_failure,
 )
 
 
@@ -15,6 +17,8 @@ def row(
     quote_status: str = "EXECUTABLE",
     reasons: list[str] | None = None,
     samples: list[dict] | None = None,
+    source: str = "solana_logs_subscribe",
+    analysis_completed: bool = True,
 ) -> dict:
     return {
         "tracking_profile": "research_v1_60m",
@@ -23,7 +27,12 @@ def row(
         "decision_status": "APPROVED",
         "decision_reasons": reasons or [],
         "quote_status": quote_status,
-        "analysis_completed_at": "2026-09-05T00:00:00+00:00",
+        "analysis_completed_at": (
+            "2026-09-05T00:00:00+00:00" if analysis_completed else None
+        ),
+        "signal_type": "SMART_MONEY",
+        "route_type": "A",
+        "discovery_metadata": {"discovery_source": source},
         "samples": samples or [],
     }
 
@@ -105,6 +114,103 @@ class CollectionStabilityTests(unittest.TestCase):
         assessment = assess_alchemy_need(lifecycle, providers)
         self.assertFalse(assessment["recommend_alchemy_free"])
         self.assertFalse(assessment["window_sufficient"])
+
+    def test_source_funnel_uses_window_deltas_and_canonical_failures(self) -> None:
+        successful = row(
+            110,
+            samples=[{"interval": "60m", "return_percent": 4.0}],
+        )
+        failed = row(
+            120,
+            status="COMPLETE",
+            quote_status="PROCESSING_FAILED",
+            reasons=["RPC_ALL_PROVIDERS_EXHAUSTED", "raw https://secret.invalid"],
+            analysis_completed=False,
+        )
+        legacy = row(
+            130,
+            status="COMPLETE",
+            quote_status="NO_ROUTE",
+            source="legacy-value",
+        )
+        metrics = {
+            "wallet_ws_activity_started_at": 10.0,
+            "wallet_ws_active_source": "solana_logs_subscribe",
+            "monitor_wallet_count": 20,
+            "wallet_ws_dex_log_match_counts_by_source": {
+                "solana_logs_subscribe": 12,
+            },
+            "wallet_ws_transaction_restore_success_counts_by_source": {
+                "solana_logs_subscribe": 8,
+            },
+            "wallet_ws_smart_money_candidate_counts_by_source": {
+                "solana_logs_subscribe": 4,
+            },
+            "wallet_ws_analyzer_success_counts_by_source": {
+                "solana_logs_subscribe": 3,
+            },
+            "wallet_ws_transaction_restore_failure_reasons_by_source": {
+                "solana_logs_subscribe": {
+                    "RPC_ALL_PROVIDERS_EXHAUSTED": 2,
+                },
+            },
+        }
+        baseline = {"websocket": {
+            "wallet_ws_activity_started_at": 10.0,
+            "wallet_ws_dex_log_match_counts_by_source": {
+                "solana_logs_subscribe": 2,
+            },
+            "wallet_ws_transaction_restore_success_counts_by_source": {
+                "solana_logs_subscribe": 3,
+            },
+            "wallet_ws_smart_money_candidate_counts_by_source": {
+                "solana_logs_subscribe": 1,
+            },
+            "wallet_ws_analyzer_success_counts_by_source": {
+                "solana_logs_subscribe": 1,
+            },
+            "wallet_ws_transaction_restore_failure_reasons_by_source": {
+                "solana_logs_subscribe": {
+                    "RPC_ALL_PROVIDERS_EXHAUSTED": 1,
+                },
+            },
+        }}
+        report = build_smart_money_source_funnels(
+            [successful, failed, legacy],
+            metrics,
+            since_epoch=100,
+            baseline=baseline,
+        )
+        public = report["sources"]["solana_logs_subscribe"]
+        self.assertEqual(public["dex_matches"], 10)
+        self.assertEqual(public["get_transaction_successful"], 5)
+        self.assertEqual(public["smart_money_candidates"], 3)
+        self.assertEqual(public["research_discovered"], 2)
+        self.assertEqual(public["analyzer_success"], 1)
+        self.assertEqual(public["analyzer_failure"], 1)
+        self.assertEqual(public["successful_60m"], 1)
+        self.assertEqual(
+            public["get_transaction_failure_distribution"],
+            {"RPC_ALL_PROVIDERS_EXHAUSTED": 1},
+        )
+        self.assertEqual(
+            public["canonical_failure_distribution"],
+            {"RPC_ALL_PROVIDERS_EXHAUSTED": 1},
+        )
+        self.assertEqual(public["dex_match_to_transaction_restore_percent"], 50.0)
+        self.assertEqual(
+            public["candidate_to_analyzer_success_percent"], 66.6667
+        )
+        unknown = report["sources"]["unknown_legacy"]
+        self.assertEqual(unknown["research_discovered"], 1)
+        self.assertEqual(
+            unknown["canonical_failure_distribution"],
+            {"ENTRY_NO_ROUTE": 1},
+        )
+        self.assertEqual(
+            canonical_smart_money_failure(failed),
+            "RPC_ALL_PROVIDERS_EXHAUSTED",
+        )
 
 
 if __name__ == "__main__":

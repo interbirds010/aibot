@@ -85,12 +85,19 @@ jobs:
                 Path("data/signal_observations.json").read_text(encoding="utf-8")
             ).get("observations", [])
             source = report["input_summary"]
+            smart_sources = source.get("smart_money_discovery_source_counts", {})
             print(
                 "ALPHA_COHORT "
                 f"source={source['source_type']} "
                 f"source_rows={source['source_row_count']} "
                 f"cohort={source['cohort']} "
                 f"cohort_rows={source['cohort_row_count']}"
+            )
+            print(
+                "ALPHA_SMART_MONEY_SOURCES "
+                f"helius_transaction_subscribe={smart_sources.get('helius_transaction_subscribe', 0)} "
+                f"solana_logs_subscribe={smart_sources.get('solana_logs_subscribe', 0)} "
+                f"unknown_legacy={smart_sources.get('unknown_legacy', 0)}"
             )
             for family in ("SMART_MONEY", "MOMENTUM"):
                 summary = report["families"][family]["summary"]
@@ -135,7 +142,8 @@ jobs:
               --baseline "$baseline"
 
             pm2 jlist > "$pm2_after"
-            ./venv/bin/python - "$pm2_before" "$pm2_after" <<'PY'
+            pm2_health_status=0
+            ./venv/bin/python - "$pm2_before" "$pm2_after" <<'PY' || pm2_health_status=$?
             import json
             import sys
             from pathlib import Path
@@ -161,20 +169,33 @@ jobs:
 
             before = selected(sys.argv[1])
             after = selected(sys.argv[2])
+            failures = []
             for name in (
                 "aibot-monitor", "aibot-risk-manager", "aibot-dashboard"
             ):
                 current = after.get(name, {})
                 if current.get("status") != "online" or not current.get("pid"):
-                    raise SystemExit(f"PM2 process unhealthy: {name}")
-                if current["restarts"] != before.get(name, {}).get("restarts"):
-                    raise SystemExit(f"PM2 restart increased during observation: {name}")
+                    failures.append(f"PM2 process unhealthy: {name}")
+                if current.get("restarts") != before.get(name, {}).get("restarts"):
+                    failures.append(
+                        f"PM2 restart increased during observation: {name}"
+                    )
             for name, state in sorted(after.items()):
                 print(
                     f"PM2_OBSERVATION name={name} status={state['status']} "
                     f"pid={state['pid']} restarts={state['restarts']}"
                 )
+            if failures:
+                raise SystemExit("; ".join(failures))
             PY
+            if (( pm2_health_status != 0 )); then
+              ./venv/bin/python -m src.research.restart_forensics \
+                --before "$pm2_before" \
+                --after "$pm2_after" \
+                --deployed-sha "$deployed_sha" \
+                --since-epoch "$since_epoch" || true
+              exit "$pm2_health_status"
+            fi
 
             dashboard_status="$(curl --silent --show-error --output /dev/null \
               --write-out '%{http_code}' http://127.0.0.1:8501/ai-bot/)"

@@ -28,6 +28,9 @@ ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_OBSERVATION_PATH = ROOT / "data" / "signal_observations.json"
 DEFAULT_ARCHIVE_PATH = RESEARCH_ARCHIVE_PATH
 DEFAULT_OUTPUT_PATH = ROOT / "data" / "alpha_discovery.json"
+DISCOVERY_SOURCE_HELIUS = "helius_transaction_subscribe"
+DISCOVERY_SOURCE_SOLANA = "solana_logs_subscribe"
+DISCOVERY_SOURCE_UNKNOWN = "unknown_legacy"
 
 SCHEMA_VERSION = 2
 MIN_SUPPORTED_OBSERVATION_SCHEMA_VERSION = 1
@@ -289,6 +292,34 @@ def _signal_family(row: dict[str, Any]) -> str | None:
         return signal_type
     route_type = str(row.get("route_type") or "").strip().upper()
     return {"A": "SMART_MONEY", "B": "MOMENTUM"}.get(route_type)
+
+
+def smart_money_discovery_source_counts(
+    rows: list[Any], *, cohort: str,
+) -> dict[str, int]:
+    """Alpha 후보를 늘리지 않고 Smart Money transport별 row만 센다."""
+    counts = {
+        DISCOVERY_SOURCE_HELIUS: 0,
+        DISCOVERY_SOURCE_SOLANA: 0,
+        DISCOVERY_SOURCE_UNKNOWN: 0,
+    }
+    for row in rows:
+        if (
+            not isinstance(row, dict)
+            or row.get("tracking_profile") != cohort
+            or _signal_family(row) != "SMART_MONEY"
+        ):
+            continue
+        metadata = row.get("discovery_metadata")
+        source = (
+            str(metadata.get("discovery_source") or "").strip()
+            if isinstance(metadata, dict) else ""
+        )
+        counts[
+            source if source in counts and source != DISCOVERY_SOURCE_UNKNOWN
+            else DISCOVERY_SOURCE_UNKNOWN
+        ] += 1
+    return counts
 
 
 def _signal_identity_digest(row: dict[str, Any]) -> str:
@@ -1035,6 +1066,9 @@ def build_alpha_discovery(
             "cohort": cohort_name,
             "cohort_row_count": cohort_row_count,
             "analyzed_row_count": len(prepared),
+            "smart_money_discovery_source_counts": (
+                smart_money_discovery_source_counts(rows, cohort=cohort_name)
+            ),
             "maximum_rows": limit,
             "excluded": excluded,
         },

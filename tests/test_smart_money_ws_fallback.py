@@ -84,6 +84,7 @@ class SmartMoneyWsFallbackTests(unittest.TestCase):
         self.assertTrue(signatures.add("one"))
 
     def test_standard_monitor_uses_public_ws_and_fetches_each_signature_once(self) -> None:
+        monitor.reset_wallet_ws_activity(now_epoch=10.0)
         program = next(iter(monitor.DEX_PROGRAMS.values()))
         notification = {
             "params": {
@@ -131,6 +132,66 @@ class SmartMoneyWsFallbackTests(unittest.TestCase):
             {"WALLET"},
             discovery_source=monitor.DISCOVERY_SOURCE_SOLANA,
         )
+        metrics = monitor.wallet_ws_activity_metrics()
+        self.assertEqual(metrics["wallet_ws_unique_signature_process_count"], 1)
+        self.assertEqual(
+            metrics["wallet_ws_transaction_restore_success_process_count"], 1
+        )
+        self.assertEqual(
+            metrics["wallet_ws_transaction_restore_failure_process_count"], 0
+        )
+        monitor.reset_wallet_ws_activity()
+
+    def test_get_transaction_failure_is_not_misclassified_as_ws_failure(self) -> None:
+        monitor.reset_wallet_ws_activity(now_epoch=10.0)
+        program = next(iter(monitor.DEX_PROGRAMS.values()))
+        socket = FakeSocket([
+            {"jsonrpc": "2.0", "id": 1, "result": 99},
+            {
+                "params": {"result": {"value": {
+                    "signature": "SIGNATURE",
+                    "err": None,
+                    "logs": [f"Program {program} invoke [1]"],
+                }}},
+            },
+        ])
+        settings = monitor.MonitorSettings(
+            "wss://helius.invalid",
+            "https://helius.invalid",
+            standard_ws_url="wss://public.invalid",
+        )
+        with (
+            patch.object(
+                monitor, "connect", return_value=AsyncContext(socket)
+            ),
+            patch.object(
+                monitor.aiohttp,
+                "ClientSession",
+                return_value=AsyncContext(object()),
+            ),
+            patch.object(
+                monitor,
+                "fetch_transaction",
+                new=AsyncMock(side_effect=monitor.SolanaRpcExhaustedError(
+                    "getTransaction", 6
+                )),
+            ),
+            patch.object(monitor.state_store, "set_global_metrics"),
+        ):
+            asyncio.run(monitor.monitor_standard_once(settings, ("WALLET",)))
+        metrics = monitor.wallet_ws_activity_metrics()
+        self.assertEqual(
+            metrics["wallet_ws_transaction_restore_failure_process_count"], 1
+        )
+        self.assertEqual(
+            metrics["wallet_ws_transaction_restore_failure_reasons_by_source"],
+            {
+                monitor.DISCOVERY_SOURCE_SOLANA: {
+                    "RPC_ALL_PROVIDERS_EXHAUSTED": 1,
+                },
+            },
+        )
+        monitor.reset_wallet_ws_activity()
 
     def test_activity_metrics_are_bounded_by_canonical_source(self) -> None:
         monitor.reset_wallet_ws_activity(now_epoch=10.0)
@@ -200,6 +261,7 @@ class SmartMoneyWsFallbackTests(unittest.TestCase):
         asyncio.run(run())
 
     def test_research_observation_records_standard_discovery_source(self) -> None:
+        monitor.reset_wallet_ws_activity(now_epoch=10.0)
         discovery = observation_tracker.ObservationDecision(
             True,
             "SIGNATURE:WALLET:MINT",
@@ -250,6 +312,14 @@ class SmartMoneyWsFallbackTests(unittest.TestCase):
             monitor.DISCOVERY_SOURCE_SOLANA,
         )
         finalize.assert_called_once()
+        metrics = monitor.wallet_ws_activity_metrics()
+        self.assertEqual(metrics["wallet_ws_analyzer_reached_process_count"], 1)
+        self.assertEqual(metrics["wallet_ws_analyzer_failure_process_count"], 1)
+        self.assertEqual(
+            metrics["wallet_ws_analyzer_failure_counts_by_source"],
+            {monitor.DISCOVERY_SOURCE_SOLANA: 1},
+        )
+        monitor.reset_wallet_ws_activity()
 
 
 if __name__ == "__main__":

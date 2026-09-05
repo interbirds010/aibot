@@ -99,11 +99,16 @@ WALLET_WS_ACTIVITY_KEYS = frozenset({
     "subscription_failure",
     "notification",
     "dex_log_match",
+    "unique_signature",
     "transaction_fetch",
+    "transaction_restore_success",
+    "transaction_restore_failure",
     "transaction_parsed",
     "smart_money_candidate",
     "research_discovered",
     "analyzer_reached",
+    "analyzer_success",
+    "analyzer_failure",
 })
 
 # On-chain feeder output is verified; fail closed if an old unverified row remains.
@@ -125,6 +130,7 @@ _wallet_ws_activity: dict[str, int] = {
 _wallet_ws_activity_by_source: dict[str, dict[str, int]] = {
     key: {} for key in WALLET_WS_ACTIVITY_KEYS
 }
+_wallet_ws_restore_failures_by_source: dict[str, dict[str, int]] = {}
 
 # Canonical mainnet program IDs. Keep this list reviewed before production use.
 DEX_PROGRAMS = {
@@ -224,6 +230,7 @@ def reset_wallet_ws_activity(*, now_epoch: float | None = None) -> None:
     for key in WALLET_WS_ACTIVITY_KEYS:
         _wallet_ws_activity[key] = 0
         _wallet_ws_activity_by_source[key] = {}
+    _wallet_ws_restore_failures_by_source.clear()
 
 
 def record_wallet_ws_activity(name: str, source: str) -> None:
@@ -236,6 +243,21 @@ def record_wallet_ws_activity(name: str, source: str) -> None:
     per_source[provider] = per_source.get(provider, 0) + 1
 
 
+def record_transaction_restore_failure(
+    source: str, error: BaseException | None,
+) -> str:
+    """getTransaction 실패를 WebSocket transport와 분리해 집계한다."""
+    provider = str(source)[:80]
+    reason = (
+        canonical_rpc_failure_reason(error)
+        if error is not None else "RPC_GET_TRANSACTION_NOT_AVAILABLE"
+    ) or "RPC_GET_TRANSACTION_FAILED"
+    record_wallet_ws_activity("transaction_restore_failure", provider)
+    reasons = _wallet_ws_restore_failures_by_source.setdefault(provider, {})
+    reasons[reason] = reasons.get(reason, 0) + 1
+    return reason
+
+
 def wallet_ws_activity_metrics() -> dict[str, Any]:
     values: dict[str, Any] = {
         "wallet_ws_activity_started_at": _wallet_ws_activity_started_at,
@@ -245,6 +267,12 @@ def wallet_ws_activity_metrics() -> dict[str, Any]:
         values[f"wallet_ws_{name}_counts_by_source"] = dict(
             sorted(_wallet_ws_activity_by_source[name].items())
         )
+    values["wallet_ws_transaction_restore_failure_reasons_by_source"] = {
+        source: dict(sorted(reasons.items()))
+        for source, reasons in sorted(
+            _wallet_ws_restore_failures_by_source.items()
+        )
+    }
     return values
 
 
@@ -808,6 +836,7 @@ async def process_paper_signal(
         decision_reasons = [str(reason) for reason in prefilter_reasons]
         safety_snapshot: dict[str, Any] = {}
         analysis_completed_at: str | None = None
+        analyzer_started = False
         try:
             from src.observation_tracker import (
                 approved_signal_max_open_positions,
@@ -905,8 +934,14 @@ async def process_paper_signal(
                     "analyzer_reached",
                     discovery_source or "unknown",
                 )
+                analyzer_started = True
             report = await analyze_token(mint)
             analysis_completed_at = datetime.now(timezone.utc).isoformat()
+            if requested_route == "A":
+                record_wallet_ws_activity(
+                    "analyzer_success",
+                    discovery_source or "unknown",
+                )
             safety_snapshot = {
                 "developer_supply_percent": (
                     getattr(report, "developer_supply_percent", None)
@@ -1165,6 +1200,15 @@ async def process_paper_signal(
                 report.safety_score, wallet, signature,
             )
         except RuntimeError as exc:
+            if (
+                requested_route == "A"
+                and analyzer_started
+                and not analysis_completed_at
+            ):
+                record_wallet_ws_activity(
+                    "analyzer_failure",
+                    discovery_source or "unknown",
+                )
             reason = redact_sensitive_text(exc)
             canonical_failure = canonical_rpc_failure_reason(exc)
             if observation_enabled and observation_id:
@@ -1201,6 +1245,15 @@ async def process_paper_signal(
                 redact_sensitive_text(exc),
             )
         except Exception:
+            if (
+                requested_route == "A"
+                and analyzer_started
+                and not analysis_completed_at
+            ):
+                record_wallet_ws_activity(
+                    "analyzer_failure",
+                    discovery_source or "unknown",
+                )
             if observation_enabled and observation_id:
                 try:
                     from src.observation_tracker import finalize_candidate_without_quote
@@ -1355,6 +1408,7 @@ def print_buys(
                     wallet,
                     signature,
                     prefilter_reasons=("PAYMENT_UNRESOLVED",),
+                    discovery_source=discovery_source,
                 )
 
 
@@ -2036,6 +2090,9 @@ async def monitor_standard_once(
             record_wallet_ws_activity("notification", DISCOVERY_SOURCE_SOLANA)
             if not seen.add(str(signature)):
                 continue
+            record_wallet_ws_activity(
+                "unique_signature", DISCOVERY_SOURCE_SOLANA
+            )
             logs = value.get("logs") or []
             dex_name = next(
                 (name for name, program in DEX_PROGRAMS.items()
@@ -2045,8 +2102,23 @@ async def monitor_standard_once(
                 continue
             record_wallet_ws_activity("dex_log_match", DISCOVERY_SOURCE_SOLANA)
             record_wallet_ws_activity("transaction_fetch", DISCOVERY_SOURCE_SOLANA)
-            transaction = await fetch_transaction(session, settings.http_url, signature)
+            try:
+                transaction = await fetch_transaction(
+                    session, settings.http_url, signature
+                )
+            except Exception as exc:
+                failure_reason = record_transaction_restore_failure(
+                    DISCOVERY_SOURCE_SOLANA, exc
+                )
+                logger.warning(
+                    "standard transaction restore failed category=%s",
+                    failure_reason,
+                )
+                continue
             if transaction:
+                record_wallet_ws_activity(
+                    "transaction_restore_success", DISCOVERY_SOURCE_SOLANA
+                )
                 record_wallet_ws_activity(
                     "transaction_parsed", DISCOVERY_SOURCE_SOLANA
                 )
@@ -2055,6 +2127,10 @@ async def monitor_standard_once(
                     dex_name,
                     set(wallets),
                     discovery_source=DISCOVERY_SOURCE_SOLANA,
+                )
+            else:
+                record_transaction_restore_failure(
+                    DISCOVERY_SOURCE_SOLANA, None
                 )
 
 

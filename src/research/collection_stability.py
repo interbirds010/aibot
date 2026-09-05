@@ -25,6 +25,7 @@ from src.observation_tracker import (
     empty_observations,
 )
 from src.solana_rpc import (
+    RPC_FAILURE_REASONS,
     RpcProvider,
     provider_configs_from_env,
     provider_states,
@@ -43,6 +44,48 @@ ALCHEMY_REVIEW_MIN_PUBLIC_REQUESTS = 100
 ALCHEMY_REVIEW_EXHAUSTED_PERCENT = 25.0
 ALCHEMY_REVIEW_MIN_EXHAUSTED = 5
 ALCHEMY_REVIEW_MIN_PUBLIC_SUCCESS_PERCENT = 90.0
+DISCOVERY_SOURCE_HELIUS = "helius_transaction_subscribe"
+DISCOVERY_SOURCE_SOLANA = "solana_logs_subscribe"
+DISCOVERY_SOURCE_UNKNOWN = "unknown_legacy"
+SMART_MONEY_SOURCES = (
+    DISCOVERY_SOURCE_HELIUS,
+    DISCOVERY_SOURCE_SOLANA,
+    DISCOVERY_SOURCE_UNKNOWN,
+)
+WALLET_WS_ACTIVITY_NAMES = (
+    "connection_success",
+    "subscription_success",
+    "subscription_failure",
+    "notification",
+    "dex_log_match",
+    "unique_signature",
+    "transaction_fetch",
+    "transaction_restore_success",
+    "transaction_restore_failure",
+    "transaction_parsed",
+    "smart_money_candidate",
+    "research_discovered",
+    "analyzer_reached",
+    "analyzer_success",
+    "analyzer_failure",
+)
+SOURCE_TRANSPORT_FIELDS = {
+    "connections": "connection_success",
+    "subscriptions": "subscription_success",
+    "subscription_failures": "subscription_failure",
+    "notifications": "notification",
+    "dex_matches": "dex_log_match",
+    "unique_signatures": "unique_signature",
+    "get_transaction_attempted": "transaction_fetch",
+    "get_transaction_successful": "transaction_restore_success",
+    "get_transaction_failed": "transaction_restore_failure",
+    "parsed_transactions": "transaction_parsed",
+    "smart_money_candidates": "smart_money_candidate",
+    "research_discovered_runtime": "research_discovered",
+    "analyzer_reached_runtime": "analyzer_reached",
+    "analyzer_success_runtime": "analyzer_success",
+    "analyzer_failure_runtime": "analyzer_failure",
+}
 
 
 def _finite(value: Any) -> float | None:
@@ -70,6 +113,232 @@ def _decision_reasons(row: dict[str, Any]) -> set[str]:
         str(reason).strip().upper()
         for reason in reasons
         if str(reason).strip()
+    }
+
+
+def canonical_discovery_source(row: dict[str, Any]) -> str:
+    metadata = row.get("discovery_metadata")
+    source = (
+        str(metadata.get("discovery_source") or "").strip()
+        if isinstance(metadata, dict) else ""
+    )
+    return source if source in SMART_MONEY_SOURCES[:-1] else DISCOVERY_SOURCE_UNKNOWN
+
+
+def _is_smart_money(row: dict[str, Any]) -> bool:
+    return (
+        str(row.get("signal_type") or "").strip().upper() == "SMART_MONEY"
+        or str(row.get("route_type") or "").strip().upper() == "A"
+    )
+
+
+def canonical_smart_money_failure(row: dict[str, Any]) -> str | None:
+    """Raw 오류 문자열을 사용하지 않고 terminal 결과를 안정적으로 분류한다."""
+    reasons = _decision_reasons(row)
+    ordered_rpc_reasons = (
+        "RPC_ALL_PROVIDERS_EXHAUSTED",
+        *sorted(RPC_FAILURE_REASONS - {"RPC_ALL_PROVIDERS_EXHAUSTED"}),
+    )
+    for reason in ordered_rpc_reasons:
+        if reason in reasons:
+            return reason
+    if DISCOVERY_PROCESSING_INTERRUPTED in reasons:
+        return DISCOVERY_PROCESSING_INTERRUPTED
+    decision_status = str(row.get("decision_status") or "").strip().upper()
+    quote_status = str(row.get("quote_status") or "").strip().upper()
+    if "ANALYZER_ROUTE_REJECTED" in reasons:
+        return "ANALYZER_REJECTION"
+    if decision_status == "REJECTED":
+        return "RESEARCH_REJECTION"
+    if quote_status == "PROCESSING_FAILED":
+        return "PROCESSING_FAILED"
+    if quote_status in {"NO_ROUTE", "NOT_REQUESTED", "SIZE_UNUSABLE"}:
+        return canonical_missing_outcome_reason(row, None)
+    return None
+
+
+def _percentage(numerator: int, denominator: int) -> float | None:
+    return round(numerator / denominator * 100, 4) if denominator else None
+
+
+def _source_metric_count(
+    metrics: dict[str, Any],
+    baseline_metrics: dict[str, Any],
+    activity: str,
+    source: str,
+    *,
+    use_delta: bool,
+) -> int:
+    key = f"wallet_ws_{activity}_counts_by_source"
+    current = metrics.get(key)
+    current_count = _counter(current.get(source)) if isinstance(current, dict) else 0
+    if not use_delta:
+        return current_count
+    previous = baseline_metrics.get(key)
+    previous_count = (
+        _counter(previous.get(source)) if isinstance(previous, dict) else 0
+    )
+    return max(0, current_count - previous_count)
+
+
+def _source_restore_failure_distribution(
+    metrics: dict[str, Any],
+    baseline_metrics: dict[str, Any],
+    source: str,
+    *,
+    use_delta: bool,
+) -> dict[str, int]:
+    key = "wallet_ws_transaction_restore_failure_reasons_by_source"
+    current_sources = metrics.get(key)
+    current = (
+        current_sources.get(source, {})
+        if isinstance(current_sources, dict) else {}
+    )
+    previous_sources = baseline_metrics.get(key)
+    previous = (
+        previous_sources.get(source, {})
+        if isinstance(previous_sources, dict) else {}
+    )
+    if not isinstance(current, dict):
+        return {}
+    result = {
+        str(reason): max(
+            0,
+            _counter(count)
+            - (_counter(previous.get(reason)) if use_delta and isinstance(previous, dict) else 0),
+        )
+        for reason, count in current.items()
+    }
+    return dict(sorted(
+        (reason, count) for reason, count in result.items() if count
+    ))
+
+
+def build_smart_money_source_funnels(
+    rows: list[Any],
+    metrics: dict[str, Any],
+    *,
+    since_epoch: float = 0.0,
+    baseline: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Transport와 Research 원장을 동일 canonical source로 요약한다."""
+    baseline_websocket = (
+        baseline.get("websocket", {}) if isinstance(baseline, dict) else {}
+    )
+    current_activity_started = _finite(metrics.get("wallet_ws_activity_started_at"))
+    baseline_activity_started = _finite(
+        baseline_websocket.get("wallet_ws_activity_started_at")
+    )
+    use_delta = (
+        bool(baseline)
+        and current_activity_started is not None
+        and baseline_activity_started == current_activity_started
+    )
+    runtime_scope = "observation_window" if use_delta else "current_process"
+    row_since = float(since_epoch)
+    selected = [
+        row for row in rows
+        if isinstance(row, dict)
+        and row.get("tracking_profile") == "research_v1_60m"
+        and _is_smart_money(row)
+        and (_finite(row.get("started_at_epoch")) or 0.0) >= row_since
+    ]
+    source_reports: dict[str, Any] = {}
+    for source in SMART_MONEY_SOURCES:
+        source_rows = [
+            row for row in selected
+            if canonical_discovery_source(row) == source
+        ]
+        transport = {
+            output: _source_metric_count(
+                metrics,
+                baseline_websocket,
+                activity,
+                source,
+                use_delta=use_delta,
+            )
+            for output, activity in SOURCE_TRANSPORT_FIELDS.items()
+        }
+        analyzer_success = sum(
+            bool(row.get("analysis_completed_at")) for row in source_rows
+        )
+        analyzer_failure = sum(
+            not bool(row.get("analysis_completed_at"))
+            and canonical_smart_money_failure(row) is not None
+            for row in source_rows
+        )
+        executable = sum(
+            str(row.get("quote_status") or "").upper() == "EXECUTABLE"
+            for row in source_rows
+        )
+        pending = sum(
+            str(row.get("quote_status") or "").upper() == "EXECUTABLE"
+            and str(row.get("status") or "").upper() == "PENDING"
+            for row in source_rows
+        )
+        trackable = sum(outcome_trackable(row) for row in source_rows)
+        terminal_untrackable = sum(
+            str(row.get("status") or "").upper()
+            in {"COMPLETE", "EXPIRED_UNSAMPLED"}
+            and not outcome_trackable(row)
+            for row in source_rows
+        )
+        successful_60m = sum(
+            (sample := _interval_sample(row, "60m")) is not None
+            and _finite(sample.get("return_percent")) is not None
+            for row in source_rows
+        )
+        failures = Counter(
+            failure
+            for row in source_rows
+            if (failure := canonical_smart_money_failure(row)) is not None
+        )
+        restored = transport["get_transaction_successful"]
+        candidates = transport["smart_money_candidates"]
+        runtime_analyzer_success = transport["analyzer_success_runtime"]
+        source_reports[source] = {
+            "runtime_scope": runtime_scope,
+            "runtime_window_complete": use_delta or not bool(baseline),
+            "watched_wallets": (
+                _counter(metrics.get("monitor_wallet_count"))
+                if metrics.get("wallet_ws_active_source") == source else 0
+            ),
+            **transport,
+            "research_discovered": len(source_rows),
+            "analyzer_success": analyzer_success,
+            "analyzer_failure": analyzer_failure,
+            "executable": executable,
+            "pending_research_v1_60m": pending,
+            "trackable": trackable,
+            "terminal_untrackable": terminal_untrackable,
+            "successful_60m": successful_60m,
+            "canonical_failure_distribution": dict(sorted(failures.items())),
+            "get_transaction_failure_distribution": (
+                _source_restore_failure_distribution(
+                    metrics,
+                    baseline_websocket,
+                    source,
+                    use_delta=use_delta,
+                )
+            ),
+            "dex_match_to_transaction_restore_percent": _percentage(
+                restored, transport["dex_matches"]
+            ),
+            "transaction_restore_to_candidate_percent": _percentage(
+                candidates, restored
+            ),
+            "candidate_to_analyzer_success_percent": _percentage(
+                runtime_analyzer_success, candidates
+            ),
+            "discovered_to_trackable_percent": _percentage(
+                trackable, len(source_rows)
+            ),
+        }
+    return {
+        "runtime_scope": runtime_scope,
+        "runtime_window_complete": use_delta or not bool(baseline),
+        "row_since_epoch": row_since,
+        "sources": source_reports,
     }
 
 
@@ -259,6 +528,13 @@ def provider_baseline(
 ) -> dict[str, Any]:
     configured = tuple(providers or provider_configs_from_env())
     states = provider_states(configured)
+    metrics_document = state_store.read_json(
+        state_store.GLOBAL_METRICS_PATH,
+        {"metrics": {}},
+    )
+    metrics = metrics_document.get("metrics")
+    if not isinstance(metrics, dict):
+        raise RuntimeError("global metrics are malformed")
     return {
         "created_at_epoch": time.time(),
         "providers": {
@@ -267,6 +543,15 @@ def provider_baseline(
                 for key in PROVIDER_COUNTERS
             }
             for name, state in states.items()
+        },
+        "websocket": {
+            key: metrics.get(key)
+            for key in (
+                "wallet_ws_activity_started_at",
+                "wallet_ws_transaction_restore_failure_reasons_by_source",
+                *(f"wallet_ws_{name}_counts_by_source"
+                  for name in WALLET_WS_ACTIVITY_NAMES),
+            )
         },
     }
 
@@ -403,8 +688,15 @@ def build_collection_report(
             "wallet_ws_notification_counts_by_source",
             "wallet_ws_dex_log_match_process_count",
             "wallet_ws_dex_log_match_counts_by_source",
+            "wallet_ws_unique_signature_process_count",
+            "wallet_ws_unique_signature_counts_by_source",
             "wallet_ws_transaction_fetch_process_count",
             "wallet_ws_transaction_fetch_counts_by_source",
+            "wallet_ws_transaction_restore_success_process_count",
+            "wallet_ws_transaction_restore_success_counts_by_source",
+            "wallet_ws_transaction_restore_failure_process_count",
+            "wallet_ws_transaction_restore_failure_counts_by_source",
+            "wallet_ws_transaction_restore_failure_reasons_by_source",
             "wallet_ws_transaction_parsed_process_count",
             "wallet_ws_transaction_parsed_counts_by_source",
             "wallet_ws_smart_money_candidate_process_count",
@@ -413,6 +705,10 @@ def build_collection_report(
             "wallet_ws_research_discovered_counts_by_source",
             "wallet_ws_analyzer_reached_process_count",
             "wallet_ws_analyzer_reached_counts_by_source",
+            "wallet_ws_analyzer_success_process_count",
+            "wallet_ws_analyzer_success_counts_by_source",
+            "wallet_ws_analyzer_failure_process_count",
+            "wallet_ws_analyzer_failure_counts_by_source",
         )
     }
     return {
@@ -420,6 +716,12 @@ def build_collection_report(
         "research": lifecycle,
         "providers": providers,
         "websocket": websocket,
+        "smart_money_sources": build_smart_money_source_funnels(
+            rows,
+            metrics,
+            since_epoch=since_epoch,
+            baseline=baseline,
+        ),
         "reconciliation": {
             "reason": DISCOVERY_PROCESSING_INTERRUPTED,
             "terminal_count": sum(

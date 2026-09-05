@@ -116,6 +116,32 @@ class BucketAssignmentTests(unittest.TestCase):
 
 
 class AlphaDiscoveryTests(unittest.TestCase):
+    def test_smart_money_sources_are_reported_without_new_candidate_buckets(self) -> None:
+        public = alpha_event(1)
+        public["discovery_metadata"]["discovery_source"] = (
+            "solana_logs_subscribe"
+        )
+        helius = alpha_event(2)
+        helius["discovery_metadata"]["discovery_source"] = (
+            "helius_transaction_subscribe"
+        )
+        legacy = alpha_event(3)
+        momentum = alpha_event(4, family="MOMENTUM")
+        momentum["discovery_metadata"]["discovery_source"] = (
+            "solana_logs_subscribe"
+        )
+
+        report = build_alpha_discovery([public, helius, legacy, momentum])
+
+        self.assertEqual(
+            report["input_summary"]["smart_money_discovery_source_counts"],
+            {
+                "helius_transaction_subscribe": 1,
+                "solana_logs_subscribe": 1,
+                "unknown_legacy": 1,
+            },
+        )
+
     def test_legacy_and_research_v1_cohorts_are_isolated(self) -> None:
         research = alpha_event(2, mint="SAME", return_60m=20.0)
         legacy = alpha_event(1, mint="SAME", return_60m=-90.0)
