@@ -6,7 +6,6 @@ import argparse
 import asyncio
 import json
 import logging
-import os
 import time
 from dataclasses import asdict, dataclass, field, replace
 from decimal import Decimal, InvalidOperation
@@ -15,12 +14,11 @@ from typing import Any
 import aiohttp
 from dotenv import load_dotenv
 from solders.pubkey import Pubkey
-from src.helius_rpc import HELIUS_MAX_ATTEMPTS, helius_rpc_call
 from src.logging_utils import configure_safe_logging, redact_sensitive_text
+from src.solana_rpc import provider_configs_from_env, solana_rpc_call
 
 RUGCHECK_BASE = "https://api.rugcheck.xyz/v1/tokens"
 ROUTE_B_MINIMUM_LIQUIDITY_USD = Decimal("10000")
-RPC_MAX_ATTEMPTS = HELIUS_MAX_ATTEMPTS
 ANALYZER_CACHE_TTL_SECONDS = 5.0
 ANALYZER_CACHE_MAX_ENTRIES = 128
 logger = logging.getLogger("analyzer")
@@ -37,12 +35,9 @@ class AnalyzerSettings:
     @classmethod
     def from_env(cls) -> "AnalyzerSettings":
         load_dotenv()
-        helius_key = os.getenv("HELIUS_API_KEY", "").strip()
-        rpc_url = os.getenv("HELIUS_RPC_HTTP_URL", "").strip()
-        rpc_url = rpc_url.replace("${HELIUS_API_KEY}", helius_key)
-        if not helius_key or not rpc_url:
-            raise RuntimeError("HELIUS_API_KEY and HELIUS_RPC_HTTP_URL must be set in .env")
-        return cls(rpc_url=rpc_url)
+        if not provider_configs_from_env():
+            raise RuntimeError("at least one Solana RPC provider must be configured")
+        return cls(rpc_url="solana-rpc-router")
 
 
 @dataclass(slots=True)
@@ -66,12 +61,12 @@ class SafetyReport:
 async def rpc_call(
     session: aiohttp.ClientSession, url: str, method: str, params: list[Any]
 ) -> Any:
-    return await helius_rpc_call(
+    del url  # Backward-compatible caller signature; routing owns endpoints.
+    return await solana_rpc_call(
         session,
-        url,
         method,
         params,
-        max_attempts=RPC_MAX_ATTEMPTS,
+        workload="analyzer",
     )
 
 
@@ -258,7 +253,7 @@ async def _analyze_token_uncached(
             rugcheck_get(session, mint, "report/summary"),
         )
 
-    result = SafetyReport(mint=mint, sources=["helius_finalized_rpc"])
+    result = SafetyReport(mint=mint, sources=["solana_rpc_router_finalized"])
     authority = mint_authority(account)
     result.mint_authority_renounced = authority is None
     if result.mint_authority_renounced:

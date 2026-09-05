@@ -23,10 +23,10 @@ from solders.pubkey import Pubkey
 from websockets.asyncio.client import ClientConnection, connect
 
 from src import state_store
-from src.helius_rpc import (
-    HeliusRpcRateLimitError,
+from src.solana_rpc import (
+    SolanaRpcExhaustedError,
     canonical_rpc_failure_reason,
-    helius_rpc_call,
+    solana_rpc_call,
 )
 from src.logging_utils import configure_safe_logging, redact_sensitive_text
 
@@ -113,12 +113,14 @@ class MonitorSettings:
     def from_env(cls) -> "MonitorSettings":
         load_dotenv()
         api_key = os.getenv("HELIUS_API_KEY", "").strip()
-        ws_url = os.getenv("HELIUS_RPC_WS_URL", "").strip()
-        ws_url = ws_url.replace("${HELIUS_API_KEY}", api_key)
+        ws_template = os.getenv("HELIUS_RPC_WS_URL", "").strip()
+        if "${HELIUS_API_KEY}" in ws_template and not api_key:
+            raise RuntimeError("Helius WSS API key must be set in .env")
+        ws_url = ws_template.replace("${HELIUS_API_KEY}", api_key)
         http_url = os.getenv("HELIUS_RPC_HTTP_URL", "").strip()
         http_url = http_url.replace("${HELIUS_API_KEY}", api_key)
-        if not api_key or not ws_url or not http_url:
-            raise RuntimeError("Helius API key, WSS URL and HTTP URL must be set in .env")
+        if not ws_url or "${" in ws_url:
+            raise RuntimeError("Helius WSS URL must be set in .env")
         reload_seconds = max(1.0, float(os.getenv("WALLET_RELOAD_SECONDS", "5")))
         return cls(ws_url=ws_url, http_url=http_url, wallet_reload_seconds=reload_seconds)
 
@@ -960,7 +962,8 @@ async def process_paper_signal(
                         "candidate terminal status update failed: mint=%s", mint
                     )
             if (
-                isinstance(exc, HeliusRpcRateLimitError)
+                isinstance(exc, SolanaRpcExhaustedError)
+                or canonical_failure is not None
                 or "failed after 3 attempts" in reason
                 or "getTokenSupply failed" in reason
                 or "could not find account" in reason
@@ -1337,7 +1340,13 @@ async def _solana_rpc(
     method: str,
     params: list[Any],
 ) -> Any:
-    return await helius_rpc_call(session, http_url, method, params)
+    del http_url  # Kept for call-site compatibility; the router owns endpoints.
+    return await solana_rpc_call(
+        session,
+        method,
+        params,
+        workload="transaction_history",
+    )
 
 
 def unknown_whale_buy_from_transaction(
@@ -1406,8 +1415,8 @@ async def confirm_unknown_whales(
     if not transaction_signatures:
         return []
     by_wallet: dict[str, UnknownWhaleBuy] = {}
-    # Helius rejects JSON-RPC batch getTransaction on some plans. Sequential,
-    # early-exit reads keep peak memory flat and stop as soon as 3 whales exist.
+    # Sequential early-exit reads keep peak memory flat and stop as soon as
+    # three qualifying wallets exist.
     for signature in transaction_signatures:
         transaction = await _solana_rpc(
             session,
@@ -1703,9 +1712,8 @@ async def fetch_transaction(
     session: aiohttp.ClientSession, http_url: str, signature: str
 ) -> dict[str, Any] | None:
     for _ in range(4):
-        result = await helius_rpc_call(
+        result = await solana_rpc_call(
             session,
-            http_url,
             "getTransaction",
             [
                 signature,
@@ -1715,6 +1723,7 @@ async def fetch_transaction(
                     "maxSupportedTransactionVersion": 0,
                 },
             ],
+            workload="transaction_history",
         )
         if isinstance(result, dict):
             return result

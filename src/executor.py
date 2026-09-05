@@ -27,8 +27,8 @@ from solders.pubkey import Pubkey
 from solders.transaction import VersionedTransaction
 
 from src.analyzer import analyze_token
-from src.helius_rpc import helius_rpc_call
 from src.logging_utils import configure_safe_logging, redact_sensitive_text
+from src.solana_rpc import solana_rpc_call
 from src.state_store import (
     atomic_write_json,
     exclusive_file_lock,
@@ -233,11 +233,12 @@ async def json_rpc(
 
 
 async def sol_balance(session: aiohttp.ClientSession, rpc_url: str, owner: str) -> int:
-    result = await helius_rpc_call(
+    del rpc_url  # Read-only endpoint selection belongs to the router.
+    result = await solana_rpc_call(
         session,
-        rpc_url,
         "getBalance",
         [owner, {"commitment": "confirmed"}],
+        workload="executor_read",
     )
     return int((result or {}).get("value", 0))
 
@@ -747,11 +748,12 @@ async def execute_buy(mint: str, settings: ExecutionSettings | None = None) -> E
 async def token_balance(
     session: aiohttp.ClientSession, rpc_url: str, owner: str, mint: str
 ) -> int:
-    result = await helius_rpc_call(
+    del rpc_url  # Read-only endpoint selection belongs to the router.
+    result = await solana_rpc_call(
         session,
-        rpc_url,
         "getTokenAccountsByOwner",
         [owner, {"mint": mint}, {"encoding": "jsonParsed", "commitment": "confirmed"}],
+        workload="executor_read",
     )
     total = 0
     for account in (result or {}).get("value") or []:

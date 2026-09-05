@@ -15,8 +15,8 @@ import aiohttp
 from dotenv import load_dotenv
 
 from src import state_store
-from src.helius_rpc import helius_rpc_call
 from src.logging_utils import redact_sensitive_text
+from src.solana_rpc import solana_rpc_call
 from src.state_store import (
     atomic_write_json,
     migrate_json,
@@ -589,11 +589,12 @@ def skip_observation(
 async def legacy_probe_amount(
     session: aiohttp.ClientSession, rpc_url: str, mint: str
 ) -> int:
-    result = await helius_rpc_call(
+    del rpc_url  # Backward-compatible signature; routing owns endpoints.
+    result = await solana_rpc_call(
         session,
-        rpc_url,
         "getTokenSupply",
         [mint, {"commitment": "confirmed"}],
+        workload="research",
     )
     value = (result or {}).get("value") or {}
     decimals = max(0, int(value.get("decimals", 0) or 0))
@@ -606,15 +607,8 @@ async def performance_loop(interval_seconds: float = 60) -> None:
     load_dotenv()
     ensure_performance_migrated()
     api_key = os.getenv("JUPITER_API_KEY", "").strip()
-    helius_key = os.getenv("HELIUS_API_KEY", "").strip()
-    rpc_url = os.getenv("HELIUS_RPC_HTTP_URL", "").strip().replace(
-        "${HELIUS_API_KEY}", helius_key
-    )
     if not api_key:
         logger.warning("wallet performance evaluator disabled: JUPITER_API_KEY is missing")
-        return
-    if not rpc_url:
-        logger.warning("wallet performance evaluator disabled: Helius RPC URL is missing")
         return
     from src.executor import JupiterNoRouteError, WSOL_MINT, jupiter_quote
 
@@ -628,7 +622,7 @@ async def performance_loop(interval_seconds: float = 60) -> None:
                     amount = int(sample.get("acquired_raw", 0) or 0)
                     if sample.get("legacy_probe"):
                         amount = await legacy_probe_amount(
-                            session, rpc_url, str(sample["mint"])
+                            session, "solana-rpc-router", str(sample["mint"])
                         )
                     quote = await jupiter_quote(
                         session,

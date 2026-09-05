@@ -41,7 +41,7 @@ pip install -r requirements.txt
 Copy-Item .env.example .env
 ```
 
-`.env`에 Helius 키를 입력합니다. 개인키는 가능하면 `.env` 대신 OS 키 저장소나 외부 secret manager에서 런타임에 주입하세요. `.env`와 개인키는 절대 커밋하지 않습니다.
+`.env`에 필요한 provider endpoint를 입력합니다. 표준 Solana JSON-RPC read는 Alchemy, Chainstack, Ankr, optional Helius 순으로 failover하고 public RPC를 마지막 emergency fallback으로만 사용합니다. endpoint가 비어 있으면 해당 provider는 자동 비활성화되며 URL이나 API key는 운영 상태 파일에 저장하지 않습니다. Helius WebSocket 구독과 DAS처럼 Helius 전용인 기능은 이 HTTP read router와 별도로 유지됩니다. 개인키는 가능하면 `.env` 대신 OS 키 저장소나 외부 secret manager에서 런타임에 주입하세요. `.env`와 개인키는 절대 커밋하지 않습니다.
 
 실행:
 
@@ -59,7 +59,7 @@ python -m src.monitor
 
 모니터는 `data/wallets.json`을 읽으며 `.env`에서 지갑 주소를 받지 않습니다. 파일 변경 여부를 기본 5초마다 확인하고 새 목록이 원자적으로 저장되면 파일을 다시 읽어 WebSocket 구독을 자동으로 구성합니다. 따라서 프로세스를 재시작하지 않아도 감시 대상 최대 20개가 동적으로 교체됩니다. Helius의 확장 `transactionSubscribe`를 사용해 감시 지갑 중 하나와 Pump.fun/PumpSwap/Raydium 프로그램 하나가 동시에 포함된 성공 트랜잭션만 RPC 단계에서 받습니다. 출력 금액은 지갑의 확정된 pre/post 잔액 기준 순변화입니다. `SOL net outflow`는 네트워크 수수료를 제외하지만, 새 토큰 계정 생성이 동반된 거래라면 계정 rent가 포함될 수 있습니다.
 
-스마트 머니 지갑 자동 갱신은 유료 데이터 API나 수동 파일 없이 Helius 표준 Solana JSON-RPC만 사용합니다. 주요 DEX 5개의 최근 서명을 프로그램당 50건씩 조회해 최대 250개 서명자 후보를 만들며, 동시 RPC 요청은 3개·요청 시작 간격은 최소 0.3초로 제한합니다. 이후 0.1 SOL 미만 또는 최근 24시간 거래가 300건을 초과한 지갑을 제외합니다. 감시 중 관찰된 실제 스왑 가격은 `data/wallet_performance.json`에 저장되며, 1시간 뒤 새 온체인 가격 표본과 비교해 반복적으로 부진하거나 위험 토큰을 매수하는 지갑은 후보 풀에서 즉시 교체됩니다.
+스마트 머니 지갑 자동 갱신은 유료 데이터 API나 수동 파일 없이 표준 Solana JSON-RPC만 사용합니다. 활성화된 무료 provider를 method-aware 순서로 사용하며 transaction/signature 이력은 Ankr, Chainstack, Alchemy, optional Helius, public 순으로 failover합니다. 주요 DEX 5개의 최근 서명을 프로그램당 50건씩 조회해 최대 250개 서명자 후보를 만들며, 동시 RPC 요청은 3개·요청 시작 간격은 최소 0.3초로 제한합니다. 이후 0.1 SOL 미만 또는 최근 24시간 거래가 300건을 초과한 지갑을 제외합니다. 감시 중 관찰된 실제 스왑 가격은 `data/wallet_performance.json`에 저장되며, 1시간 뒤 새 온체인 가격 표본과 비교해 반복적으로 부진하거나 위험 토큰을 매수하는 지갑은 후보 풀에서 즉시 교체됩니다.
 
 ```powershell
 # 1시간 주기 상시 실행 (WALLET_REFRESH_HOURS=2로 설정하면 2시간)
@@ -77,7 +77,7 @@ python -m src.wallet_feeder --once
 python -m src.analyzer <TOKEN_MINT_CA>
 ```
 
-분석기는 finalized Helius RPC와 Rugcheck를 교차 사용합니다. 개발자 직접 보유량 10% 미만은 30점, Mint 권한 포기는 35점, LP 95% 이상 락업/소각은 35점으로 총 100점입니다. 세 조건을 모두 충족하고 85점 이상일 때만 `should_enter_token(mint)`가 `True`를 반환합니다. 데이터 누락이나 API 오류는 `False`로 처리합니다. CLI는 진입 가능 시 종료 코드 `0`, 그 외에는 `2`를 반환합니다. 이 판정도 안전을 보증하지 않으며 연결 지갑·내부자 그래프와 실제 매도 가능성 검사는 후속 단계에서 추가해야 합니다.
+분석기는 router가 선택한 finalized 표준 RPC와 Rugcheck를 교차 사용합니다. 가벼운 안전 조회는 Alchemy, Chainstack, Ankr, optional Helius, public 순이며, provider별 공유 rate limiter와 circuit breaker를 적용합니다. 개발자 직접 보유량 10% 미만은 30점, Mint 권한 포기는 35점, LP 95% 이상 락업/소각은 35점으로 총 100점입니다. 세 조건을 모두 충족하고 85점 이상일 때만 `should_enter_token(mint)`가 `True`를 반환합니다. 데이터 누락이나 모든 provider 실패는 기존처럼 `False`로 처리합니다. CLI는 진입 가능 시 종료 코드 `0`, 그 외에는 `2`를 반환합니다. 이 판정도 안전을 보증하지 않으며 연결 지갑·내부자 그래프와 실제 매도 가능성 검사는 후속 단계에서 추가해야 합니다.
 
 Jupiter/Jito 실행기:
 

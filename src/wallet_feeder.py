@@ -19,8 +19,8 @@ import aiohttp
 from dotenv import load_dotenv
 from solders.pubkey import Pubkey
 
-from src.helius_rpc import helius_rpc_call
 from src.logging_utils import configure_safe_logging, redact_sensitive_text
+from src.solana_rpc import provider_configs_from_env, solana_rpc_call
 from src.wallet_performance import (
     capped_return_percent,
     ensure_performance_migrated,
@@ -60,13 +60,11 @@ class FeederSettings:
     @classmethod
     def from_env(cls) -> "FeederSettings":
         load_dotenv()
-        key = os.getenv("HELIUS_API_KEY", "").strip()
-        url = os.getenv("HELIUS_RPC_HTTP_URL", "").strip().replace("${HELIUS_API_KEY}", key)
-        if not key or not url:
-            raise RuntimeError("HELIUS_API_KEY and HELIUS_RPC_HTTP_URL must be set")
+        if not provider_configs_from_env():
+            raise RuntimeError("at least one Solana RPC provider must be configured")
         max_wallets = max(1, int(os.getenv("WALLET_MAX_WALLETS", "20")))
         return cls(
-            rpc_url=url,
+            rpc_url="solana-rpc-router",
             refresh_seconds=max(1, int(os.getenv("WALLET_REFRESH_HOURS", "1"))) * 3600,
             max_wallets=max_wallets,
             min_sol_balance=max(0.0, float(os.getenv("WALLET_MIN_SOL_BALANCE", "0.1"))),
@@ -136,11 +134,11 @@ class RpcClient:
     async def call(self, method: str, params: list[Any]) -> Any:
         await self.throttle()
         async with self.limit:
-            return await helius_rpc_call(
+            return await solana_rpc_call(
                 self.session,
-                self.settings.rpc_url,
                 method,
                 params,
+                workload="wallet_feeder",
             )
 
 
