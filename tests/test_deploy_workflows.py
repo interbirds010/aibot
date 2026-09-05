@@ -16,6 +16,13 @@ class DeployWorkflowTests(unittest.TestCase):
         self.assertIn("src.research.collection_stability", workflow)
         self.assertIn("RPC_ROUTER_SMOKE", workflow)
 
+    def test_monitor_memory_ceiling_remains_unchanged(self) -> None:
+        ecosystem = (ROOT / "ecosystem.config.js").read_text(encoding="utf-8")
+        monitor_block = ecosystem.split('name: "aibot-monitor"', 1)[1].split(
+            "},", 1
+        )[0]
+        self.assertIn('max_memory_restart: "260M"', monitor_block)
+
     def test_extended_observation_is_manual_and_bounded(self) -> None:
         workflow = (
             ROOT / ".github" / "workflows" / "research-observation.yml"
@@ -29,6 +36,8 @@ class DeployWorkflowTests(unittest.TestCase):
         self.assertIn("RESEARCH_REPORT_SCOPE=cumulative", workflow)
         self.assertIn("RESEARCH_REPORT_SCOPE=observation_window", workflow)
         self.assertIn("ALPHA_SMART_MONEY_SOURCES", workflow)
+        self.assertIn("src.research.monitor_memory_profile", workflow)
+        self.assertNotIn('sleep "$OBSERVATION_SECONDS"', workflow)
         self.assertIn("src.research.restart_forensics", workflow)
         self.assertIn("MONITOR_RESTART_FORENSICS", (
             ROOT / "src" / "research" / "restart_forensics.py"

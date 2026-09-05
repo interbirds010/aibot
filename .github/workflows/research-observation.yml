@@ -69,7 +69,10 @@ jobs:
             since_epoch="$(date +%s)"
 
             echo "RESEARCH_OBSERVATION seconds=$OBSERVATION_SECONDS"
-            sleep "$OBSERVATION_SECONDS"
+            ./venv/bin/python -m src.research.monitor_memory_profile \
+              --duration "$OBSERVATION_SECONDS" \
+              --interval 10 \
+              --deployed-sha "$deployed_sha"
 
             ./venv/bin/python -m src.research.alpha_discovery
             ./venv/bin/python - <<'PY'

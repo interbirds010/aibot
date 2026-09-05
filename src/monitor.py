@@ -30,6 +30,12 @@ from src.solana_rpc import (
     solana_rpc_call,
 )
 from src.logging_utils import configure_safe_logging, redact_sensitive_text
+from src.runtime_memory import (
+    current_rss_bytes,
+    record_memory_phase,
+    record_transaction_payload,
+    runtime_memory_metrics,
+)
 
 logger = logging.getLogger("smart-money-monitor")
 
@@ -91,6 +97,7 @@ WALLET_WS_FAILURE_REASONS = frozenset({
 SOLANA_PUBLIC_WS_URL = "wss://api.mainnet.solana.com"
 HELIUS_RECOVERY_PROBE_SECONDS = 1_800.0
 MAX_SEEN_WALLET_SIGNATURES = 10_000
+MONITOR_RSS_CEILING_BYTES = 260 * 1024 * 1024
 DISCOVERY_SOURCE_HELIUS = "helius_transaction_subscribe"
 DISCOVERY_SOURCE_SOLANA = "solana_logs_subscribe"
 WALLET_WS_ACTIVITY_KEYS = frozenset({
@@ -116,6 +123,10 @@ TEST_ALLOW_UNVERIFIED_WALLETS = False
 _analysis_limit = asyncio.Semaphore(2)
 _signal_tasks: set[asyncio.Task[None]] = set()
 _shadow_signal_tasks: set[asyncio.Task[None]] = set()
+_signal_task_created_count = 0
+_signal_task_completed_count = 0
+_shadow_signal_task_created_count = 0
+_shadow_signal_task_completed_count = 0
 _whale_buy_history: dict[tuple[str, str], deque[tuple[float, int]]] = {}
 _last_history_cleanup_at = 0.0
 _market_entry_cooldowns: dict[str, float] = {}
@@ -131,6 +142,8 @@ _wallet_ws_activity_by_source: dict[str, dict[str, int]] = {
     key: {} for key in WALLET_WS_ACTIVITY_KEYS
 }
 _wallet_ws_restore_failures_by_source: dict[str, dict[str, int]] = {}
+_active_signature_window_size = 0
+_active_signature_window_max_size = 0
 
 # Canonical mainnet program IDs. Keep this list reviewed before production use.
 DEX_PROGRAMS = {
@@ -208,18 +221,29 @@ class SignatureWindow:
     """한 연결 안의 중복 signature를 bounded FIFO로 억제한다."""
 
     def __init__(self, maximum: int = MAX_SEEN_WALLET_SIGNATURES) -> None:
+        global _active_signature_window_size
         self.maximum = max(1, int(maximum))
         self._ordered: deque[str] = deque()
         self._seen: set[str] = set()
+        _active_signature_window_size = 0
 
     def add(self, signature: str) -> bool:
+        global _active_signature_window_size, _active_signature_window_max_size
         if signature in self._seen:
             return False
         self._seen.add(signature)
         self._ordered.append(signature)
         while len(self._ordered) > self.maximum:
             self._seen.discard(self._ordered.popleft())
+        _active_signature_window_size = len(self._ordered)
+        _active_signature_window_max_size = max(
+            _active_signature_window_max_size,
+            _active_signature_window_size,
+        )
         return True
+
+    def __len__(self) -> int:
+        return len(self._ordered)
 
 
 def reset_wallet_ws_activity(*, now_epoch: float | None = None) -> None:
@@ -274,6 +298,79 @@ def wallet_ws_activity_metrics() -> dict[str, Any]:
         )
     }
     return values
+
+
+def _release_signal_task(task: asyncio.Task[None], *, shadow: bool) -> None:
+    global _signal_task_completed_count, _shadow_signal_task_completed_count
+    _signal_tasks.discard(task)
+    _signal_task_completed_count += 1
+    if shadow:
+        _shadow_signal_tasks.discard(task)
+        _shadow_signal_task_completed_count += 1
+
+
+def track_signal_task(task: asyncio.Task[None], *, shadow: bool = False) -> None:
+    """Task registry를 단일 lifecycle로 관리하고 완료 참조를 제거한다."""
+    global _signal_task_created_count, _shadow_signal_task_created_count
+    _signal_tasks.add(task)
+    _signal_task_created_count += 1
+    if shadow:
+        _shadow_signal_tasks.add(task)
+        _shadow_signal_task_created_count += 1
+    task.add_done_callback(
+        lambda completed: _release_signal_task(completed, shadow=shadow)
+    )
+
+
+def monitor_runtime_metrics(wallet_count: int) -> dict[str, Any]:
+    """민감한 object 내용 없이 live task/collection 크기만 집계한다."""
+    from src.analyzer import analyzer_runtime_metrics
+
+    tasks = [task for task in asyncio.all_tasks() if not task.done()]
+    signal_tasks = list(_signal_tasks)
+    shadow_tasks = list(_shadow_signal_tasks)
+    metrics = runtime_memory_metrics(
+        rss_ceiling_bytes=MONITOR_RSS_CEILING_BYTES
+    )
+    metrics.update({
+        "monitor_asyncio_live_task_count": len(tasks),
+        "monitor_signal_task_count": len(signal_tasks),
+        "monitor_signal_done_task_count": sum(
+            task.done() for task in signal_tasks
+        ),
+        "monitor_signal_task_created_count": _signal_task_created_count,
+        "monitor_signal_task_completed_count": _signal_task_completed_count,
+        "monitor_shadow_signal_task_count": len(shadow_tasks),
+        "monitor_shadow_signal_done_task_count": sum(
+            task.done() for task in shadow_tasks
+        ),
+        "monitor_shadow_signal_task_created_count": (
+            _shadow_signal_task_created_count
+        ),
+        "monitor_shadow_signal_task_completed_count": (
+            _shadow_signal_task_completed_count
+        ),
+        "monitor_wallet_count": int(wallet_count),
+        "monitor_signature_window_size": _active_signature_window_size,
+        "monitor_signature_window_max_size": (
+            _active_signature_window_max_size
+        ),
+        "monitor_whale_history_key_count": len(_whale_buy_history),
+        "monitor_whale_history_entry_count": sum(
+            len(history) for history in _whale_buy_history.values()
+        ),
+        "monitor_market_entry_cooldown_count": len(_market_entry_cooldowns),
+        "monitor_market_shadow_cooldown_count": len(_market_shadow_cooldowns),
+        "monitor_ws_metric_source_bucket_count": sum(
+            len(values) for values in _wallet_ws_activity_by_source.values()
+        ),
+        "monitor_ws_failure_reason_bucket_count": sum(
+            len(values)
+            for values in _wallet_ws_restore_failures_by_source.values()
+        ),
+    })
+    metrics.update(analyzer_runtime_metrics())
+    return metrics
 
 
 @dataclass(frozen=True, slots=True)
@@ -539,12 +636,23 @@ async def monitor_heartbeat(wallet_count: int) -> None:
     while True:
         metrics = wallet_ws_activity_metrics()
         metrics["monitor_process_heartbeat_at"] = time.time()
-        metrics["monitor_wallet_count"] = int(wallet_count)
+        metrics.update(monitor_runtime_metrics(wallet_count))
         await asyncio.to_thread(
             state_store.set_global_metrics,
             metrics,
         )
-        logger.info("heartbeat: actively monitoring %s wallets", wallet_count)
+        rss = metrics.get("monitor_memory_rss_bytes")
+        logger.info(
+            "heartbeat: wallets=%s rss_mib=%s ceiling_percent=%s "
+            "tasks=%s signal_tasks=%s shadow_tasks=%s signature_window=%s",
+            wallet_count,
+            round(rss / 1024 / 1024, 2) if isinstance(rss, int) else "UNKNOWN",
+            metrics.get("monitor_memory_rss_ceiling_percent"),
+            metrics.get("monitor_asyncio_live_task_count"),
+            metrics.get("monitor_signal_task_count"),
+            metrics.get("monitor_shadow_signal_task_count"),
+            metrics.get("monitor_signature_window_size"),
+        )
         await asyncio.sleep(60)
 
 
@@ -935,7 +1043,11 @@ async def process_paper_signal(
                     discovery_source or "unknown",
                 )
                 analyzer_started = True
-            report = await analyze_token(mint)
+            analyzer_memory_start = current_rss_bytes()
+            try:
+                report = await analyze_token(mint)
+            finally:
+                record_memory_phase("analyzer", analyzer_memory_start)
             analysis_completed_at = datetime.now(timezone.utc).isoformat()
             if requested_route == "A":
                 record_wallet_ws_activity(
@@ -1300,11 +1412,7 @@ def schedule_paper_signal(
             discovery_source=discovery_source,
         )
     )
-    _signal_tasks.add(task)
-    task.add_done_callback(_signal_tasks.discard)
-    if prefilter_reasons:
-        _shadow_signal_tasks.add(task)
-        task.add_done_callback(_shadow_signal_tasks.discard)
+    track_signal_task(task, shadow=bool(prefilter_reasons))
 
 
 def print_buys(
@@ -1374,8 +1482,7 @@ def print_buys(
                 observation = asyncio.create_task(
                     observe_buy(wallet, mint, raw, paid_lamports, signature)
                 )
-                _signal_tasks.add(observation)
-                observation.add_done_callback(_signal_tasks.discard)
+                track_signal_task(observation)
 
                 amount_allowed = whale_buy_amount_allowed(
                     paid_lamports,
@@ -1802,10 +1909,7 @@ def schedule_market_shadow(
             prefilter_reasons=rejection_reasons,
         )
     )
-    _signal_tasks.add(task)
-    task.add_done_callback(_signal_tasks.discard)
-    _shadow_signal_tasks.add(task)
-    task.add_done_callback(_shadow_signal_tasks.discard)
+    track_signal_task(task, shadow=True)
     return True
 
 
@@ -1818,9 +1922,16 @@ async def run_market_momentum_route(settings: MonitorSettings) -> None:
             started = time.monotonic()
             try:
                 wallets = set(load_wallets(settings.wallets_path))
-                candidates, near_misses = await fetch_momentum_candidate_cohorts(
-                    session
-                )
+                momentum_fetch_memory_start = current_rss_bytes()
+                try:
+                    candidates, near_misses = (
+                        await fetch_momentum_candidate_cohorts(session)
+                    )
+                finally:
+                    record_memory_phase(
+                        "momentum_candidate_fetch",
+                        momentum_fetch_memory_start,
+                    )
                 _route_b_consecutive_failures = 0
                 health_now = time.time()
                 if (
@@ -1852,12 +1963,19 @@ async def run_market_momentum_route(settings: MonitorSettings) -> None:
                 )
                 shadow_scheduled = False
                 if candidate is not None:
-                    whales = await asyncio.wait_for(
-                        confirm_unknown_whales(
-                            session, settings.http_url, candidate, wallets
-                        ),
-                        timeout=ROUTE_B_CONFIRM_TIMEOUT_SECONDS,
-                    )
+                    momentum_whale_memory_start = current_rss_bytes()
+                    try:
+                        whales = await asyncio.wait_for(
+                            confirm_unknown_whales(
+                                session, settings.http_url, candidate, wallets
+                            ),
+                            timeout=ROUTE_B_CONFIRM_TIMEOUT_SECONDS,
+                        )
+                    finally:
+                        record_memory_phase(
+                            "momentum_whale_confirmation",
+                            momentum_whale_memory_start,
+                        )
                     if len(whales) >= UNKNOWN_WHALE_MIN_COUNT:
                         refreshed_candidates = await fetch_momentum_candidates(session)
                         refreshed = next(
@@ -1948,8 +2066,7 @@ async def run_market_momentum_route(settings: MonitorSettings) -> None:
                                 },
                             )
                         )
-                        _signal_tasks.add(task)
-                        task.add_done_callback(_signal_tasks.discard)
+                        track_signal_task(task)
                     else:
                         shadow_scheduled = schedule_market_shadow(
                             candidate,
@@ -2004,20 +2121,27 @@ async def fetch_transaction(
     session: aiohttp.ClientSession, http_url: str, signature: str
 ) -> dict[str, Any] | None:
     for _ in range(4):
-        result = await solana_rpc_call(
-            session,
-            "getTransaction",
-            [
-                signature,
-                {
-                    "commitment": "confirmed",
-                    "encoding": "jsonParsed",
-                    "maxSupportedTransactionVersion": 0,
-                },
-            ],
-            workload="transaction_history",
-        )
+        transaction_memory_start = current_rss_bytes()
+        try:
+            result = await solana_rpc_call(
+                session,
+                "getTransaction",
+                [
+                    signature,
+                    {
+                        "commitment": "confirmed",
+                        "encoding": "jsonParsed",
+                        "maxSupportedTransactionVersion": 0,
+                    },
+                ],
+                workload="transaction_history",
+            )
+        finally:
+            record_memory_phase(
+                "smart_get_transaction", transaction_memory_start
+            )
         if isinstance(result, dict):
+            record_transaction_payload(result)
             return result
         await asyncio.sleep(0.4)
     return None
@@ -2214,9 +2338,11 @@ async def monitor_once(settings: MonitorSettings, wallets: tuple[str, ...]) -> N
 
 
 async def run_forever(settings: MonitorSettings) -> None:
+    global _active_signature_window_size
     delay = 3
     route = WalletWsRouteState()
     while True:
+        _active_signature_window_size = 0
         connected_at = time.monotonic()
         try:
             wallets = load_wallets(settings.wallets_path)

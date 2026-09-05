@@ -16,6 +16,7 @@ import aiohttp
 from dotenv import load_dotenv
 
 from src.logging_utils import redact_sensitive_text
+from src.runtime_memory import current_rss_bytes, record_memory_phase
 from src.state_store import migrate_json, read_json, set_global_metrics, update_json
 
 logger = logging.getLogger("signal-observer")
@@ -1346,14 +1347,28 @@ async def observation_loop(interval_seconds: float = 15.0) -> None:
 
         while True:
             tick_started = time.monotonic()
-            due = await asyncio.to_thread(due_observation_samples, time.time())
+            due_scan_memory_start = current_rss_bytes()
+            try:
+                due = await asyncio.to_thread(
+                    due_observation_samples, time.time()
+                )
+            finally:
+                record_memory_phase(
+                    "observation_due_scan", due_scan_memory_start
+                )
             results = await run_due_sample_batch(due, sample_due)
             analysis_dirty = any(results)
             if analysis_dirty:
                 try:
                     from src.observation_analysis import refresh_observation_analysis
 
-                    await asyncio.to_thread(refresh_observation_analysis)
+                    analysis_memory_start = current_rss_bytes()
+                    try:
+                        await asyncio.to_thread(refresh_observation_analysis)
+                    finally:
+                        record_memory_phase(
+                            "observation_analysis", analysis_memory_start
+                        )
                 except Exception:
                     logger.exception("observation condition analysis refresh failed")
             if (

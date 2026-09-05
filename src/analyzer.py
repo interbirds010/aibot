@@ -317,6 +317,17 @@ _analysis_flights: dict[
 _analysis_cache_lock = asyncio.Lock()
 
 
+def analyzer_runtime_metrics() -> dict[str, int]:
+    """분석기 single-flight/cache의 크기만 노출하는 운영 진단 지표다."""
+    return {
+        "monitor_analyzer_cache_entry_count": len(_analysis_cache),
+        "monitor_analyzer_flight_task_count": len(_analysis_flights),
+        "monitor_analyzer_done_flight_task_count": sum(
+            task.done() for task in _analysis_flights.values()
+        ),
+    }
+
+
 def _copy_safety_report(report: SafetyReport) -> SafetyReport:
     return replace(
         report,
