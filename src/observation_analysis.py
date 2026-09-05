@@ -891,3 +891,18 @@ def refresh_observation_analysis(
         mutate,
     )
     return saved
+
+
+def main() -> int:
+    """대형 분석은 monitor가 아닌 bounded 운영 workflow에서 단발 실행한다."""
+    report = refresh_observation_analysis()
+    print(
+        "OBSERVATION_ANALYSIS_REFRESH "
+        f"source={report.get('input_source', 'UNKNOWN')} "
+        f"rows={report.get('input_row_count', 0)}"
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

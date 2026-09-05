@@ -1,13 +1,18 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import unittest
 from unittest import mock
 
-from src import monitor, runtime_memory
+from src import monitor, observation_tracker, runtime_memory
 
 
 class RuntimeMemoryTests(unittest.TestCase):
+    def test_full_analysis_is_not_in_observer_hot_path(self) -> None:
+        source = inspect.getsource(observation_tracker.observation_loop)
+        self.assertNotIn("refresh_observation_analysis", source)
+
     def test_proc_memory_values_are_normalized_to_bytes(self) -> None:
         result = runtime_memory.process_memory_snapshot(
             status_text="VmRSS: 123 kB\nVmSize: 456 kB\nThreads: 7\n",

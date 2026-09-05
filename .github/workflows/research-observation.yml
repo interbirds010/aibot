@@ -74,6 +74,7 @@ jobs:
               --interval 10 \
               --deployed-sha "$deployed_sha"
 
+            ./venv/bin/python -m src.observation_analysis
             ./venv/bin/python -m src.research.alpha_discovery
             ./venv/bin/python - <<'PY'
             import json

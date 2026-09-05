@@ -37,6 +37,7 @@ class DeployWorkflowTests(unittest.TestCase):
         self.assertIn("RESEARCH_REPORT_SCOPE=observation_window", workflow)
         self.assertIn("ALPHA_SMART_MONEY_SOURCES", workflow)
         self.assertIn("src.research.monitor_memory_profile", workflow)
+        self.assertIn("python -m src.observation_analysis", workflow)
         self.assertNotIn('sleep "$OBSERVATION_SECONDS"', workflow)
         self.assertIn("src.research.restart_forensics", workflow)
         self.assertIn("MONITOR_RESTART_FORENSICS", (

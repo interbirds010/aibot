@@ -1358,19 +1358,6 @@ async def observation_loop(interval_seconds: float = 15.0) -> None:
                 )
             results = await run_due_sample_batch(due, sample_due)
             analysis_dirty = any(results)
-            if analysis_dirty:
-                try:
-                    from src.observation_analysis import refresh_observation_analysis
-
-                    analysis_memory_start = current_rss_bytes()
-                    try:
-                        await asyncio.to_thread(refresh_observation_analysis)
-                    finally:
-                        record_memory_phase(
-                            "observation_analysis", analysis_memory_start
-                        )
-                except Exception:
-                    logger.exception("observation condition analysis refresh failed")
             if (
                 analysis_dirty
                 or time.monotonic() - last_health_refresh
