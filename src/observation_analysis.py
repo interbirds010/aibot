@@ -28,6 +28,7 @@ SHADOW_STRATEGY_NAMES = (
 )
 RESEARCH_HORIZONS = ("1m", "3m", "5m", "15m", "30m", "60m")
 RESEARCH_PRIMARY_HORIZON = "60m"
+PIPELINE_INTERRUPTION_REASONS = frozenset({"DISCOVERY_PROCESSING_INTERRUPTED"})
 UNTRACKABLE_QUOTE_STATUS_REASONS = {
     "NO_ROUTE": "ENTRY_NO_ROUTE",
     "NOT_REQUESTED": "ENTRY_NOT_REQUESTED",
@@ -98,6 +99,8 @@ def _missing_outcome_reason(
         if isinstance(decision_reasons, list):
             for raw_reason in decision_reasons:
                 reason = str(raw_reason).strip().upper()
+                if reason in PIPELINE_INTERRUPTION_REASONS:
+                    return reason
                 if reason in RPC_FAILURE_REASONS:
                     return reason
     entry_reason = UNTRACKABLE_QUOTE_STATUS_REASONS.get(quote_status)
@@ -127,6 +130,7 @@ def _lag_metrics(samples: list[dict[str, Any]]) -> dict[str, Any]:
         "mean_sample_lag_seconds": _rounded(_stable_mean(lags)),
         "median_sample_lag_seconds": _rounded(_quantile(lags, 0.50)),
         "p90_sample_lag_seconds": _rounded(_quantile(lags, 0.90)),
+        "p95_sample_lag_seconds": _rounded(_quantile(lags, 0.95)),
         "max_sample_lag_seconds": _rounded(max(lags) if lags else None),
     }
 

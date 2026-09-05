@@ -38,6 +38,8 @@ MAX_SAMPLE_ATTEMPTS = 3
 MAX_HORIZON_SAMPLE_LAG_SECONDS = 60.0
 OBSERVER_HEALTH_INTERVAL_SECONDS = 60.0
 OBSERVER_RESTART_DELAY_SECONDS = 30.0
+DISCOVERY_RECONCILIATION_GRACE_SECONDS = 3_600.0
+DISCOVERY_PROCESSING_INTERRUPTED = "DISCOVERY_PROCESSING_INTERRUPTED"
 OBSERVATION_SCHEMA_VERSION = 5
 TERMINAL_OBSERVATION_STATUSES = {"COMPLETE", "EXPIRED_UNSAMPLED"}
 CANDIDATE_V2_MIN_SCORE = 90.0
@@ -180,6 +182,63 @@ def ensure_observations_migrated() -> dict[str, Any]:
         empty_observations(),
         migrate_observation_document,
     )
+
+
+def reconcile_interrupted_discoveries(
+    *,
+    now_epoch: float | None = None,
+    grace_seconds: float = DISCOVERY_RECONCILIATION_GRACE_SECONDS,
+) -> int:
+    """충분히 오래된 미분석 discovery만 terminal 운영 실패로 마감한다."""
+    now = time.time() if now_epoch is None else float(now_epoch)
+    grace = max(60.0, float(grace_seconds))
+    reconciled = 0
+
+    def migrate(document: dict[str, Any]) -> bool:
+        nonlocal reconciled
+        changed = migrate_observation_document(document)
+        rows = document.get("observations", [])
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            started_at = _finite_or_none(row.get("started_at_epoch"))
+            if (
+                str(row.get("status") or "").upper() != "DISCOVERED"
+                or str(row.get("decision_status") or "").upper() != "DISCOVERED"
+                or str(row.get("quote_status") or "").upper() != "NOT_REQUESTED"
+                or row.get("tracking_profile") != "research_v1_60m"
+                or row.get("analysis_completed_at") is not None
+                or row.get("entry_quote_at") is not None
+                or row.get("decision_reasons") != []
+                or row.get("samples") != []
+                or row.get("sample_attempts") not in ({}, None)
+                or row.get("paper_experiment_position_id") is not None
+                or row.get("candidate_v2_position_id") is not None
+                or str(row.get("paper_experiment_status") or "NOT_EVALUATED").upper()
+                != "NOT_EVALUATED"
+                or started_at is None
+                or now - started_at < grace
+            ):
+                continue
+            completed_at = datetime.fromtimestamp(now, timezone.utc).isoformat()
+            row["status"] = "COMPLETE"
+            row["decision_status"] = "INTERRUPTED"
+            row["decision_reasons"] = [DISCOVERY_PROCESSING_INTERRUPTED]
+            row["quote_status"] = "PROCESSING_FAILED"
+            row["research_decision"] = "SHADOW"
+            row["paper_experiment_status"] = "NOT_ELIGIBLE"
+            row["candidate_v2_paper_status"] = "NOT_ELIGIBLE"
+            row["reconciled_at"] = completed_at
+            row["reconciliation_reason"] = DISCOVERY_PROCESSING_INTERRUPTED
+            row["completed_at"] = completed_at
+            reconciled += 1
+            changed = True
+        if reconciled:
+            document["updated_at"] = datetime.now(timezone.utc).isoformat()
+        return changed
+
+    migrate_json(OBSERVATION_PATH, empty_observations(), migrate)
+    return reconciled
 
 
 def _sampled_at_epoch(sample: dict[str, Any]) -> float | None:
@@ -995,6 +1054,20 @@ async def observation_loop(interval_seconds: float = 15.0) -> None:
         "observer_started_at": started_at,
         "observer_heartbeat_at": started_at,
     })
+    observation_document = await asyncio.to_thread(ensure_observations_migrated)
+    reconciled = await asyncio.to_thread(reconcile_interrupted_discoveries)
+    if reconciled:
+        observation_document = await asyncio.to_thread(ensure_observations_migrated)
+        logger.warning(
+            "interrupted discovery observations reconciled: count=%s reason=%s",
+            reconciled,
+            DISCOVERY_PROCESSING_INTERRUPTED,
+        )
+    await _publish_observer_metrics({
+        "discovery_reconciliation_last_count": reconciled,
+        "discovery_reconciliation_last_at": time.time(),
+        "discovery_reconciliation_reason": DISCOVERY_PROCESSING_INTERRUPTED,
+    })
     load_dotenv()
     api_key = os.getenv("JUPITER_API_KEY", "").strip()
     if not api_key:
@@ -1012,7 +1085,6 @@ async def observation_loop(interval_seconds: float = 15.0) -> None:
         ensure_shadow_trades_migrated,
     )
 
-    observation_document = await asyncio.to_thread(ensure_observations_migrated)
     await asyncio.to_thread(ensure_shadow_trades_migrated)
     backfilled = await asyncio.to_thread(
         backfill_completed_shadow_trades,

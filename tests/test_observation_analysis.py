@@ -260,6 +260,7 @@ class ResearchMetricsTests(unittest.TestCase):
         self.assertEqual(horizon["mean_sample_lag_seconds"], 21.6667)
         self.assertEqual(horizon["median_sample_lag_seconds"], 3.0)
         self.assertEqual(horizon["p90_sample_lag_seconds"], 49.4)
+        self.assertEqual(horizon["p95_sample_lag_seconds"], 55.2)
         self.assertEqual(horizon["max_sample_lag_seconds"], 61.0)
 
     def test_group_horizons_include_coverage_and_lag_metrics(self) -> None:
@@ -310,6 +311,20 @@ class ResearchMetricsTests(unittest.TestCase):
         rejection = metrics["rejection_reasons"][0]
         self.assertEqual(rejection["coverage_rate_percent"], 0.0)
         self.assertIsNone(rejection["trackable_coverage_rate_percent"])
+
+    def test_interrupted_discovery_has_stable_pipeline_missing_reason(self) -> None:
+        row = self.event("INTERRUPTED", "SHADOW", None)
+        row["decision_status"] = "INTERRUPTED"
+        row["quote_status"] = "PROCESSING_FAILED"
+        row["decision_reasons"] = ["DISCOVERY_PROCESSING_INTERRUPTED"]
+
+        horizon = build_research_metrics([row])["horizons"]["60m"]
+
+        self.assertEqual(
+            horizon["missing_reasons"],
+            {"DISCOVERY_PROCESSING_INTERRUPTED": 1},
+        )
+        self.assertEqual(horizon["outcome_untrackable_count"], 1)
 
     def test_rejection_reason_separates_raw_and_trackable_coverage(self) -> None:
         sampled = self.event("SAMPLED", "REJECTED", 10.0, reason="LOW_SCORE")

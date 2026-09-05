@@ -159,6 +159,109 @@ class ObservationLedgerTests(unittest.TestCase):
         )["observations"] if row["mint"] == "ENTERED")
         self.assertEqual(entered["research_decision"], "ENTERED")
 
+    def test_interrupted_discovery_reconciliation_is_narrow_and_idempotent(self) -> None:
+        with patch.object(observation_tracker.time, "time", return_value=100.0):
+            old = asyncio.run(observation_tracker.record_candidate_discovery(
+                mint="OLD",
+                route_type="A",
+                source_wallet="WALLET",
+                source_signature="OLD",
+                token_amount_raw=100,
+                token_decimals=6,
+                signal_detected_at="2026-07-30T00:00:00+00:00",
+            ))
+        with patch.object(observation_tracker.time, "time", return_value=3_900.0):
+            recent = asyncio.run(observation_tracker.record_candidate_discovery(
+                mint="RECENT",
+                route_type="A",
+                source_wallet="WALLET",
+                source_signature="RECENT",
+                token_amount_raw=100,
+                token_decimals=6,
+                signal_detected_at="2026-07-30T00:00:00+00:00",
+            ))
+
+        count = observation_tracker.reconcile_interrupted_discoveries(
+            now_epoch=4_000.0,
+        )
+        document = observation_tracker.read_json(
+            observation_tracker.OBSERVATION_PATH,
+            observation_tracker.empty_observations(),
+        )
+        rows = {
+            row["observation_id"]: row for row in document["observations"]
+        }
+
+        self.assertEqual(count, 1)
+        self.assertEqual(rows[old.observation_id]["status"], "COMPLETE")
+        self.assertEqual(
+            rows[old.observation_id]["decision_status"],
+            "INTERRUPTED",
+        )
+        self.assertEqual(
+            rows[old.observation_id]["decision_reasons"],
+            [observation_tracker.DISCOVERY_PROCESSING_INTERRUPTED],
+        )
+        self.assertEqual(
+            rows[old.observation_id]["quote_status"],
+            "PROCESSING_FAILED",
+        )
+        self.assertIsNone(rows[old.observation_id]["analysis_completed_at"])
+        self.assertEqual(rows[recent.observation_id]["status"], "DISCOVERED")
+
+        version = document["version"]
+        self.assertEqual(
+            observation_tracker.reconcile_interrupted_discoveries(
+                now_epoch=4_000.0,
+            ),
+            0,
+        )
+        unchanged = observation_tracker.read_json(
+            observation_tracker.OBSERVATION_PATH,
+            observation_tracker.empty_observations(),
+        )
+        self.assertEqual(unchanged["version"], version)
+
+    def test_reconciliation_preserves_sampled_and_terminal_rows(self) -> None:
+        for mint in ("SAMPLED", "TERMINAL"):
+            with patch.object(observation_tracker.time, "time", return_value=100.0):
+                asyncio.run(observation_tracker.record_candidate_discovery(
+                    mint=mint,
+                    route_type="B",
+                    source_wallet="WALLET",
+                    source_signature=mint,
+                    token_amount_raw=100,
+                    token_decimals=6,
+                    signal_detected_at="2026-07-30T00:00:00+00:00",
+                ))
+
+        def mutate(document: dict) -> None:
+            rows = {row["mint"]: row for row in document["observations"]}
+            rows["SAMPLED"]["samples"] = [{"interval": "1m"}]
+            rows["TERMINAL"]["status"] = "COMPLETE"
+
+        observation_tracker.update_json(
+            observation_tracker.OBSERVATION_PATH,
+            observation_tracker.empty_observations(),
+            mutate,
+        )
+        before = observation_tracker.read_json(
+            observation_tracker.OBSERVATION_PATH,
+            observation_tracker.empty_observations(),
+        )
+
+        self.assertEqual(
+            observation_tracker.reconcile_interrupted_discoveries(
+                now_epoch=4_000.0,
+            ),
+            0,
+        )
+        after = observation_tracker.read_json(
+            observation_tracker.OBSERVATION_PATH,
+            observation_tracker.empty_observations(),
+        )
+        self.assertEqual(after, before)
+
     def test_missing_momentum_features_remain_none(self) -> None:
         self.assertTrue(self.record(momentum_metrics={"volume_m5_usd": 20_000}))
         row = observation_tracker.read_json(

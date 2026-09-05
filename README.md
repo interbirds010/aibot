@@ -110,6 +110,18 @@ streamlit run src/dashboard.py --server.address localhost --server.port 8501
 
 Live 모드는 평문 개인키를 거부합니다. 암호화 키의 공개주소가 `EXPECTED_LIVE_WALLET_ADDRESS`와 일치하고 `LIVE_TRADING_ACK=I_UNDERSTAND_LIVE_TRADING_RISK`가 명시되어야 하며, RPC/Jito URL도 HTTPS mainnet인지 검사합니다. 거래 생성 후 Helius `simulateTransaction`의 `unitsConsumed`에 10% 버퍼를 더해 `SetComputeUnitLimit`을 다시 기록하고 재서명합니다. 실행 상태는 `BUILT → SIMULATED → SUBMITTED → LANDED/FAILED/UNKNOWN`으로 로그와 live 장부 이벤트에 기록됩니다.
 
+## Research 수집 안정성 진단
+
+현재 누적 Research lifecycle, horizon별 coverage·missing reason·sample lag, provider circuit 상태와 WebSocket canonical 장애 원인은 endpoint를 출력하지 않는 다음 명령으로 확인합니다.
+
+```powershell
+python -m src.research.collection_stability
+```
+
+장시간 관찰 전에는 `--write-baseline <PATH>`로 provider 누적값을 저장하고, 관찰 후 `--baseline <PATH>`를 전달하면 해당 구간 delta를 계산합니다. GitHub의 `Research collection observation` workflow도 같은 진단을 수동으로 실행하며 일반 배포를 기다리게 하지 않습니다.
+
+Alchemy Free 추가는 자동화하지 않습니다. 동일 관찰 구간에 Research signal 50건 이상과 Solana Public 요청 100건 이상이 모두 쌓였을 때만 판단하며, `RPC_ALL_PROVIDERS_EXHAUSTED`가 5건 이상이면서 signal의 25% 이상이고 Public 성공률도 90% 미만인 세 조건이 동시에 지속될 때 추가를 권고합니다. 이 기준은 수집 인프라 운영 기준이며 거래·전략 threshold가 아닙니다. 표본이 그보다 작거나 조건 중 하나라도 충족하지 않으면 Public RPC 관찰을 유지합니다.
+
 ## 권장 확장 순서
 
 1. 관심 DEX 프로그램 ID와 이벤트 파서를 `src/parsers/`에 추가

@@ -131,7 +131,16 @@ class SolanaRpcRouterTests(unittest.TestCase):
         state = solana_rpc.provider_state("ankr", [target])
         self.assertEqual(state["consecutive_failures"], 3)
         self.assertEqual(state["circuit_state"], "OPEN")
+        self.assertEqual(state["circuit_open_count"], 1)
         self.assertIsNone(solana_rpc._reserve_provider_slot_sync(target))
+
+        solana_rpc._record_provider_failure_sync(
+            target,
+            reservation,
+            failure,
+        )
+        state = solana_rpc.provider_state("ankr", [target])
+        self.assertEqual(state["circuit_open_count"], 1)
 
     def test_cooldown_expiry_allows_one_probe_and_success_closes_circuit(self) -> None:
         target = provider("alchemy")
@@ -157,6 +166,27 @@ class SolanaRpcRouterTests(unittest.TestCase):
         recovered = solana_rpc.provider_state("alchemy", [target])
         self.assertEqual(recovered["circuit_state"], "CLOSED")
         self.assertEqual(recovered["consecutive_failures"], 0)
+
+    def test_provider_state_migrates_metrics_and_calculates_success_rate(self) -> None:
+        target = provider("alchemy")
+        atomic_write_json(solana_rpc._state_path("alchemy"), {
+            "schema_version": 1,
+            "version": 4,
+            "provider": "alchemy",
+            "request_count": 5,
+            "success_count": 3,
+            "failure_count": 1,
+            "rate_limit_count": 1,
+        })
+
+        state = solana_rpc.provider_state("alchemy", [target])
+
+        self.assertEqual(
+            state["schema_version"],
+            solana_rpc.RPC_PROVIDER_STATE_SCHEMA_VERSION,
+        )
+        self.assertEqual(state["circuit_open_count"], 0)
+        self.assertEqual(state["success_rate_percent"], 75.0)
 
     def test_all_providers_fail_closed(self) -> None:
         primary, secondary = provider("alchemy"), provider("ankr")

@@ -1,0 +1,124 @@
+name: Research collection observation
+
+on:
+  workflow_dispatch:
+    inputs:
+      observation_seconds:
+        description: "실제 production traffic 관찰 시간(60~1800초)"
+        required: true
+        default: "360"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-aibot-production
+  cancel-in-progress: false
+
+jobs:
+  observe:
+    name: Observe production Research collection
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 35
+
+    steps:
+      - name: Observe bounded production traffic
+        uses: appleboy/ssh-action@v1
+        env:
+          EXPECTED_SHA: ${{ github.sha }}
+          OBSERVATION_SECONDS: ${{ inputs.observation_seconds }}
+          RUN_ID: ${{ github.run_id }}
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: deploy
+          password: ${{ secrets.SSH_PASSWORD }}
+          port: 22
+          timeout: 30s
+          command_timeout: 32m
+          envs: EXPECTED_SHA,OBSERVATION_SECONDS,RUN_ID
+          script: |
+            set -Eeuo pipefail
+
+            if [[ ! "$OBSERVATION_SECONDS" =~ ^[0-9]+$ ]] \
+              || (( OBSERVATION_SECONDS < 60 || OBSERVATION_SECONDS > 1800 )); then
+              echo "ERROR: observation_seconds must be between 60 and 1800" >&2
+              exit 1
+            fi
+
+            cd /var/www/aibot
+            test -x ./venv/bin/python
+            test -f .deployed-sha
+            deployed_sha="$(tr -d '[:space:]' < .deployed-sha)"
+            if [[ "$deployed_sha" != "$EXPECTED_SHA" ]]; then
+              echo "ERROR: production SHA does not match workflow main SHA" >&2
+              exit 1
+            fi
+            echo "PRODUCTION_SHA=$deployed_sha"
+
+            baseline="/tmp/aibot-rpc-baseline-${RUN_ID}.json"
+            pm2_before="/tmp/aibot-pm2-before-${RUN_ID}.json"
+            pm2_after="/tmp/aibot-pm2-after-${RUN_ID}.json"
+            trap 'rm -f "$baseline" "$pm2_before" "$pm2_after"' EXIT
+
+            export PM2_HOME=/home/deploy/.pm2
+            pm2 jlist > "$pm2_before"
+            ./venv/bin/python -m src.research.collection_stability \
+              --write-baseline "$baseline"
+            since_epoch="$(date +%s)"
+
+            echo "RESEARCH_OBSERVATION seconds=$OBSERVATION_SECONDS"
+            sleep "$OBSERVATION_SECONDS"
+
+            ./venv/bin/python -m src.research.alpha_discovery
+            ./venv/bin/python -m src.research.collection_stability \
+              --since-epoch "$since_epoch" \
+              --baseline "$baseline"
+
+            pm2 jlist > "$pm2_after"
+            ./venv/bin/python - "$pm2_before" "$pm2_after" <<'PY'
+            import json
+            import sys
+            from pathlib import Path
+
+            def selected(path):
+                apps = json.loads(Path(path).read_text(encoding="utf-8"))
+                return {
+                    app.get("name"): {
+                        "status": (app.get("pm2_env") or {}).get("status"),
+                        "pid": app.get("pid"),
+                        "restarts": int(
+                            (app.get("pm2_env") or {}).get("restart_time", 0) or 0
+                        ),
+                    }
+                    for app in apps
+                    if app.get("name") in {
+                        "aibot-monitor",
+                        "aibot-risk-manager",
+                        "aibot-dashboard",
+                        "wallet_feeder",
+                    }
+                }
+
+            before = selected(sys.argv[1])
+            after = selected(sys.argv[2])
+            for name in (
+                "aibot-monitor", "aibot-risk-manager", "aibot-dashboard"
+            ):
+                current = after.get(name, {})
+                if current.get("status") != "online" or not current.get("pid"):
+                    raise SystemExit(f"PM2 process unhealthy: {name}")
+                if current["restarts"] != before.get(name, {}).get("restarts"):
+                    raise SystemExit(f"PM2 restart increased during observation: {name}")
+            for name, state in sorted(after.items()):
+                print(
+                    f"PM2_OBSERVATION name={name} status={state['status']} "
+                    f"pid={state['pid']} restarts={state['restarts']}"
+                )
+            PY
+
+            dashboard_status="$(curl --silent --show-error --output /dev/null \
+              --write-out '%{http_code}' http://127.0.0.1:8501/ai-bot/)"
+            test "$dashboard_status" = "200"
+            echo "DASHBOARD_HTTP=$dashboard_status"

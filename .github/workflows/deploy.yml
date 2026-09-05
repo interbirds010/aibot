@@ -17,7 +17,7 @@ jobs:
     name: Deploy to Ubuntu
     runs-on: ubuntu-latest
     environment: production
-    timeout-minutes: 25
+    timeout-minutes: 15
 
     steps:
       - name: Check out main
@@ -176,7 +176,7 @@ jobs:
                     key: state.get(key)
                     for key in (
                         "request_count", "success_count", "failure_count",
-                        "rate_limit_count", "circuit_state",
+                        "rate_limit_count", "circuit_open_count", "circuit_state",
                     )
                 }
 
@@ -510,8 +510,13 @@ jobs:
                             f"successes={state['success_count']} "
                             f"failures={state['failure_count']} "
                             f"rate_limits={state['rate_limit_count']} "
+                            f"success_rate={state['success_rate_percent']} "
+                            f"consecutive_failures={state['consecutive_failures']} "
+                            f"circuit_opens={state['circuit_open_count']} "
                             f"circuit={state['circuit_state']} "
-                            f"last_success={state['last_success_at_epoch']}"
+                            f"last_success={state['last_success_at_epoch']} "
+                            f"last_failure={state['last_failure_at_epoch']} "
+                            f"last_failure_category={state['last_failure_category']}"
                         )
 
                     before = {
@@ -585,10 +590,8 @@ jobs:
             )
             PY
 
-            # Observe real market traffic only. Six minutes covers the first
-            # 1m/3m/5m horizons without holding deployment for the 60m result.
-            sleep 360
-            ./venv/bin/python -m src.research.alpha_discovery
+            # 일반 배포는 실제 signal을 기다리지 않고 구조 상태만 즉시 확인한다.
+            ./venv/bin/python -m src.research.collection_stability
             ./venv/bin/python - "$DEPLOY_SHA" <<'PY'
             import json
             import subprocess
@@ -817,3 +820,7 @@ jobs:
                 )
             print("JUPITER_POSITION_HEALTH=OK")
             PY
+
+            printf '%s\n' "$DEPLOY_SHA" > .deployed-sha.tmp
+            mv .deployed-sha.tmp .deployed-sha
+            echo "DEPLOYED_SHA=$DEPLOY_SHA"

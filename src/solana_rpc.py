@@ -26,6 +26,7 @@ logger = logging.getLogger("solana-rpc")
 RPC_PROVIDER_STATE_DIR = (
     Path(__file__).resolve().parents[1] / "data" / "solana_rpc_providers"
 )
+RPC_PROVIDER_STATE_SCHEMA_VERSION = 2
 SOLANA_PUBLIC_DEFAULT_URL = "https://api.mainnet.solana.com"
 RPC_CIRCUIT_FAILURE_THRESHOLD = 3
 RPC_CIRCUIT_COOLDOWN_SECONDS = 60.0
@@ -296,7 +297,7 @@ def _state_path(provider_name: str) -> Path:
 
 def _empty_provider_state(provider_name: str) -> dict[str, Any]:
     return {
-        "schema_version": 1,
+        "schema_version": RPC_PROVIDER_STATE_SCHEMA_VERSION,
         "version": 0,
         "provider": provider_name,
         "enabled": True,
@@ -311,8 +312,22 @@ def _empty_provider_state(provider_name: str) -> dict[str, Any]:
         "last_failure_category": None,
         "cooldown_until_epoch": 0.0,
         "circuit_state": "CLOSED",
+        "circuit_open_count": 0,
         "half_open_lease_until_epoch": 0.0,
     }
+
+
+def _migrate_provider_state(
+    provider_name: str,
+    state: dict[str, Any],
+) -> dict[str, Any]:
+    """기존 provider state에 새 bounded metric 기본값을 보완한다."""
+    defaults = _empty_provider_state(provider_name)
+    for key, value in defaults.items():
+        state.setdefault(key, value)
+    state["schema_version"] = RPC_PROVIDER_STATE_SCHEMA_VERSION
+    state["provider"] = provider_name
+    return state
 
 
 def _safe_epoch(value: Any) -> float:
@@ -335,7 +350,10 @@ def _reserve_provider_slot_sync(
     """provider별 전역 slot을 확보하고 OPEN/HALF_OPEN을 원자적으로 처리한다."""
     path = _state_path(provider.name)
     with exclusive_file_lock(path, timeout_seconds=180.0):
-        state = read_json(path, _empty_provider_state(provider.name))
+        state = _migrate_provider_state(
+            provider.name,
+            read_json(path, _empty_provider_state(provider.name)),
+        )
         now = time.time() if now_epoch is None else float(now_epoch)
         circuit = str(state.get("circuit_state") or "CLOSED").upper()
         cooldown_until = _safe_epoch(state.get("cooldown_until_epoch"))
@@ -366,7 +384,7 @@ def _reserve_provider_slot_sync(
             now = time.time()
         else:
             now = target
-        state["schema_version"] = 1
+        state["schema_version"] = RPC_PROVIDER_STATE_SCHEMA_VERSION
         state["provider"] = provider.name
         state["enabled"] = True
         state["request_count"] = int(state.get("request_count", 0) or 0) + 1
@@ -388,7 +406,10 @@ def _record_provider_success_sync(
 ) -> None:
     path = _state_path(provider.name)
     with exclusive_file_lock(path, timeout_seconds=180.0):
-        state = read_json(path, _empty_provider_state(provider.name))
+        state = _migrate_provider_state(
+            provider.name,
+            read_json(path, _empty_provider_state(provider.name)),
+        )
         state["success_count"] = int(state.get("success_count", 0) or 0) + 1
         state["consecutive_failures"] = 0
         state["last_success_at_epoch"] = time.time()
@@ -407,8 +428,12 @@ def _record_provider_failure_sync(
 ) -> None:
     path = _state_path(provider.name)
     with exclusive_file_lock(path, timeout_seconds=180.0):
-        state = read_json(path, _empty_provider_state(provider.name))
+        state = _migrate_provider_state(
+            provider.name,
+            read_json(path, _empty_provider_state(provider.name)),
+        )
         now = time.time()
+        prior_circuit = str(state.get("circuit_state") or "CLOSED").upper()
         state["failure_count"] = int(state.get("failure_count", 0) or 0) + 1
         state["last_failure_at_epoch"] = now
         state["last_failure_category"] = failure.category
@@ -429,6 +454,10 @@ def _record_provider_failure_sync(
                 or consecutive >= RPC_CIRCUIT_FAILURE_THRESHOLD
             ):
                 state["circuit_state"] = "OPEN"
+                if prior_circuit != "OPEN":
+                    state["circuit_open_count"] = (
+                        int(state.get("circuit_open_count", 0) or 0) + 1
+                    )
                 state["cooldown_until_epoch"] = max(
                     state["cooldown_until_epoch"],
                     now + RPC_CIRCUIT_COOLDOWN_SECONDS,
@@ -451,7 +480,10 @@ def provider_state(
     """endpoint 없이 provider 운영 state만 반환한다."""
     path = _state_path(provider_name)
     with exclusive_file_lock(path):
-        state = read_json(path, _empty_provider_state(provider_name))
+        state = _migrate_provider_state(
+            provider_name,
+            read_json(path, _empty_provider_state(provider_name)),
+        )
     configured = (
         tuple(providers)
         if providers is not None
@@ -460,6 +492,14 @@ def provider_state(
     state["enabled"] = provider_name in {
         provider.name for provider in configured
     }
+    completed = (
+        int(state.get("success_count", 0) or 0)
+        + int(state.get("failure_count", 0) or 0)
+    )
+    state["success_rate_percent"] = (
+        round(int(state.get("success_count", 0) or 0) / completed * 100, 4)
+        if completed else None
+    )
     return state
 
 

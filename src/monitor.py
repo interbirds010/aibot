@@ -21,6 +21,7 @@ import aiohttp
 from dotenv import load_dotenv
 from solders.pubkey import Pubkey
 from websockets.asyncio.client import ClientConnection, connect
+from websockets.exceptions import ConnectionClosed, InvalidHandshake, InvalidStatus
 
 from src import state_store
 from src.solana_rpc import (
@@ -77,6 +78,16 @@ SUBSCRIPTION_REFRESH_SECONDS = 1_800.0
 HEALTH_WRITE_INTERVAL_SECONDS = 60.0
 ROUTE_B_CONFIRM_TIMEOUT_SECONDS = 180.0
 MAX_PENDING_SHADOW_SIGNALS = 40
+WALLET_WS_FAILURE_REASONS = frozenset({
+    "WS_AUTH_FAILED",
+    "WS_RATE_LIMITED",
+    "WS_HANDSHAKE_FAILED",
+    "WS_SUBSCRIPTION_FAILED",
+    "WS_REMOTE_CLOSED",
+    "WS_HEARTBEAT_TIMEOUT",
+    "WS_TRANSPORT_ERROR",
+    "WS_MALFORMED_RESPONSE",
+})
 
 # On-chain feeder output is verified; fail closed if an old unverified row remains.
 TEST_ALLOW_UNVERIFIED_WALLETS = False
@@ -279,8 +290,96 @@ class EnhancedSubscriptionUnavailable(Exception):
     """Signal that the Helius plan requires standard WebSocket fallback."""
 
 
+class WebSocketSubscriptionRejected(RuntimeError):
+    """Bounded subscription rejection without persisting provider payloads."""
+
+    def __init__(self, canonical_reason: str) -> None:
+        self.canonical_reason = canonical_reason
+        super().__init__(canonical_reason)
+
+
 class SubscriptionRefresh(Exception):
     """정상 연결도 주기적으로 재구독해 장기 정체를 방지한다."""
+
+
+def _websocket_http_status(error: BaseException) -> int | None:
+    response = getattr(error, "response", None)
+    raw_status = getattr(response, "status_code", None)
+    if raw_status is None:
+        raw_status = getattr(error, "status_code", None)
+    try:
+        return int(raw_status) if raw_status is not None else None
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def websocket_subscription_failure_reason(payload: Any) -> str:
+    """subscription 오류 payload를 bounded 운영 category로 정규화한다."""
+    error = payload if isinstance(payload, dict) else {}
+    try:
+        code = int(error.get("code"))
+    except (TypeError, ValueError, OverflowError):
+        code = 0
+    message = str(error.get("message") or "").upper()
+    if code in {401, 403} or "AUTH" in message or "API KEY" in message:
+        return "WS_AUTH_FAILED"
+    if code == 429 or "RATE LIMIT" in message or "TOO MANY" in message:
+        return "WS_RATE_LIMITED"
+    return "WS_SUBSCRIPTION_FAILED"
+
+
+def canonical_websocket_failure_reason(error: BaseException) -> str:
+    """raw 예외를 저장하지 않고 WebSocket 장애 category만 반환한다."""
+    explicit = str(getattr(error, "canonical_reason", "") or "")
+    if explicit in WALLET_WS_FAILURE_REASONS:
+        return explicit
+    status = _websocket_http_status(error)
+    if status in {401, 403}:
+        return "WS_AUTH_FAILED"
+    if status == 429:
+        return "WS_RATE_LIMITED"
+    if isinstance(error, (InvalidStatus, InvalidHandshake)):
+        return "WS_HANDSHAKE_FAILED"
+    if isinstance(error, json.JSONDecodeError):
+        return "WS_MALFORMED_RESPONSE"
+    if isinstance(error, ConnectionClosed):
+        description = str(error).upper()
+        if "PING TIMEOUT" in description or "HEARTBEAT" in description:
+            return "WS_HEARTBEAT_TIMEOUT"
+        return "WS_REMOTE_CLOSED"
+    if isinstance(error, (OSError, asyncio.TimeoutError, ConnectionError)):
+        return "WS_TRANSPORT_ERROR"
+    return "WS_TRANSPORT_ERROR"
+
+
+def record_wallet_ws_failure(reason: str, *, now_epoch: float | None = None) -> None:
+    """WebSocket reconnect 원인을 전역 원장에 원자적으로 누적한다."""
+    category = str(reason).upper()
+    if category not in WALLET_WS_FAILURE_REASONS:
+        raise ValueError("unsupported wallet WebSocket failure reason")
+    now = time.time() if now_epoch is None else float(now_epoch)
+
+    def mutate(document: dict[str, Any]) -> None:
+        document.setdefault("schema_version", 2)
+        metrics = document.setdefault("metrics", {})
+        if not isinstance(metrics, dict):
+            raise RuntimeError("global metrics are malformed")
+        metrics["wallet_ws_reconnect_count"] = (
+            int(metrics.get("wallet_ws_reconnect_count", 0) or 0) + 1
+        )
+        metrics["wallet_ws_consecutive_failures"] = (
+            int(metrics.get("wallet_ws_consecutive_failures", 0) or 0) + 1
+        )
+        metrics["wallet_ws_last_failure_at"] = now
+        metrics["wallet_ws_last_failure_category"] = category
+        metrics["wallet_ws_state"] = "RECONNECTING"
+        metrics["wallet_ws_state_changed_at"] = now
+
+    state_store.update_json(
+        state_store.GLOBAL_METRICS_PATH,
+        {"schema_version": 2, "version": 0, "metrics": {}},
+        mutate,
+    )
 
 
 async def watch_wallet_file(
@@ -1741,6 +1840,15 @@ async def monitor_standard_once(
     async with connect(
         settings.ws_url, ping_interval=20, ping_timeout=20, open_timeout=20, max_queue=512
     ) as socket, aiohttp.ClientSession(timeout=timeout) as session:
+        connected_at = time.time()
+        await asyncio.to_thread(
+            state_store.set_global_metrics,
+            {
+                "wallet_ws_connected_at": connected_at,
+                "wallet_ws_endpoint_kind": "HELIUS_WSS",
+                "wallet_ws_subscription_method": "logsSubscribe",
+            },
+        )
         for request_id, wallet in enumerate(wallets, start=1):
             request_to_wallet[request_id] = wallet
             await socket.send(json.dumps({
@@ -1752,7 +1860,9 @@ async def monitor_standard_once(
             message = json.loads(raw_message)
             if "id" in message:
                 if "error" in message:
-                    raise RuntimeError(f"standard subscription rejected: {message['error']}")
+                    raise WebSocketSubscriptionRejected(
+                        websocket_subscription_failure_reason(message["error"])
+                    )
                 acknowledgements += 1
                 if acknowledgements == len(wallets):
                     await asyncio.to_thread(
@@ -1761,6 +1871,8 @@ async def monitor_standard_once(
                             "wallet_ws_state": "SUBSCRIBED",
                             "wallet_ws_subscribed_at": time.time(),
                             "wallet_ws_mode": "STANDARD",
+                            "wallet_ws_last_success_at": time.time(),
+                            "wallet_ws_consecutive_failures": 0,
                             "wallet_ws_state_changed_at": time.time(),
                         },
                     )
@@ -1800,6 +1912,15 @@ async def monitor_once(settings: MonitorSettings, wallets: tuple[str, ...]) -> N
         open_timeout=20,
         max_queue=512,
     ) as socket:
+        connected_at = time.time()
+        await asyncio.to_thread(
+            state_store.set_global_metrics,
+            {
+                "wallet_ws_connected_at": connected_at,
+                "wallet_ws_endpoint_kind": "HELIUS_WSS",
+                "wallet_ws_subscription_method": "transactionSubscribe",
+            },
+        )
         for request_id, (name, program) in enumerate(DEX_PROGRAMS.items(), start=1):
             await socket.send(json.dumps(subscription_request(request_id, wallets, program)))
 
@@ -1811,7 +1932,9 @@ async def monitor_once(settings: MonitorSettings, wallets: tuple[str, ...]) -> N
                     if "error" in message:
                         if "not available on the free plan" in str(message["error"]):
                             raise EnhancedSubscriptionUnavailable
-                        raise RuntimeError(f"subscription rejected: {message['error']}")
+                        raise WebSocketSubscriptionRejected(
+                            websocket_subscription_failure_reason(message["error"])
+                        )
                     request_id = int(message["id"])
                     subscription_to_dex[int(message["result"])] = request_to_dex[request_id]
                     if len(subscription_to_dex) == len(DEX_PROGRAMS):
@@ -1821,6 +1944,8 @@ async def monitor_once(settings: MonitorSettings, wallets: tuple[str, ...]) -> N
                                 "wallet_ws_state": "SUBSCRIBED",
                                 "wallet_ws_subscribed_at": time.time(),
                                 "wallet_ws_mode": "ENHANCED",
+                                "wallet_ws_last_success_at": time.time(),
+                                "wallet_ws_consecutive_failures": 0,
                                 "wallet_ws_state_changed_at": time.time(),
                             },
                         )
@@ -1903,21 +2028,32 @@ async def run_forever(settings: MonitorSettings) -> None:
                 "enhanced transactionSubscribe unavailable; switching to wallet-filtered logsSubscribe"
             )
             use_standard_fallback = True
+            await asyncio.to_thread(
+                state_store.set_global_metrics,
+                {
+                    "wallet_ws_enhanced_fallback_reason": (
+                        "WS_ENHANCED_NOT_AVAILABLE"
+                    ),
+                    "wallet_ws_enhanced_fallback_at": time.time(),
+                },
+            )
             delay = 3
             continue
         except asyncio.CancelledError:
             raise
-        except Exception:
+        except Exception as exc:
+            category = canonical_websocket_failure_reason(exc)
             await asyncio.to_thread(
-                state_store.set_global_metrics,
-                {
-                    "wallet_ws_state": "RECONNECTING",
-                    "wallet_ws_state_changed_at": time.time(),
-                },
+                record_wallet_ws_failure,
+                category,
             )
             if time.monotonic() - connected_at >= 60:
                 delay = 3
-            logger.exception("connection lost; reconnecting in %s seconds", delay)
+            logger.exception(
+                "connection lost; reconnecting in %s seconds category=%s",
+                delay,
+                category,
+            )
             await asyncio.sleep(delay)
             delay = min(delay * 2, 300)
 
