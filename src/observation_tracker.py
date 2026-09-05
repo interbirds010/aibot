@@ -1170,11 +1170,10 @@ async def observation_loop(interval_seconds: float = 15.0) -> None:
         backfill_research_archive,
     )
 
-    shadow_document = await asyncio.to_thread(ensure_shadow_trades_migrated)
+    await asyncio.to_thread(ensure_shadow_trades_migrated)
     archive_backfill = await asyncio.to_thread(
         backfill_research_archive,
         observation_document.get("observations", []),
-        shadow_rows=shadow_document.get("trades", []),
         archive_path=OBSERVATION_PATH.parent / "research_archive",
         metrics_path=OBSERVATION_PATH.parent / "research_archive_metrics.json",
     )

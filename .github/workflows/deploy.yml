@@ -290,6 +290,7 @@ jobs:
             ./venv/bin/python -m compileall -q src
             ./venv/bin/python -c \
               "import fcntl; from src.state_store import exclusive_file_lock; print('fcntl/state_store: OK')"
+            ./venv/bin/python -m src.research_archive
 
             export PM2_HOME=/home/deploy/.pm2
             pm2 startOrReload ecosystem.config.js --update-env

@@ -356,7 +356,7 @@ def archive_integrity_metrics(
     rows, stats = load_research_archive(
         archive_path=archive_path,
         tracking_profile=DEFAULT_COHORT,
-        maximum_rows=10_000,
+        maximum_rows=1,
     )
     del rows
     metric_file = metrics_path or RESEARCH_ARCHIVE_METRICS_PATH
