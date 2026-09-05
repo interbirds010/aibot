@@ -17,8 +17,10 @@ from typing import Any
 
 import aiohttp
 from dotenv import load_dotenv
-from src.logging_utils import configure_safe_logging, redact_sensitive_text
 from solders.pubkey import Pubkey
+
+from src.helius_rpc import helius_rpc_call
+from src.logging_utils import configure_safe_logging, redact_sensitive_text
 from src.wallet_performance import (
     capped_return_percent,
     ensure_performance_migrated,
@@ -124,7 +126,6 @@ class RpcClient:
         self.limit = asyncio.Semaphore(settings.http_concurrency)
         self.rate_lock = asyncio.Lock()
         self.last_request_at = 0.0
-        self.request_id = 0
 
     async def throttle(self) -> None:
         async with self.rate_lock:
@@ -133,27 +134,14 @@ class RpcClient:
             self.last_request_at = time.monotonic()
 
     async def call(self, method: str, params: list[Any]) -> Any:
-        self.request_id += 1
-        request = {"jsonrpc": "2.0", "id": self.request_id, "method": method, "params": params}
-        delay = 1
-        for attempt in range(5):
-            await self.throttle()
-            async with self.limit:
-                async with self.session.post(self.settings.rpc_url, json=request) as response:
-                    if response.status == 429 or response.status >= 500:
-                        retry_after = response.headers.get("Retry-After")
-                        wait = float(retry_after) if retry_after else delay
-                    else:
-                        response.raise_for_status()
-                        payload = await response.json()
-                        if payload.get("error"):
-                            raise RuntimeError(f"{method}: {payload['error']}")
-                        return payload.get("result")
-            if attempt == 4:
-                break
-            await asyncio.sleep(wait)
-            delay = min(delay * 2, 30)
-        raise RuntimeError(f"RPC retries exhausted: {method}")
+        await self.throttle()
+        async with self.limit:
+            return await helius_rpc_call(
+                self.session,
+                self.settings.rpc_url,
+                method,
+                params,
+            )
 
 
 def transaction_signers(result: Any) -> list[str]:

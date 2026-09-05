@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from src.helius_rpc import HELIUS_RATE_LIMIT_FAILURE_REASONS
 from src.state_store import read_json, update_json
 
 
@@ -92,6 +93,13 @@ def _missing_outcome_reason(
     row: dict[str, Any], sample: dict[str, Any] | None
 ) -> str:
     quote_status = str(row.get("quote_status") or "").strip().upper()
+    if quote_status == "PROCESSING_FAILED":
+        decision_reasons = row.get("decision_reasons")
+        if isinstance(decision_reasons, list):
+            for raw_reason in decision_reasons:
+                reason = str(raw_reason).strip().upper()
+                if reason in HELIUS_RATE_LIMIT_FAILURE_REASONS:
+                    return reason
     entry_reason = UNTRACKABLE_QUOTE_STATUS_REASONS.get(quote_status)
     if entry_reason is not None:
         return entry_reason

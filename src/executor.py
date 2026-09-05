@@ -27,6 +27,7 @@ from solders.pubkey import Pubkey
 from solders.transaction import VersionedTransaction
 
 from src.analyzer import analyze_token
+from src.helius_rpc import helius_rpc_call
 from src.logging_utils import configure_safe_logging, redact_sensitive_text
 from src.state_store import (
     atomic_write_json,
@@ -232,7 +233,12 @@ async def json_rpc(
 
 
 async def sol_balance(session: aiohttp.ClientSession, rpc_url: str, owner: str) -> int:
-    result = await json_rpc(session, rpc_url, "getBalance", [owner, {"commitment": "confirmed"}])
+    result = await helius_rpc_call(
+        session,
+        rpc_url,
+        "getBalance",
+        [owner, {"commitment": "confirmed"}],
+    )
     return int((result or {}).get("value", 0))
 
 
@@ -741,7 +747,7 @@ async def execute_buy(mint: str, settings: ExecutionSettings | None = None) -> E
 async def token_balance(
     session: aiohttp.ClientSession, rpc_url: str, owner: str, mint: str
 ) -> int:
-    result = await json_rpc(
+    result = await helius_rpc_call(
         session,
         rpc_url,
         "getTokenAccountsByOwner",

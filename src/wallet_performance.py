@@ -15,6 +15,7 @@ import aiohttp
 from dotenv import load_dotenv
 
 from src import state_store
+from src.helius_rpc import helius_rpc_call
 from src.logging_utils import redact_sensitive_text
 from src.state_store import (
     atomic_write_json,
@@ -588,16 +589,13 @@ def skip_observation(
 async def legacy_probe_amount(
     session: aiohttp.ClientSession, rpc_url: str, mint: str
 ) -> int:
-    request = {
-        "jsonrpc": "2.0", "id": f"supply:{mint}", "method": "getTokenSupply",
-        "params": [mint, {"commitment": "confirmed"}],
-    }
-    async with session.post(rpc_url, json=request) as response:
-        response.raise_for_status()
-        payload = await response.json()
-    if payload.get("error"):
-        raise RuntimeError(f"getTokenSupply failed: {payload['error']}")
-    value = (payload.get("result") or {}).get("value") or {}
+    result = await helius_rpc_call(
+        session,
+        rpc_url,
+        "getTokenSupply",
+        [mint, {"commitment": "confirmed"}],
+    )
+    value = (result or {}).get("value") or {}
     decimals = max(0, int(value.get("decimals", 0) or 0))
     # A 1,000-token sell probe avoids invalid dust routes while remaining small
     # enough to approximate the wallet's observed lamports/raw entry price.

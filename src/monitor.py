@@ -23,6 +23,11 @@ from solders.pubkey import Pubkey
 from websockets.asyncio.client import ClientConnection, connect
 
 from src import state_store
+from src.helius_rpc import (
+    HeliusRpcRateLimitError,
+    canonical_rpc_failure_reason,
+    helius_rpc_call,
+)
 from src.logging_utils import configure_safe_logging, redact_sensitive_text
 
 logger = logging.getLogger("smart-money-monitor")
@@ -934,6 +939,7 @@ async def process_paper_signal(
             )
         except RuntimeError as exc:
             reason = redact_sensitive_text(exc)
+            canonical_failure = canonical_rpc_failure_reason(exc)
             if observation_enabled and observation_id:
                 try:
                     from src.observation_tracker import finalize_candidate_without_quote
@@ -942,7 +948,9 @@ async def process_paper_signal(
                         finalize_candidate_without_quote,
                         observation_id,
                         decision_status="UNAVAILABLE",
-                        decision_reasons=decision_reasons + [reason],
+                        decision_reasons=decision_reasons + [
+                            canonical_failure or reason
+                        ],
                         quote_status="PROCESSING_FAILED",
                         safety_metrics=safety_snapshot,
                         analysis_completed_at=analysis_completed_at,
@@ -952,7 +960,8 @@ async def process_paper_signal(
                         "candidate terminal status update failed: mint=%s", mint
                     )
             if (
-                "failed after 3 attempts" in reason
+                isinstance(exc, HeliusRpcRateLimitError)
+                or "failed after 3 attempts" in reason
                 or "getTokenSupply failed" in reason
                 or "could not find account" in reason
             ):
@@ -1328,13 +1337,7 @@ async def _solana_rpc(
     method: str,
     params: list[Any],
 ) -> Any:
-    request = {"jsonrpc": "2.0", "id": method, "method": method, "params": params}
-    async with session.post(http_url, json=request) as response:
-        response.raise_for_status()
-        payload = await response.json()
-    if payload.get("error"):
-        raise RuntimeError(f"{method} failed: {payload['error']}")
-    return payload.get("result")
+    return await helius_rpc_call(session, http_url, method, params)
 
 
 def unknown_whale_buy_from_transaction(
@@ -1699,17 +1702,22 @@ async def keepalive(socket: ClientConnection) -> None:
 async def fetch_transaction(
     session: aiohttp.ClientSession, http_url: str, signature: str
 ) -> dict[str, Any] | None:
-    request = {
-        "jsonrpc": "2.0", "id": signature, "method": "getTransaction",
-        "params": [signature, {"commitment": "confirmed", "encoding": "jsonParsed",
-                                "maxSupportedTransactionVersion": 0}],
-    }
     for _ in range(4):
-        async with session.post(http_url, json=request) as response:
-            response.raise_for_status()
-            payload = await response.json()
-        if payload.get("result"):
-            return payload["result"]
+        result = await helius_rpc_call(
+            session,
+            http_url,
+            "getTransaction",
+            [
+                signature,
+                {
+                    "commitment": "confirmed",
+                    "encoding": "jsonParsed",
+                    "maxSupportedTransactionVersion": 0,
+                },
+            ],
+        )
+        if isinstance(result, dict):
+            return result
         await asyncio.sleep(0.4)
     return None
 

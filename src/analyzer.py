@@ -7,18 +7,22 @@ import asyncio
 import json
 import logging
 import os
-from dataclasses import asdict, dataclass, field
+import time
+from dataclasses import asdict, dataclass, field, replace
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
 import aiohttp
 from dotenv import load_dotenv
 from solders.pubkey import Pubkey
+from src.helius_rpc import HELIUS_MAX_ATTEMPTS, helius_rpc_call
 from src.logging_utils import configure_safe_logging, redact_sensitive_text
 
 RUGCHECK_BASE = "https://api.rugcheck.xyz/v1/tokens"
 ROUTE_B_MINIMUM_LIQUIDITY_USD = Decimal("10000")
-RPC_MAX_ATTEMPTS = 3
+RPC_MAX_ATTEMPTS = HELIUS_MAX_ATTEMPTS
+ANALYZER_CACHE_TTL_SECONDS = 5.0
+ANALYZER_CACHE_MAX_ENTRIES = 128
 logger = logging.getLogger("analyzer")
 
 
@@ -62,34 +66,13 @@ class SafetyReport:
 async def rpc_call(
     session: aiohttp.ClientSession, url: str, method: str, params: list[Any]
 ) -> Any:
-    request = {"jsonrpc": "2.0", "id": method, "method": method, "params": params}
-    last_error: Exception | None = None
-    for attempt_index in range(RPC_MAX_ATTEMPTS):
-        try:
-            async with session.post(url, json=request) as response:
-                response.raise_for_status()
-                payload = await response.json()
-            if payload.get("error"):
-                raise RuntimeError(f"{method} failed: {payload['error']}")
-            return payload.get("result")
-        except (aiohttp.ClientError, asyncio.TimeoutError, RuntimeError) as exc:
-            last_error = exc
-            if attempt_index + 1 >= RPC_MAX_ATTEMPTS:
-                break
-            delay = float(2**attempt_index)
-            logger.warning(
-                "Solana RPC retry: method=%s attempt=%d/%d delay=%.1fs error=%s",
-                method,
-                attempt_index + 1,
-                RPC_MAX_ATTEMPTS,
-                delay,
-                redact_sensitive_text(exc)[:300],
-            )
-            await asyncio.sleep(delay)
-    raise RuntimeError(
-        f"{method} failed after {RPC_MAX_ATTEMPTS} attempts: "
-        f"{redact_sensitive_text(last_error)}"
-    ) from last_error
+    return await helius_rpc_call(
+        session,
+        url,
+        method,
+        params,
+        max_attempts=RPC_MAX_ATTEMPTS,
+    )
 
 
 async def rugcheck_get(
@@ -252,7 +235,7 @@ def select_route_type(
     return None
 
 
-async def analyze_token(
+async def _analyze_token_uncached(
     mint: str, settings: AnalyzerSettings | None = None
 ) -> SafetyReport:
     """Return a detailed, fail-closed safety report for a detected mint."""
@@ -328,6 +311,91 @@ async def analyze_token(
     )
     result.should_enter = result.route_type is not None
     return result
+
+
+_analysis_cache: dict[
+    tuple[str, AnalyzerSettings], tuple[float, SafetyReport]
+] = {}
+_analysis_flights: dict[
+    tuple[str, AnalyzerSettings], asyncio.Task[SafetyReport]
+] = {}
+_analysis_cache_lock = asyncio.Lock()
+
+
+def _copy_safety_report(report: SafetyReport) -> SafetyReport:
+    return replace(
+        report,
+        reasons=list(report.reasons),
+        sources=list(report.sources),
+    )
+
+
+def _consume_flight_exception(task: asyncio.Task[SafetyReport]) -> None:
+    """모든 대기자가 취소돼도 shared task 예외 경고를 남기지 않는다."""
+    if not task.cancelled():
+        task.exception()
+
+
+async def _run_analysis_flight(
+    key: tuple[str, AnalyzerSettings],
+    mint: str,
+    settings: AnalyzerSettings,
+) -> SafetyReport:
+    try:
+        report = await _analyze_token_uncached(mint, settings)
+        async with _analysis_cache_lock:
+            now = time.monotonic()
+            expired = [
+                cache_key
+                for cache_key, (expires_at, _) in _analysis_cache.items()
+                if expires_at <= now
+            ]
+            for cache_key in expired:
+                _analysis_cache.pop(cache_key, None)
+            if len(_analysis_cache) >= ANALYZER_CACHE_MAX_ENTRIES:
+                oldest = min(
+                    _analysis_cache,
+                    key=lambda cache_key: _analysis_cache[cache_key][0],
+                )
+                _analysis_cache.pop(oldest, None)
+            _analysis_cache[key] = (
+                now + ANALYZER_CACHE_TTL_SECONDS,
+                _copy_safety_report(report),
+            )
+        return report
+    finally:
+        async with _analysis_cache_lock:
+            current = asyncio.current_task()
+            if _analysis_flights.get(key) is current:
+                _analysis_flights.pop(key, None)
+
+
+async def analyze_token(
+    mint: str, settings: AnalyzerSettings | None = None
+) -> SafetyReport:
+    """동일 mint의 동시 분석은 합치고 성공 결과만 5초 동안 재사용한다."""
+    resolved_settings = settings or AnalyzerSettings.from_env()
+    try:
+        Pubkey.from_string(mint)
+    except ValueError as exc:
+        raise ValueError(f"invalid mint address: {mint}") from exc
+    key = (mint, resolved_settings)
+    async with _analysis_cache_lock:
+        now = time.monotonic()
+        cached = _analysis_cache.get(key)
+        if cached is not None:
+            expires_at, report = cached
+            if expires_at > now:
+                return _copy_safety_report(report)
+            _analysis_cache.pop(key, None)
+        task = _analysis_flights.get(key)
+        if task is None:
+            task = asyncio.create_task(
+                _run_analysis_flight(key, mint, resolved_settings)
+            )
+            task.add_done_callback(_consume_flight_exception)
+            _analysis_flights[key] = task
+    return _copy_safety_report(await asyncio.shield(task))
 
 
 async def should_enter_token(mint: str) -> bool:
