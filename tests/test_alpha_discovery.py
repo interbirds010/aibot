@@ -13,6 +13,7 @@ from src.research.alpha_discovery import (
     build_alpha_discovery,
     refresh_alpha_discovery,
 )
+from src import research_archive
 
 
 def alpha_event(
@@ -43,6 +44,7 @@ def alpha_event(
         "route_type": route,
         "started_at_epoch": float(index if timestamp is None else timestamp),
         "quote_status": quote_status,
+        "tracking_profile": "research_v1_60m",
         "discovery_metadata": {
             "whale_paid_lamports": whale_paid_sol * 1_000_000_000,
         },
@@ -114,6 +116,20 @@ class BucketAssignmentTests(unittest.TestCase):
 
 
 class AlphaDiscoveryTests(unittest.TestCase):
+    def test_legacy_and_research_v1_cohorts_are_isolated(self) -> None:
+        research = alpha_event(2, mint="SAME", return_60m=20.0)
+        legacy = alpha_event(1, mint="SAME", return_60m=-90.0)
+        legacy["tracking_profile"] = "legacy_15m"
+        report = build_alpha_discovery([legacy, research])
+        summary = report["families"]["SMART_MONEY"]["summary"]
+        self.assertEqual(summary["event_signal_count"], 1)
+        self.assertEqual(summary["unique_mint_count"], 1)
+        self.assertEqual(
+            summary["unique_mint_primary_outcome"]["mean_return_percent"],
+            20.0,
+        )
+        self.assertEqual(report["input_summary"]["excluded"]["outside_cohort"], 1)
+
     def test_event_and_first_signal_per_mint_views_are_distinct(self) -> None:
         first = alpha_event(1, mint="SAME", whale_paid_sol=1.2)
         later = alpha_event(2, mint="SAME", whale_paid_sol=3.5)
@@ -156,6 +172,7 @@ class AlphaDiscoveryTests(unittest.TestCase):
         self.assertEqual(bucket["split"]["holdout_signal_count"], 2)
         self.assertEqual(primary["train"]["expectancy_percent"], -10.0)
         self.assertEqual(primary["holdout"]["expectancy_percent"], 20.0)
+        self.assertEqual(bucket["split"]["cross_split_mint_count"], 0)
 
     def test_same_timestamp_uses_stable_identity_tie_break(self) -> None:
         rows = [
@@ -280,6 +297,26 @@ class AlphaDiscoveryTests(unittest.TestCase):
         self.assertIn(
             "TRACKABLE_COVERAGE_BELOW_MINIMUM", bucket["status_reasons"]
         )
+
+    def test_missing_outcomes_remain_in_coverage_with_canonical_reasons(self) -> None:
+        missed = alpha_event(1, return_60m=None)
+        missed["samples"].append({
+            "interval": "60m", "return_percent": None,
+            "error": "HORIZON_MISSED raw detail",
+        })
+        no_route = alpha_event(
+            2, return_60m=None, quote_status="NO_ROUTE",
+        )
+        metrics = build_alpha_discovery([missed, no_route])["families"][
+            "SMART_MONEY"
+        ]["summary"]["event_primary_outcome"]
+        self.assertEqual(metrics["signal_count"], 2)
+        self.assertEqual(metrics["sampled_count"], 0)
+        self.assertEqual(metrics["missing_count"], 2)
+        self.assertEqual(metrics["missing_reasons"], {
+            "ENTRY_NO_ROUTE": 1,
+            "HORIZON_MISSED": 1,
+        })
 
     def test_positive_holdout_collapse_is_unstable(self) -> None:
         rows = [
@@ -421,6 +458,37 @@ class AlphaDiscoveryTests(unittest.TestCase):
             self.assertEqual(saved["input_summary"]["source_schema_version"], 4)
             self.assertEqual(saved["input_summary"]["source_version"], 7)
             self.assertEqual(saved["version"], 1)
+
+    def test_refresh_reads_archive_without_operational_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            archive = root / "research_archive"
+            output = root / "alpha_discovery.json"
+            research_archive.archive_observation(
+                {**alpha_event(1), "status": "COMPLETE"},
+                archive_path=archive,
+                metrics_path=root / "research_archive_metrics.json",
+            )
+            saved = refresh_alpha_discovery(
+                observation_path=archive, output_path=output,
+            )
+            summary = saved["input_summary"]
+            self.assertEqual(summary["source_type"], "research_archive")
+            self.assertEqual(summary["source_row_count"], 1)
+            self.assertEqual(summary["cohort"], "research_v1_60m")
+            self.assertEqual(summary["cohort_row_count"], 1)
+
+    def test_empty_archive_does_not_silently_fallback_to_legacy(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            archive = root / "research_archive"
+            output = root / "alpha_discovery.json"
+            saved = refresh_alpha_discovery(
+                observation_path=archive, output_path=output,
+            )
+            self.assertEqual(saved["input_summary"]["source_type"], "research_archive")
+            self.assertEqual(saved["input_summary"]["source_row_count"], 0)
+            self.assertEqual(saved["input_summary"]["analyzed_row_count"], 0)
 
     def test_refresh_rejects_output_path_equal_to_observation_path(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

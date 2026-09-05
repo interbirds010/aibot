@@ -11,15 +11,25 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from src.observation_analysis import performance_metrics
+from src.observation_analysis import (
+    canonical_missing_outcome_reason,
+    performance_metrics,
+)
+from src.research_archive import (
+    ARCHIVE_SCHEMA_VERSION,
+    DEFAULT_COHORT,
+    RESEARCH_ARCHIVE_PATH,
+    load_research_archive,
+)
 from src.state_store import read_json, update_json
 
 
 ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_OBSERVATION_PATH = ROOT / "data" / "signal_observations.json"
+DEFAULT_ARCHIVE_PATH = RESEARCH_ARCHIVE_PATH
 DEFAULT_OUTPUT_PATH = ROOT / "data" / "alpha_discovery.json"
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 MIN_SUPPORTED_OBSERVATION_SCHEMA_VERSION = 1
 MAX_SUPPORTED_OBSERVATION_SCHEMA_VERSION = 5
 BUCKET_VERSION = "alpha_v2_fixed_1"
@@ -304,7 +314,7 @@ def _signal_identity_digest(row: dict[str, Any]) -> str:
 
 
 def _prepare_rows(
-    rows: list[Any], *, maximum_rows: int,
+    rows: list[Any], *, maximum_rows: int, cohort: str,
 ) -> tuple[list[PreparedRow], dict[str, int]]:
     prepared: list[PreparedRow] = []
     excluded = {
@@ -313,6 +323,7 @@ def _prepare_rows(
         "missing_or_invalid_timestamp": 0,
         "missing_mint": 0,
         "outside_latest_window": 0,
+        "outside_cohort": 0,
     }
     for item in rows:
         if not isinstance(item, dict):
@@ -329,6 +340,9 @@ def _prepare_rows(
         mint = str(item.get("mint") or "").strip()
         if not mint:
             excluded["missing_mint"] += 1
+            continue
+        if item.get("tracking_profile") != cohort:
+            excluded["outside_cohort"] += 1
             continue
         digest = _signal_identity_digest(item)
         stable_id = str(item.get("observation_id") or "").strip() or digest
@@ -454,6 +468,17 @@ def _metrics(rows: list[PreparedRow], horizon: str) -> dict[str, Any]:
         outcome is not None and not trackable
         for outcome, trackable in zip(raw_returns, trackable_flags)
     )
+    missing_reasons: dict[str, int] = {}
+    for row, outcome in zip(rows, returns):
+        if outcome is not None:
+            continue
+        samples = row.raw.get("samples")
+        sample = next((
+            item for item in samples
+            if isinstance(item, dict) and str(item.get("interval")) == horizon
+        ), None) if isinstance(samples, list) else None
+        reason = canonical_missing_outcome_reason(row.raw, sample)
+        missing_reasons[reason] = missing_reasons.get(reason, 0) + 1
     excursions = [
         _sampled_excursion(row, horizon)
         for row, trackable in zip(rows, trackable_flags)
@@ -467,6 +492,7 @@ def _metrics(rows: list[PreparedRow], horizon: str) -> dict[str, Any]:
         "sampled_count": sampled_count,
         "inconsistent_untrackable_sample_count": inconsistent_sample_count,
         "missing_count": signal_count - sampled_count,
+        "missing_reasons": dict(sorted(missing_reasons.items())),
         "raw_coverage_rate_percent": (
             round(sampled_count / signal_count * 100, 4)
             if signal_count else None
@@ -897,6 +923,7 @@ def build_alpha_discovery(
     holdout_fraction: float = DEFAULT_HOLDOUT_FRACTION,
     maximum_rows: int = MAX_ANALYSIS_ROWS,
     generated_at: str | None = None,
+    cohort: str = DEFAULT_COHORT,
 ) -> dict[str, Any]:
     """외부 상태를 변경하지 않고 deterministic Alpha Discovery를 계산한다."""
     if not isinstance(rows, list):
@@ -913,7 +940,16 @@ def build_alpha_discovery(
     if limit < 1 or limit > MAX_ANALYSIS_ROWS:
         raise ValueError(f"maximum_rows must be between 1 and {MAX_ANALYSIS_ROWS}")
 
-    prepared, excluded = _prepare_rows(rows, maximum_rows=limit)
+    cohort_name = str(cohort).strip()
+    if not cohort_name:
+        raise ValueError("alpha discovery cohort must not be empty")
+    prepared, excluded = _prepare_rows(
+        rows, maximum_rows=limit, cohort=cohort_name,
+    )
+    cohort_row_count = sum(
+        isinstance(row, dict) and row.get("tracking_profile") == cohort_name
+        for row in rows
+    )
     families: dict[str, Any] = {}
     candidate_records: list[tuple[str, str, dict[str, Any]]] = []
     for family in ("SMART_MONEY", "MOMENTUM"):
@@ -975,6 +1011,8 @@ def build_alpha_discovery(
             "outcome_basis": "jupiter_executable_reverse_quote",
             "excursion_basis": "scheduled_horizon_samples_up_to_outcome",
             "unique_mint_rule": "first_signal_per_family_and_mint",
+            "unique_mint_split_order": "first_signal_then_chronological_split",
+            "unique_mint_cross_split_leakage_allowed": False,
             "hypothesis_policy": "predefined_buckets_and_interactions_only",
             "ranking_priority": [
                 "positive_holdout_expectancy",
@@ -985,6 +1023,7 @@ def build_alpha_discovery(
             ],
             "multiple_testing_warning": True,
             "automatic_trading_changes": False,
+            "cohort": cohort_name,
             "bucket_definitions": _bucket_configuration(),
             "interactions": {
                 family: [list(pair) for pair in pairs]
@@ -993,6 +1032,8 @@ def build_alpha_discovery(
         },
         "input_summary": {
             "input_row_count": len(rows),
+            "cohort": cohort_name,
+            "cohort_row_count": cohort_row_count,
             "analyzed_row_count": len(prepared),
             "maximum_rows": limit,
             "excluded": excluded,
@@ -1014,15 +1055,34 @@ def refresh_alpha_discovery(
     output_path: Path | None = None,
 ) -> dict[str, Any]:
     """관찰 원장은 읽기만 하고 Alpha Discovery 결과만 원자 저장한다."""
-    source = observation_path or DEFAULT_OBSERVATION_PATH
+    source = observation_path or DEFAULT_ARCHIVE_PATH
     target = output_path or DEFAULT_OUTPUT_PATH
     if source.resolve() == target.resolve():
         raise ValueError("alpha discovery output must differ from observation input")
     if source.exists() and target.exists() and source.samefile(target):
         raise ValueError("alpha discovery output must differ from observation input")
-    document = read_json(source, {"schema_version": 0, "version": 0,
-                                  "observations": []})
-    if source.exists():
+    archive_metadata: dict[str, Any] | None = None
+    if (
+        source.is_dir()
+        or source.suffix.lower() != ".json"
+        or source.resolve() == DEFAULT_ARCHIVE_PATH.resolve()
+    ):
+        rows, archive_metadata = load_research_archive(
+            archive_path=source,
+            tracking_profile=DEFAULT_COHORT,
+            maximum_rows=MAX_ANALYSIS_ROWS,
+        )
+        document = {
+            "schema_version": ARCHIVE_SCHEMA_VERSION,
+            "version": None,
+            "observations": rows,
+        }
+        source_type = "research_archive"
+    else:
+        document = read_json(source, {"schema_version": 0, "version": 0,
+                                      "observations": []})
+        source_type = "explicit_observation_ledger"
+    if source.exists() and source_type == "explicit_observation_ledger":
         schema_version = document.get("schema_version")
         version = document.get("version")
         if isinstance(schema_version, bool) or not isinstance(schema_version, int):
@@ -1045,6 +1105,25 @@ def refresh_alpha_discovery(
         "schema_version"
     )
     report["input_summary"]["source_version"] = document.get("version")
+    try:
+        source_path = str(source.resolve().relative_to(ROOT.resolve())).replace("\\", "/")
+    except ValueError:
+        source_path = source.name
+    report["input_summary"].update({
+        "source_type": source_type,
+        "source_path": source_path,
+        "source_row_count": (
+            archive_metadata["archive_total_rows"]
+            if archive_metadata is not None else len(rows)
+        ),
+    })
+    if archive_metadata is not None:
+        report["input_summary"].update(archive_metadata)
+        report["input_summary"]["excluded"]["outside_latest_window"] = max(
+            0,
+            int(archive_metadata["cohort_row_count"])
+            - int(archive_metadata["loaded_cohort_row_count"]),
+        )
 
     def mutate(current: dict[str, Any]) -> None:
         current.clear()
@@ -1058,7 +1137,7 @@ def refresh_alpha_discovery(
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Run Alpha Discovery V2")
-    parser.add_argument("--input", type=Path, default=DEFAULT_OBSERVATION_PATH)
+    parser.add_argument("--input", type=Path, default=DEFAULT_ARCHIVE_PATH)
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT_PATH)
     args = parser.parse_args(argv)
     report = refresh_alpha_discovery(

@@ -396,6 +396,44 @@ def retained_observations(rows: list[Any]) -> list[Any]:
     return [row for row in rows if id(row) in kept_ids]
 
 
+def archive_and_retain_observations(rows: list[Any]) -> list[Any]:
+    """terminal row를 먼저 보존하고 operational ledger를 제한한다."""
+    from src.research_archive import archive_terminal_rows
+
+    archive_path = OBSERVATION_PATH.parent / "research_archive"
+    metrics_path = OBSERVATION_PATH.parent / "research_archive_metrics.json"
+    archive_terminal_rows(
+        (
+            row for row in rows
+            if isinstance(row, dict)
+            and not (
+                row.get("archive_schema_version") == 1
+                and row.get("archived_at")
+            )
+        ),
+        archive_path=archive_path,
+        metrics_path=metrics_path,
+    )
+    unarchived_ids = {
+        id(row) for row in rows
+        if isinstance(row, dict)
+        and str(row.get("status") or "").upper() in TERMINAL_OBSERVATION_STATUSES
+        and not (
+            row.get("archive_schema_version") == 1
+            and row.get("archived_at")
+        )
+    }
+    retained = retained_observations(rows)
+    kept_ids = {id(row) for row in retained}
+    if unarchived_ids <= kept_ids:
+        return retained
+    # Archive 장애 중에는 손실보다 일시적인 operational cap 초과를 택한다.
+    return [
+        row for row in rows
+        if id(row) in kept_ids or id(row) in unarchived_ids
+    ]
+
+
 def expire_observation_backlog(rows: list[Any]) -> None:
     """장애 중 쌓인 미실행 표본을 명시적으로 만료해 원장을 제한한다."""
     expirable = [
@@ -555,7 +593,7 @@ async def record_candidate_discovery(
             "status": "DISCOVERED",
         })
         expire_observation_backlog(rows)
-        document["observations"] = retained_observations(rows)
+        document["observations"] = archive_and_retain_observations(rows)
         document["schema_version"] = OBSERVATION_SCHEMA_VERSION
         document["updated_at"] = datetime.now(timezone.utc).isoformat()
         return ObservationDecision(True, observation_id, False, variants)
@@ -639,7 +677,7 @@ def finalize_candidate_without_quote(
         target["analysis_completed_at"] = analysis_completed_at
         target["status"] = "COMPLETE"
         target["completed_at"] = datetime.now(timezone.utc).isoformat()
-        document["observations"] = retained_observations(
+        document["observations"] = archive_and_retain_observations(
             document.get("observations", [])
         )
         document["updated_at"] = datetime.now(timezone.utc).isoformat()
@@ -786,7 +824,7 @@ async def record_observation_decision(
         else:
             rows.append(payload)
         expire_observation_backlog(rows)
-        document["observations"] = retained_observations(rows)
+        document["observations"] = archive_and_retain_observations(rows)
         document["schema_version"] = OBSERVATION_SCHEMA_VERSION
         document["updated_at"] = datetime.now(timezone.utc).isoformat()
         return ObservationDecision(True, observation_id, candidate_eligible, variants)
@@ -872,7 +910,7 @@ def mark_paper_experiment_status(
             "ENTERED" if normalized in {"OPENED", "CLOSED"}
             else canonical_research_decision(target)
         )
-        document["observations"] = retained_observations(
+        document["observations"] = archive_and_retain_observations(
             document.get("observations", [])
         )
         document["updated_at"] = datetime.now(timezone.utc).isoformat()
@@ -1084,7 +1122,7 @@ def record_sample(
             if not target.get("completed_at"):
                 target["completed_at"] = datetime.now(timezone.utc).isoformat()
         expire_observation_backlog(rows)
-        document["observations"] = retained_observations(rows)
+        document["observations"] = archive_and_retain_observations(rows)
         document["updated_at"] = datetime.now(timezone.utc).isoformat()
         return dict(target)
 
@@ -1123,6 +1161,37 @@ async def observation_loop(interval_seconds: float = 15.0) -> None:
         "discovery_reconciliation_last_at": time.time(),
         "discovery_reconciliation_reason": DISCOVERY_PROCESSING_INTERRUPTED,
     })
+    from src.shadow_trade_ledger import (
+        backfill_completed_shadow_trades,
+        ensure_shadow_trades_migrated,
+    )
+    from src.research_archive import (
+        archive_integrity_metrics,
+        backfill_research_archive,
+    )
+
+    shadow_document = await asyncio.to_thread(ensure_shadow_trades_migrated)
+    archive_backfill = await asyncio.to_thread(
+        backfill_research_archive,
+        observation_document.get("observations", []),
+        shadow_rows=shadow_document.get("trades", []),
+        archive_path=OBSERVATION_PATH.parent / "research_archive",
+        metrics_path=OBSERVATION_PATH.parent / "research_archive_metrics.json",
+    )
+    logger.info("research archive reconciliation: %s", archive_backfill)
+    archive_metrics = await asyncio.to_thread(
+        archive_integrity_metrics,
+        operational_rows=observation_document.get("observations", []),
+        archive_path=OBSERVATION_PATH.parent / "research_archive",
+        metrics_path=OBSERVATION_PATH.parent / "research_archive_metrics.json",
+    )
+    backfilled = await asyncio.to_thread(
+        backfill_completed_shadow_trades,
+        observation_document.get("observations", []),
+    )
+    if backfilled:
+        logger.info("completed shadow trades backfilled: count=%s", backfilled)
+
     load_dotenv()
     api_key = os.getenv("JUPITER_API_KEY", "").strip()
     if not api_key:
@@ -1131,28 +1200,18 @@ async def observation_loop(interval_seconds: float = 15.0) -> None:
             "observer_state": "DISABLED_MISSING_API_KEY",
             "observer_heartbeat_at": now,
             "observer_state_changed_at": now,
+            **{f"research_{key}": value for key, value in archive_metrics.items()},
         })
         logger.warning("signal observer disabled: JUPITER_API_KEY is missing")
         return
     from src.executor import JupiterNoRouteError, WSOL_MINT, jupiter_quote
-    from src.shadow_trade_ledger import (
-        backfill_completed_shadow_trades,
-        ensure_shadow_trades_migrated,
-    )
-
-    await asyncio.to_thread(ensure_shadow_trades_migrated)
-    backfilled = await asyncio.to_thread(
-        backfill_completed_shadow_trades,
-        observation_document.get("observations", []),
-    )
-    if backfilled:
-        logger.info("completed shadow trades backfilled: count=%s", backfilled)
 
     now = time.time()
     await _publish_observer_metrics({
         "observer_state": "RUNNING",
         "observer_heartbeat_at": now,
         "observer_state_changed_at": now,
+        **{f"research_{key}": value for key, value in archive_metrics.items()},
         **observation_runtime_metrics(observation_document),
     })
     last_health_refresh = time.monotonic()

@@ -76,6 +76,7 @@ jobs:
                 "paper_trades.json",
                 "wallet_performance.json",
                 "global_metrics.json",
+                "research_archive_metrics.json",
             )
 
             def sized(value):
@@ -120,6 +121,18 @@ jobs:
                             "pending_research_observations"
                         ),
                     }
+                if name == "research_archive_metrics.json":
+                    return {
+                        "duplicate_prevented_count": document.get(
+                            "duplicate_prevented_count"
+                        ),
+                        "archive_write_failure_count": document.get(
+                            "archive_write_failure_count"
+                        ),
+                        "last_archive_success": document.get(
+                            "last_archive_success"
+                        ),
+                    }
                 return {"wallet_count": sized(document.get("wallets"))}
 
             manifest = {
@@ -160,6 +173,35 @@ jobs:
                 print(
                     f"BACKUP_FILE name={name} exists=true summary={summary}"
                 )
+
+            archive_source = root / "research_archive" / "records"
+            archive_target = target / "research_archive" / "records"
+            archive_files = sorted(archive_source.glob("*/*.json"))
+            archive_digest = hashlib.sha256()
+            archive_bytes = 0
+            for source in archive_files:
+                relative = source.relative_to(archive_source)
+                payload = source.read_bytes()
+                destination = archive_target / relative
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                with destination.open("xb") as output:
+                    output.write(payload)
+                    output.flush()
+                    os.fsync(output.fileno())
+                digest = hashlib.sha256(payload).hexdigest()
+                archive_digest.update(str(relative).encode("utf-8"))
+                archive_digest.update(digest.encode("ascii"))
+                archive_bytes += len(payload)
+            manifest["research_archive"] = {
+                "record_count": len(archive_files),
+                "size_bytes": archive_bytes,
+                "tree_sha256": archive_digest.hexdigest(),
+            }
+            print(
+                "BACKUP_RESEARCH_ARCHIVE "
+                f"records={len(archive_files)} size_bytes={archive_bytes} "
+                f"tree_sha256={archive_digest.hexdigest()}"
+            )
 
             provider_state_root = root / "solana_rpc_providers"
             manifest["rpc_provider_states"] = {}
@@ -389,6 +431,26 @@ jobs:
                 payload = (backup_dir / name).read_bytes()
                 if hashlib.sha256(payload).hexdigest() != item["sha256"]:
                     raise SystemExit(f"backup checksum mismatch: {name}")
+            archive_digest = hashlib.sha256()
+            archive_files = sorted(
+                (backup_dir / "research_archive" / "records").glob("*/*.json")
+            )
+            archive_bytes = 0
+            for path in archive_files:
+                payload = path.read_bytes()
+                relative = path.relative_to(
+                    backup_dir / "research_archive" / "records"
+                )
+                archive_digest.update(str(relative).encode("utf-8"))
+                archive_digest.update(hashlib.sha256(payload).hexdigest().encode("ascii"))
+                archive_bytes += len(payload)
+            archive_manifest = manifest.get("research_archive", {})
+            if (
+                len(archive_files) != archive_manifest.get("record_count")
+                or archive_bytes != archive_manifest.get("size_bytes")
+                or archive_digest.hexdigest() != archive_manifest.get("tree_sha256")
+            ):
+                raise SystemExit("research archive backup checksum mismatch")
 
             data = Path("data")
             current = {}
@@ -571,6 +633,19 @@ jobs:
             )
             if report.get("automatic_trading_changes") is not False:
                 raise SystemExit("Alpha report trading-change guard failed")
+            source = report.get("input_summary", {})
+            if source.get("source_type") != "research_archive":
+                raise SystemExit("Alpha report is not using Research archive")
+            if source.get("cohort") != "research_v1_60m":
+                raise SystemExit("Alpha report cohort isolation failed")
+            print(
+                "ALPHA_SOURCE "
+                f"type={source.get('source_type')} "
+                f"path={source.get('source_path')} "
+                f"archive_rows={source.get('source_row_count')} "
+                f"cohort={source.get('cohort')} "
+                f"cohort_rows={source.get('cohort_row_count')}"
+            )
             for family in ("SMART_MONEY", "MOMENTUM"):
                 summary = report["families"][family]["summary"]
                 primary = summary["event_primary_outcome"]
@@ -600,6 +675,7 @@ jobs:
             from collections import Counter
             from pathlib import Path
 
+            from src.research_archive import archive_integrity_metrics
             from src.solana_rpc import provider_configs_from_env, provider_state
 
             deploy_sha = sys.argv[1]
@@ -616,6 +692,23 @@ jobs:
             rows = observations.get("observations")
             if not isinstance(rows, list):
                 raise SystemExit("signal observation rows are malformed")
+            archive = archive_integrity_metrics(operational_rows=rows)
+            print(
+                "RESEARCH_ARCHIVE "
+                f"total={archive['archive_total_rows']} "
+                f"research_v1={archive['cohort_row_count']} "
+                f"recent={archive['archived_recent_interval']} "
+                f"research_recent={archive['research_v1_signals_recent_interval']} "
+                f"duplicates={archive['duplicate_prevented_count']} "
+                f"write_failures={archive['archive_write_failure_count']} "
+                f"unarchived={archive['unarchived_completed_rows_count']} "
+                f"bytes={archive['archive_total_bytes']} "
+                f"average_row_bytes={archive['average_archive_row_bytes']} "
+                f"last_success={archive['last_archive_success']} "
+                f"last_failure={archive['last_archive_failure']}"
+            )
+            if archive["unarchived_completed_rows_count"]:
+                raise SystemExit("completed Research rows remain unarchived")
             new_rows = [
                 row for row in rows
                 if isinstance(row, dict)

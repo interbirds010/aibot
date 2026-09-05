@@ -120,7 +120,16 @@ python -m src.research.collection_stability
 
 장시간 관찰 전에는 `--write-baseline <PATH>`로 provider 누적값을 저장하고, 관찰 후 `--baseline <PATH>`를 전달하면 해당 구간 delta를 계산합니다. GitHub의 `Research collection observation` workflow도 같은 진단을 수동으로 실행하며 일반 배포를 기다리게 하지 않습니다.
 
-Observer는 15초 cadence와 최대 20개 batch를 유지하되 모든 due horizon을 scheduled `target_at_epoch` 오름차순으로 처리합니다. 한 batch 안에서는 최대 4개 작업만 병행하고 Jupiter의 기존 프로세스 공용 1.25초 request slot을 그대로 준수합니다. target 이후 60초를 넘긴 quote는 과거 horizon 값으로 저장하지 않고 `HORIZON_MISSED`로 마감합니다. 1,000-row 제한은 active observation을 우선 보존하고 terminal history만 제거하지만, active backlog가 200개를 넘으면 가장 오래된 미완료 row를 명시적으로 만료합니다. 따라서 장기 Research 전체 이력은 향후 별도 archive로 분리해야 합니다.
+Observer는 15초 cadence와 최대 20개 batch를 유지하되 모든 due horizon을 scheduled `target_at_epoch` 오름차순으로 처리합니다. 한 batch 안에서는 최대 4개 작업만 병행하고 Jupiter의 기존 프로세스 공용 1.25초 request slot을 그대로 준수합니다. target 이후 60초를 넘긴 quote는 과거 horizon 값으로 저장하지 않고 `HORIZON_MISSED`로 마감합니다. 1,000-row 제한은 active observation을 우선 보존하고 terminal history만 제거하며, active backlog가 200개를 넘으면 가장 오래된 미완료 row를 명시적으로 만료합니다.
+
+완료·만료된 row는 operational trim 전에 `data/research_archive/records/`의 observation-id hash 경로에 immutable JSON으로 먼저 보존됩니다. 동일 observation은 같은 파일을 사용하므로 restart와 backfill에도 중복되지 않으며, archive 실패 row는 손실을 막기 위해 일시적으로 1,000-row 제한 밖에서도 유지됩니다. `signal_observations.json → schema migration → terminal completion → Research archive → operational retention`이 canonical 수집 흐름입니다. `shadow_trades.json`은 실행 가능 신호의 전략 비교용 최대 10,000건 원장으로 남고 전체 Research archive를 대신하지 않습니다. 기존 원장과 Research V1 shadow snapshot의 멱등 backfill은 다음 명령으로 확인하거나 실행합니다.
+
+```powershell
+python -m src.research_archive --dry-run
+python -m src.research_archive
+```
+
+Alpha Discovery는 기본적으로 operational 1,000-row 파일이 아니라 Research archive를 읽고 `tracking_profile=research_v1_60m`만 분석합니다. legacy row는 같은 first-signal-per-mint pool에 들어가지 않습니다. cohort 내부에서 신호 시각으로 정렬한 뒤 family·mint별 최초 신호를 선택하고 80/20 시간순 split하므로 candidate 판정용 unique-mint view에는 train/holdout mint leakage가 없습니다. event-level view는 반복 신호 진단용이며 candidate 판정 기준이 아닙니다. Archive가 없거나 비어 있어도 legacy operational 원장으로 조용히 fallback하지 않고 빈 Research V1 결과와 source metadata를 출력합니다.
 
 Alchemy Free 추가는 자동화하지 않습니다. 동일 관찰 구간에 Research signal 50건 이상과 Solana Public 요청 100건 이상이 모두 쌓였을 때만 판단하며, `RPC_ALL_PROVIDERS_EXHAUSTED`가 5건 이상이면서 signal의 25% 이상이고 Public 성공률도 90% 미만인 세 조건이 동시에 지속될 때 추가를 권고합니다. 이 기준은 수집 인프라 운영 기준이며 거래·전략 threshold가 아닙니다. 표본이 그보다 작거나 조건 중 하나라도 충족하지 않으면 Public RPC 관찰을 유지합니다.
 
