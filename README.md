@@ -57,7 +57,7 @@ python -m src.main
 python -m src.monitor
 ```
 
-모니터는 `data/wallets.json`을 읽으며 `.env`에서 지갑 주소를 받지 않습니다. 파일 변경 여부를 기본 5초마다 확인하고 새 목록이 원자적으로 저장되면 파일을 다시 읽어 WebSocket 구독을 자동으로 구성합니다. 따라서 프로세스를 재시작하지 않아도 감시 대상 최대 20개가 동적으로 교체됩니다. Helius의 확장 `transactionSubscribe`를 사용해 감시 지갑 중 하나와 Pump.fun/PumpSwap/Raydium 프로그램 하나가 동시에 포함된 성공 트랜잭션만 RPC 단계에서 받습니다. 출력 금액은 지갑의 확정된 pre/post 잔액 기준 순변화입니다. `SOL net outflow`는 네트워크 수수료를 제외하지만, 새 토큰 계정 생성이 동반된 거래라면 계정 rent가 포함될 수 있습니다.
+모니터는 `data/wallets.json`을 읽으며 `.env`에서 지갑 주소를 받지 않습니다. 파일 변경 여부를 기본 5초마다 확인하고 새 목록이 원자적으로 저장되면 파일을 다시 읽어 WebSocket 구독을 자동으로 구성합니다. 따라서 프로세스를 재시작하지 않아도 감시 대상 최대 20개가 동적으로 교체됩니다. 우선 Helius 확장 `transactionSubscribe`로 감시 지갑 중 하나와 Pump.fun/PumpSwap/Raydium 프로그램 하나가 동시에 포함된 성공 트랜잭션을 받습니다. Helius 연결 또는 구독이 실패하면 API key가 필요 없는 Solana public WSS의 표준 `logsSubscribe`로 감시 지갑별 로그를 구독하고, DEX 프로그램 로그가 확인된 signature만 기존 bounded HTTP router의 `getTransaction`으로 복원합니다. 동일 signature는 연결별 최대 10,000건 FIFO에서 중복 억제하며 30분마다 Helius 복구를 재확인합니다. 두 경로 모두 같은 거래 parser와 Smart Money 조건을 사용하고 observation에는 `helius_transaction_subscribe` 또는 `solana_logs_subscribe` source를 남깁니다. 출력 금액은 지갑의 확정된 pre/post 잔액 기준 순변화입니다. `SOL net outflow`는 네트워크 수수료를 제외하지만, 새 토큰 계정 생성이 동반된 거래라면 계정 rent가 포함될 수 있습니다.
 
 스마트 머니 지갑 자동 갱신은 유료 데이터 API나 수동 파일 없이 표준 Solana JSON-RPC만 사용합니다. 활성화된 무료 provider를 method-aware 순서로 사용하며 transaction/signature 이력은 Ankr, Chainstack, Alchemy, optional Helius, public 순으로 failover합니다. 주요 DEX 5개의 최근 서명을 프로그램당 50건씩 조회해 최대 250개 서명자 후보를 만들며, 동시 RPC 요청은 3개·요청 시작 간격은 최소 0.3초로 제한합니다. 이후 0.1 SOL 미만 또는 최근 24시간 거래가 300건을 초과한 지갑을 제외합니다. 감시 중 관찰된 실제 스왑 가격은 `data/wallet_performance.json`에 저장되며, 1시간 뒤 새 온체인 가격 표본과 비교해 반복적으로 부진하거나 위험 토큰을 매수하는 지갑은 후보 풀에서 즉시 교체됩니다.
 

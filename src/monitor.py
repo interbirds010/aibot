@@ -88,6 +88,23 @@ WALLET_WS_FAILURE_REASONS = frozenset({
     "WS_TRANSPORT_ERROR",
     "WS_MALFORMED_RESPONSE",
 })
+SOLANA_PUBLIC_WS_URL = "wss://api.mainnet.solana.com"
+HELIUS_RECOVERY_PROBE_SECONDS = 1_800.0
+MAX_SEEN_WALLET_SIGNATURES = 10_000
+DISCOVERY_SOURCE_HELIUS = "helius_transaction_subscribe"
+DISCOVERY_SOURCE_SOLANA = "solana_logs_subscribe"
+WALLET_WS_ACTIVITY_KEYS = frozenset({
+    "connection_success",
+    "subscription_success",
+    "subscription_failure",
+    "notification",
+    "dex_log_match",
+    "transaction_fetch",
+    "transaction_parsed",
+    "smart_money_candidate",
+    "research_discovered",
+    "analyzer_reached",
+})
 
 # On-chain feeder output is verified; fail closed if an old unverified row remains.
 TEST_ALLOW_UNVERIFIED_WALLETS = False
@@ -101,6 +118,13 @@ _market_shadow_cooldowns: dict[str, float] = {}
 _last_route_b_health_write_at = 0.0
 _route_b_consecutive_failures = 0
 _last_market_shadow_capture_at = 0.0
+_wallet_ws_activity_started_at = time.time()
+_wallet_ws_activity: dict[str, int] = {
+    key: 0 for key in WALLET_WS_ACTIVITY_KEYS
+}
+_wallet_ws_activity_by_source: dict[str, dict[str, int]] = {
+    key: {} for key in WALLET_WS_ACTIVITY_KEYS
+}
 
 # Canonical mainnet program IDs. Keep this list reviewed before production use.
 DEX_PROGRAMS = {
@@ -119,6 +143,7 @@ class MonitorSettings:
     http_url: str
     wallets_path: Path = WALLETS_PATH
     wallet_reload_seconds: float = 5.0
+    standard_ws_url: str = SOLANA_PUBLIC_WS_URL
 
     @classmethod
     def from_env(cls) -> "MonitorSettings":
@@ -130,10 +155,97 @@ class MonitorSettings:
         ws_url = ws_template.replace("${HELIUS_API_KEY}", api_key)
         http_url = os.getenv("HELIUS_RPC_HTTP_URL", "").strip()
         http_url = http_url.replace("${HELIUS_API_KEY}", api_key)
+        standard_ws_url = (
+            os.getenv("SOLANA_PUBLIC_WS_URL", "").strip()
+            or SOLANA_PUBLIC_WS_URL
+        )
         if not ws_url or "${" in ws_url:
             raise RuntimeError("Helius WSS URL must be set in .env")
+        if not standard_ws_url.startswith(("ws://", "wss://")):
+            raise RuntimeError("Solana public WSS URL must use ws:// or wss://")
         reload_seconds = max(1.0, float(os.getenv("WALLET_RELOAD_SECONDS", "5")))
-        return cls(ws_url=ws_url, http_url=http_url, wallet_reload_seconds=reload_seconds)
+        return cls(
+            ws_url=ws_url,
+            http_url=http_url,
+            standard_ws_url=standard_ws_url,
+            wallet_reload_seconds=reload_seconds,
+        )
+
+
+@dataclass(slots=True)
+class WalletWsRouteState:
+    """Helius 복구를 주기적으로 확인하는 bounded WS fallback 상태다."""
+
+    mode: str = "HELIUS_ENHANCED"
+    next_helius_probe_at: float = 0.0
+
+    @property
+    def uses_standard(self) -> bool:
+        return self.mode == "SOLANA_STANDARD"
+
+    def activate_standard(self, now: float) -> None:
+        self.mode = "SOLANA_STANDARD"
+        self.next_helius_probe_at = now + HELIUS_RECOVERY_PROBE_SECONDS
+
+    def record_failure(self, now: float) -> None:
+        if not self.uses_standard:
+            self.activate_standard(now)
+        elif now >= self.next_helius_probe_at:
+            self.mode = "HELIUS_ENHANCED"
+
+    def refresh(self, now: float) -> None:
+        if self.uses_standard and now >= self.next_helius_probe_at:
+            self.mode = "HELIUS_ENHANCED"
+
+
+class SignatureWindow:
+    """한 연결 안의 중복 signature를 bounded FIFO로 억제한다."""
+
+    def __init__(self, maximum: int = MAX_SEEN_WALLET_SIGNATURES) -> None:
+        self.maximum = max(1, int(maximum))
+        self._ordered: deque[str] = deque()
+        self._seen: set[str] = set()
+
+    def add(self, signature: str) -> bool:
+        if signature in self._seen:
+            return False
+        self._seen.add(signature)
+        self._ordered.append(signature)
+        while len(self._ordered) > self.maximum:
+            self._seen.discard(self._ordered.popleft())
+        return True
+
+
+def reset_wallet_ws_activity(*, now_epoch: float | None = None) -> None:
+    global _wallet_ws_activity_started_at
+    _wallet_ws_activity_started_at = (
+        time.time() if now_epoch is None else float(now_epoch)
+    )
+    for key in WALLET_WS_ACTIVITY_KEYS:
+        _wallet_ws_activity[key] = 0
+        _wallet_ws_activity_by_source[key] = {}
+
+
+def record_wallet_ws_activity(name: str, source: str) -> None:
+    """고빈도 경로에서는 메모리 counter만 갱신하고 heartbeat가 저장한다."""
+    if name not in WALLET_WS_ACTIVITY_KEYS:
+        raise ValueError("unsupported wallet WebSocket activity metric")
+    provider = str(source)[:80]
+    _wallet_ws_activity[name] += 1
+    per_source = _wallet_ws_activity_by_source[name]
+    per_source[provider] = per_source.get(provider, 0) + 1
+
+
+def wallet_ws_activity_metrics() -> dict[str, Any]:
+    values: dict[str, Any] = {
+        "wallet_ws_activity_started_at": _wallet_ws_activity_started_at,
+    }
+    for name in sorted(WALLET_WS_ACTIVITY_KEYS):
+        values[f"wallet_ws_{name}_process_count"] = _wallet_ws_activity[name]
+        values[f"wallet_ws_{name}_counts_by_source"] = dict(
+            sorted(_wallet_ws_activity_by_source[name].items())
+        )
+    return values
 
 
 @dataclass(frozen=True, slots=True)
@@ -397,12 +509,12 @@ async def watch_wallet_file(
 
 async def monitor_heartbeat(wallet_count: int) -> None:
     while True:
+        metrics = wallet_ws_activity_metrics()
+        metrics["monitor_process_heartbeat_at"] = time.time()
+        metrics["monitor_wallet_count"] = int(wallet_count)
         await asyncio.to_thread(
             state_store.set_global_metrics,
-            {
-                "monitor_process_heartbeat_at": time.time(),
-                "monitor_wallet_count": int(wallet_count),
-            },
+            metrics,
         )
         logger.info("heartbeat: actively monitoring %s wallets", wallet_count)
         await asyncio.sleep(60)
@@ -687,6 +799,7 @@ async def process_paper_signal(
     *,
     momentum_metrics: dict[str, int | float] | None = None,
     prefilter_reasons: tuple[str, ...] = (),
+    discovery_source: str | None = None,
 ) -> None:
     """모든 형성 후보를 관찰하고 승인 후보만 페이퍼 매수한다."""
     async with _analysis_limit:
@@ -708,6 +821,14 @@ async def process_paper_signal(
 
             observation_enabled = observation_mode_enabled()
             if observation_enabled:
+                discovery_details: dict[str, Any] = {
+                    "whale_paid_lamports": whale_paid_lamports,
+                    "source_token_amount_raw": whale_token_amount_raw,
+                    "source_token_decimals": token_decimals,
+                    "prefilter_reasons": ",".join(decision_reasons),
+                }
+                if discovery_source:
+                    discovery_details["discovery_source"] = discovery_source
                 discovered = await record_candidate_discovery(
                     mint=mint,
                     route_type=requested_route,
@@ -718,14 +839,14 @@ async def process_paper_signal(
                     signal_detected_at=signal_detected_at,
                     dex_momentum_score=dex_momentum_score,
                     momentum_metrics=momentum_metrics,
-                    discovery_metadata={
-                        "whale_paid_lamports": whale_paid_lamports,
-                        "source_token_amount_raw": whale_token_amount_raw,
-                        "source_token_decimals": token_decimals,
-                        "prefilter_reasons": ",".join(decision_reasons),
-                    },
+                    discovery_metadata=discovery_details,
                 )
                 observation_id = discovered.observation_id
+                if requested_route == "A" and discovered.created:
+                    record_wallet_ws_activity(
+                        "research_discovered",
+                        discovery_source or "unknown",
+                    )
             elif decision_reasons:
                 return
             route_a_size_multiplier = Decimal("1")
@@ -779,6 +900,11 @@ async def process_paper_signal(
                 record_rpc_skip,
             )
 
+            if requested_route == "A":
+                record_wallet_ws_activity(
+                    "analyzer_reached",
+                    discovery_source or "unknown",
+                )
             report = await analyze_token(mint)
             analysis_completed_at = datetime.now(timezone.utc).isoformat()
             safety_snapshot = {
@@ -1100,6 +1226,7 @@ def schedule_paper_signal(
     wallet: str, signature: str,
     *,
     prefilter_reasons: tuple[str, ...] = (),
+    discovery_source: str = DISCOVERY_SOURCE_HELIUS,
 ) -> None:
     if prefilter_reasons and len(_shadow_signal_tasks) >= MAX_PENDING_SHADOW_SIGNALS:
         logger.warning(
@@ -1117,6 +1244,7 @@ def schedule_paper_signal(
             "A",
             0.0,
             prefilter_reasons=prefilter_reasons,
+            discovery_source=discovery_source,
         )
     )
     _signal_tasks.add(task)
@@ -1126,7 +1254,13 @@ def schedule_paper_signal(
         task.add_done_callback(_shadow_signal_tasks.discard)
 
 
-def print_buys(result: dict[str, Any], dex_name: str, watched_wallets: set[str]) -> None:
+def print_buys(
+    result: dict[str, Any],
+    dex_name: str,
+    watched_wallets: set[str],
+    *,
+    discovery_source: str = DISCOVERY_SOURCE_HELIUS,
+) -> None:
     transaction = result.get("transaction") or {}
     message = transaction.get("message") or {}
     meta = result.get("meta") or {}
@@ -1196,6 +1330,10 @@ def print_buys(result: dict[str, Any], dex_name: str, watched_wallets: set[str])
                     mint=mint,
                     signature=signature,
                 )
+                record_wallet_ws_activity(
+                    "smart_money_candidate",
+                    discovery_source,
+                )
                 schedule_paper_signal(
                     mint,
                     raw,
@@ -1206,6 +1344,7 @@ def print_buys(result: dict[str, Any], dex_name: str, watched_wallets: set[str])
                     prefilter_reasons=(
                         () if amount_allowed else ("WHALE_AMOUNT_FILTER_REJECTED",)
                     ),
+                    discovery_source=discovery_source,
                 )
             else:
                 schedule_paper_signal(
@@ -1833,24 +1972,28 @@ async def fetch_transaction(
 async def monitor_standard_once(
     settings: MonitorSettings, wallets: tuple[str, ...]
 ) -> None:
-    """Free-plan fallback: wallet-filtered logs, then fetch only matching DEX txs."""
-    request_to_wallet: dict[int, str] = {}
-    seen: set[str] = set()
+    """Public fallback: wallet logs, then fetch only matching DEX transactions."""
+    seen = SignatureWindow()
     timeout = aiohttp.ClientTimeout(total=15)
     async with connect(
-        settings.ws_url, ping_interval=20, ping_timeout=20, open_timeout=20, max_queue=512
+        settings.standard_ws_url,
+        ping_interval=20,
+        ping_timeout=20,
+        open_timeout=20,
+        max_queue=512,
     ) as socket, aiohttp.ClientSession(timeout=timeout) as session:
         connected_at = time.time()
+        record_wallet_ws_activity("connection_success", DISCOVERY_SOURCE_SOLANA)
         await asyncio.to_thread(
             state_store.set_global_metrics,
             {
                 "wallet_ws_connected_at": connected_at,
-                "wallet_ws_endpoint_kind": "HELIUS_WSS",
+                "wallet_ws_endpoint_kind": "SOLANA_PUBLIC_WSS",
                 "wallet_ws_subscription_method": "logsSubscribe",
+                "wallet_ws_active_source": DISCOVERY_SOURCE_SOLANA,
             },
         )
         for request_id, wallet in enumerate(wallets, start=1):
-            request_to_wallet[request_id] = wallet
             await socket.send(json.dumps({
                 "jsonrpc": "2.0", "id": request_id, "method": "logsSubscribe",
                 "params": [{"mentions": [wallet]}, {"commitment": "confirmed"}],
@@ -1865,12 +2008,16 @@ async def monitor_standard_once(
                     )
                 acknowledgements += 1
                 if acknowledgements == len(wallets):
+                    record_wallet_ws_activity(
+                        "subscription_success", DISCOVERY_SOURCE_SOLANA
+                    )
                     await asyncio.to_thread(
                         state_store.set_global_metrics,
                         {
                             "wallet_ws_state": "SUBSCRIBED",
                             "wallet_ws_subscribed_at": time.time(),
                             "wallet_ws_mode": "STANDARD",
+                            "wallet_ws_active_source": DISCOVERY_SOURCE_SOLANA,
                             "wallet_ws_last_success_at": time.time(),
                             "wallet_ws_consecutive_failures": 0,
                             "wallet_ws_state_changed_at": time.time(),
@@ -1884,7 +2031,10 @@ async def monitor_standard_once(
                 continue
             value = ((message.get("params") or {}).get("result") or {}).get("value") or {}
             signature = value.get("signature")
-            if not signature or signature in seen or value.get("err") is not None:
+            if not signature or value.get("err") is not None:
+                continue
+            record_wallet_ws_activity("notification", DISCOVERY_SOURCE_SOLANA)
+            if not seen.add(str(signature)):
                 continue
             logs = value.get("logs") or []
             dex_name = next(
@@ -1893,13 +2043,19 @@ async def monitor_standard_once(
             )
             if not dex_name:
                 continue
-            seen.add(signature)
-            if len(seen) > 10_000:
-                seen.clear()
-                seen.add(signature)
+            record_wallet_ws_activity("dex_log_match", DISCOVERY_SOURCE_SOLANA)
+            record_wallet_ws_activity("transaction_fetch", DISCOVERY_SOURCE_SOLANA)
             transaction = await fetch_transaction(session, settings.http_url, signature)
             if transaction:
-                print_buys(transaction, dex_name, set(wallets))
+                record_wallet_ws_activity(
+                    "transaction_parsed", DISCOVERY_SOURCE_SOLANA
+                )
+                print_buys(
+                    transaction,
+                    dex_name,
+                    set(wallets),
+                    discovery_source=DISCOVERY_SOURCE_SOLANA,
+                )
 
 
 async def monitor_once(settings: MonitorSettings, wallets: tuple[str, ...]) -> None:
@@ -1913,12 +2069,14 @@ async def monitor_once(settings: MonitorSettings, wallets: tuple[str, ...]) -> N
         max_queue=512,
     ) as socket:
         connected_at = time.time()
+        record_wallet_ws_activity("connection_success", DISCOVERY_SOURCE_HELIUS)
         await asyncio.to_thread(
             state_store.set_global_metrics,
             {
                 "wallet_ws_connected_at": connected_at,
                 "wallet_ws_endpoint_kind": "HELIUS_WSS",
                 "wallet_ws_subscription_method": "transactionSubscribe",
+                "wallet_ws_active_source": DISCOVERY_SOURCE_HELIUS,
             },
         )
         for request_id, (name, program) in enumerate(DEX_PROGRAMS.items(), start=1):
@@ -1938,12 +2096,16 @@ async def monitor_once(settings: MonitorSettings, wallets: tuple[str, ...]) -> N
                     request_id = int(message["id"])
                     subscription_to_dex[int(message["result"])] = request_to_dex[request_id]
                     if len(subscription_to_dex) == len(DEX_PROGRAMS):
+                        record_wallet_ws_activity(
+                            "subscription_success", DISCOVERY_SOURCE_HELIUS
+                        )
                         await asyncio.to_thread(
                             state_store.set_global_metrics,
                             {
                                 "wallet_ws_state": "SUBSCRIBED",
                                 "wallet_ws_subscribed_at": time.time(),
                                 "wallet_ws_mode": "ENHANCED",
+                                "wallet_ws_active_source": DISCOVERY_SOURCE_HELIUS,
                                 "wallet_ws_last_success_at": time.time(),
                                 "wallet_ws_consecutive_failures": 0,
                                 "wallet_ws_state_changed_at": time.time(),
@@ -1957,7 +2119,18 @@ async def monitor_once(settings: MonitorSettings, wallets: tuple[str, ...]) -> N
                 dex_name = subscription_to_dex.get(subscription_id)
                 value = (params.get("result") or {}).get("value")
                 if dex_name and isinstance(value, dict):
-                    print_buys(value, dex_name, set(wallets))
+                    record_wallet_ws_activity(
+                        "notification", DISCOVERY_SOURCE_HELIUS
+                    )
+                    record_wallet_ws_activity(
+                        "transaction_parsed", DISCOVERY_SOURCE_HELIUS
+                    )
+                    print_buys(
+                        value,
+                        dex_name,
+                        set(wallets),
+                        discovery_source=DISCOVERY_SOURCE_HELIUS,
+                    )
         finally:
             ping_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
@@ -1966,7 +2139,7 @@ async def monitor_once(settings: MonitorSettings, wallets: tuple[str, ...]) -> N
 
 async def run_forever(settings: MonitorSettings) -> None:
     delay = 3
-    use_standard_fallback = False
+    route = WalletWsRouteState()
     while True:
         connected_at = time.monotonic()
         try:
@@ -1978,11 +2151,23 @@ async def run_forever(settings: MonitorSettings) -> None:
                 {
                     "wallet_ws_state": "CONNECTING",
                     "wallet_ws_state_changed_at": time.time(),
+                    "wallet_ws_endpoint_kind": (
+                        "SOLANA_PUBLIC_WSS"
+                        if route.uses_standard else "HELIUS_WSS"
+                    ),
+                    "wallet_ws_subscription_method": (
+                        "logsSubscribe"
+                        if route.uses_standard else "transactionSubscribe"
+                    ),
+                    "wallet_ws_active_source": (
+                        DISCOVERY_SOURCE_SOLANA
+                        if route.uses_standard else DISCOVERY_SOURCE_HELIUS
+                    ),
                 },
             )
             monitor_task = asyncio.create_task(
                 monitor_standard_once(settings, wallets)
-                if use_standard_fallback else monitor_once(settings, wallets)
+                if route.uses_standard else monitor_once(settings, wallets)
             )
             watcher_task = asyncio.create_task(
                 watch_wallet_file(
@@ -2021,13 +2206,17 @@ async def run_forever(settings: MonitorSettings) -> None:
                     "wallet_ws_state_changed_at": time.time(),
                 },
             )
+            route.refresh(time.monotonic())
             delay = 3
             continue
         except EnhancedSubscriptionUnavailable:
+            record_wallet_ws_activity(
+                "subscription_failure", DISCOVERY_SOURCE_HELIUS
+            )
             logger.warning(
                 "enhanced transactionSubscribe unavailable; switching to wallet-filtered logsSubscribe"
             )
-            use_standard_fallback = True
+            route.activate_standard(time.monotonic())
             await asyncio.to_thread(
                 state_store.set_global_metrics,
                 {
@@ -2043,16 +2232,38 @@ async def run_forever(settings: MonitorSettings) -> None:
             raise
         except Exception as exc:
             category = canonical_websocket_failure_reason(exc)
+            failed_mode = route.mode
+            if isinstance(exc, WebSocketSubscriptionRejected):
+                record_wallet_ws_activity(
+                    "subscription_failure",
+                    DISCOVERY_SOURCE_SOLANA
+                    if route.uses_standard else DISCOVERY_SOURCE_HELIUS,
+                )
+            route.record_failure(time.monotonic())
             await asyncio.to_thread(
                 record_wallet_ws_failure,
                 category,
             )
+            if (
+                failed_mode == "HELIUS_ENHANCED"
+                and route.mode == "SOLANA_STANDARD"
+            ):
+                await asyncio.to_thread(
+                    state_store.set_global_metrics,
+                    {
+                        "wallet_ws_enhanced_fallback_reason": category,
+                        "wallet_ws_enhanced_fallback_at": time.time(),
+                    },
+                )
             if time.monotonic() - connected_at >= 60:
                 delay = 3
             logger.exception(
-                "connection lost; reconnecting in %s seconds category=%s",
+                "connection lost; reconnecting in %s seconds category=%s "
+                "failed_mode=%s next_mode=%s",
                 delay,
                 category,
+                failed_mode,
+                route.mode,
             )
             await asyncio.sleep(delay)
             delay = min(delay * 2, 300)
@@ -2073,6 +2284,7 @@ async def run_service() -> None:
     )
     paper_entries_enabled = not observation_mode or approved_paper_mode
     started_at = time.time()
+    reset_wallet_ws_activity(now_epoch=started_at)
     await asyncio.to_thread(
         state_store.set_global_metrics,
         {
@@ -2080,6 +2292,7 @@ async def run_service() -> None:
             "monitor_process_heartbeat_at": started_at,
             "wallet_ws_state": "STARTING",
             "wallet_ws_state_changed_at": started_at,
+            **wallet_ws_activity_metrics(),
         },
     )
     logger.info(
