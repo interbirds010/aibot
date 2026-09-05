@@ -27,6 +27,10 @@ _OOM = re.compile(
 _KERNEL_ACCESS_WARNING = re.compile(
     r"(?i)(permission denied|not seeing messages|failed to open|access denied)"
 )
+_PM2_MEMORY_RESTART = re.compile(
+    r"(?i)(max[-_ ]memory[-_ ]restart|exceeds?.{0,80}memory|too much memory)"
+)
+_PYTHON_TRACEBACK = re.compile(r"(?m)^Traceback \(most recent call last\):")
 
 
 def _integer(value: Any) -> int | None:
@@ -65,20 +69,46 @@ def pm2_snapshot(app: dict[str, Any]) -> dict[str, Any]:
             round(uptime_ms / 1000, 3) if uptime_ms is not None else None
         ),
         "current_rss_bytes": _integer(monitor.get("memory")),
+        "max_memory_restart_bytes": _integer(
+            environment.get("max_memory_restart")
+        ),
     }
 
 
-def safe_log_tail(text: str) -> list[str]:
-    """URL·credential을 제거하고 마지막 stderr 일부만 반환한다."""
+def safe_log_tail(
+    text: str,
+    *,
+    max_lines: int = MAX_LOG_LINES,
+    max_chars: int = MAX_LOG_CHARS,
+) -> list[str]:
+    """URL·credential을 제거하고 마지막 로그 일부만 반환한다."""
     safe_lines: list[str] = []
-    for raw in str(text).splitlines()[-MAX_LOG_LINES:]:
+    for raw in str(text).splitlines()[-max_lines:]:
         line = redact_sensitive_text(raw)
         line = _URL.sub("<URL_REDACTED>", line)
         line = _SECRET_ASSIGNMENT.sub(r"\1=HIDDEN_MASKED", line)
         safe_lines.append(line[:1_000])
-    while sum(len(line) for line in safe_lines) > MAX_LOG_CHARS:
+    while sum(len(line) for line in safe_lines) > max_chars:
         safe_lines.pop(0)
     return safe_lines
+
+
+def _restart_reason_category(
+    *,
+    restart_delta: int,
+    oom_evidence: str,
+    stderr_tail: str,
+    pm2_daemon_tail: str,
+) -> str:
+    if restart_delta == 0:
+        return "NOT_APPLICABLE"
+    if str(oom_evidence).upper() == "PRESENT":
+        return "KERNEL_OOM"
+    if _PM2_MEMORY_RESTART.search(pm2_daemon_tail):
+        return "PM2_MAX_MEMORY_RESTART"
+    if _PYTHON_TRACEBACK.search(stderr_tail):
+        return "PYTHON_UNCAUGHT_EXCEPTION"
+    return "UNKNOWN"
 
 
 def build_restart_forensics(
@@ -91,6 +121,10 @@ def build_restart_forensics(
     oom_evidence_lines: list[str] | None = None,
     stderr_tail: str = "",
     stderr_tail_status: str = "AVAILABLE",
+    stdout_tail: str = "",
+    stdout_tail_status: str = "AVAILABLE",
+    pm2_daemon_tail: str = "",
+    pm2_daemon_tail_status: str = "AVAILABLE",
 ) -> dict[str, Any]:
     before = pm2_snapshot(_monitor(before_apps))
     after = pm2_snapshot(_monitor(after_apps))
@@ -99,10 +133,16 @@ def build_restart_forensics(
     if re.fullmatch(r"[0-9a-f]{40}", sha) is None:
         sha = "UNKNOWN"
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "deployed_sha": sha,
         "restart_detected": restart_delta != 0,
         "restart_delta": restart_delta,
+        "restart_reason_category": _restart_reason_category(
+            restart_delta=restart_delta,
+            oom_evidence=oom_evidence,
+            stderr_tail=stderr_tail,
+            pm2_daemon_tail=pm2_daemon_tail,
+        ),
         "before": before,
         "after": after,
         "system_available_memory_bytes": available_memory_bytes,
@@ -112,6 +152,14 @@ def build_restart_forensics(
         )[-3:],
         "stderr_tail_status": str(stderr_tail_status).upper()[:40],
         "recent_safe_stderr_tail": safe_log_tail(stderr_tail),
+        "stdout_tail_status": str(stdout_tail_status).upper()[:40],
+        "recent_safe_stdout_tail": safe_log_tail(
+            stdout_tail, max_lines=20, max_chars=4_000
+        ),
+        "pm2_daemon_tail_status": str(pm2_daemon_tail_status).upper()[:40],
+        "recent_safe_pm2_daemon_tail": safe_log_tail(
+            pm2_daemon_tail, max_lines=20, max_chars=4_000
+        ),
     }
 
 
@@ -158,15 +206,35 @@ def _kernel_oom_evidence(since_epoch: float) -> tuple[str, list[str]]:
     return ("NONE", []) if readable else ("UNKNOWN", [])
 
 
-def _safe_pm2_error_tail(after_apps: list[Any]) -> tuple[str, str]:
+def _safe_pm2_file_tail(
+    after_apps: list[Any], *field_names: str
+) -> tuple[str, str]:
     environment = _monitor(after_apps).get("pm2_env")
     environment = environment if isinstance(environment, dict) else {}
-    raw_path = str(environment.get("pm_err_log") or "").strip()
+    raw_path = next(
+        (
+            str(environment.get(field) or "").strip()
+            for field in field_names
+            if str(environment.get(field) or "").strip()
+        ),
+        "",
+    )
     if not raw_path:
         return "", "UNAVAILABLE"
     try:
         base = Path(os.getenv("PM2_HOME", "/home/deploy/.pm2")).resolve()
         path = Path(raw_path).resolve()
+        path.relative_to(base)
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except (OSError, ValueError):
+        return "", "UNAVAILABLE"
+    return "\n".join(lines[-MAX_LOG_LINES:]), "AVAILABLE"
+
+
+def _safe_pm2_daemon_tail() -> tuple[str, str]:
+    try:
+        base = Path(os.getenv("PM2_HOME", "/home/deploy/.pm2")).resolve()
+        path = (base / "pm2.log").resolve()
         path.relative_to(base)
         lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
     except (OSError, ValueError):
@@ -185,7 +253,13 @@ def main() -> int:
     before_apps = _load_apps(args.before)
     after_apps = _load_apps(args.after)
     oom_status, oom_lines = _kernel_oom_evidence(args.since_epoch)
-    stderr_tail, stderr_status = _safe_pm2_error_tail(after_apps)
+    stderr_tail, stderr_status = _safe_pm2_file_tail(
+        after_apps, "pm_err_log_path", "pm_err_log"
+    )
+    stdout_tail, stdout_status = _safe_pm2_file_tail(
+        after_apps, "pm_out_log_path", "pm_out_log"
+    )
+    pm2_daemon_tail, pm2_daemon_status = _safe_pm2_daemon_tail()
     report = build_restart_forensics(
         before_apps,
         after_apps,
@@ -195,6 +269,10 @@ def main() -> int:
         oom_evidence_lines=oom_lines,
         stderr_tail=stderr_tail,
         stderr_tail_status=stderr_status,
+        stdout_tail=stdout_tail,
+        stdout_tail_status=stdout_status,
+        pm2_daemon_tail=pm2_daemon_tail,
+        pm2_daemon_tail_status=pm2_daemon_status,
     )
     print(
         "MONITOR_RESTART_FORENSICS "
