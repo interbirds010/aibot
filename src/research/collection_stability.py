@@ -11,9 +11,16 @@ from pathlib import Path
 from typing import Any, Sequence
 
 from src import state_store
-from src.observation_analysis import RESEARCH_HORIZONS, build_research_metrics
+from src.observation_analysis import (
+    RESEARCH_HORIZONS,
+    build_research_metrics,
+    canonical_missing_outcome_reason,
+    outcome_trackable,
+    sampling_timing_metrics,
+)
 from src.observation_tracker import (
     DISCOVERY_PROCESSING_INTERRUPTED,
+    OBSERVATION_INTERVALS,
     OBSERVATION_PATH,
     empty_observations,
 )
@@ -66,12 +73,24 @@ def _decision_reasons(row: dict[str, Any]) -> set[str]:
     }
 
 
+def _interval_sample(row: dict[str, Any], interval: str) -> dict[str, Any] | None:
+    samples = row.get("samples")
+    if not isinstance(samples, list):
+        return None
+    return next((
+        sample for sample in samples
+        if isinstance(sample, dict) and str(sample.get("interval")) == interval
+    ), None)
+
+
 def build_research_lifecycle(
     rows: list[Any],
     *,
     since_epoch: float = 0.0,
+    now_epoch: float | None = None,
 ) -> dict[str, Any]:
     """지정 시점 이후 Research V1 event의 funnel과 horizon 품질을 계산한다."""
+    now = time.time() if now_epoch is None else float(now_epoch)
     selected = [
         row for row in rows
         if isinstance(row, dict)
@@ -83,19 +102,46 @@ def build_research_lifecycle(
         str(row.get("status") or "UNKNOWN").upper() for row in selected
     )
     horizon_rows: dict[str, Any] = {}
+    interval_delays = dict(OBSERVATION_INTERVALS)
     for horizon in RESEARCH_HORIZONS:
         source = research["horizons"][horizon]
-        sample_record_count = sum(
-            any(
-                isinstance(sample, dict)
-                and str(sample.get("interval")) == horizon
-                for sample in (
-                    row.get("samples")
-                    if isinstance(row.get("samples"), list)
-                    else []
-                )
-            )
-            for row in selected
+        sample_pairs = [(row, _interval_sample(row, horizon)) for row in selected]
+        sample_record_count = sum(sample is not None for _, sample in sample_pairs)
+        trackable_rows = [row for row in selected if outcome_trackable(row)]
+        eligible_rows = [
+            row for row in trackable_rows
+            if (started := _finite(row.get("started_at_epoch"))) is not None
+            and now >= started + interval_delays[horizon]
+        ]
+        eligible_pairs = [
+            (row, _interval_sample(row, horizon)) for row in eligible_rows
+        ]
+        successful_count = sum(
+            sample is not None
+            and _finite(sample.get("return_percent")) is not None
+            for _, sample in eligible_pairs
+        )
+        eligible_missing_reasons = Counter(
+            canonical_missing_outcome_reason(row, sample)
+            for row, sample in eligible_pairs
+            if sample is None or _finite(sample.get("return_percent")) is None
+        )
+        due_targets = [
+            (_finite(row.get("started_at_epoch")) or 0.0)
+            + interval_delays[horizon]
+            for row, sample in eligible_pairs
+            if sample is None and str(row.get("status") or "").upper() == "PENDING"
+        ]
+        eligible_missing_count = len(eligible_rows) - successful_count
+        missed_count = eligible_missing_reasons.get("HORIZON_MISSED", 0)
+        no_route_count = eligible_missing_reasons.get("EXIT_NO_ROUTE", 0)
+        not_sampled_count = eligible_missing_reasons.get("NOT_SAMPLED", 0)
+        api_failure_count = sum(
+            count for reason, count in eligible_missing_reasons.items()
+            if reason == "API_FAILURE" or reason.startswith("RPC_")
+        )
+        classified_missing = (
+            missed_count + no_route_count + not_sampled_count + api_failure_count
         )
         horizon_rows[horizon] = {
             key: source.get(key)
@@ -112,10 +158,40 @@ def build_research_lifecycle(
                 "median_sample_lag_seconds",
                 "p90_sample_lag_seconds",
                 "p95_sample_lag_seconds",
+                "p99_sample_lag_seconds",
                 "max_sample_lag_seconds",
+                "quote_latency_sample_count",
+                "median_quote_latency_ms",
+                "p95_quote_latency_ms",
+                "max_quote_latency_ms",
             )
         }
-        horizon_rows[horizon]["sample_record_count"] = sample_record_count
+        horizon_rows[horizon].update({
+            "sample_record_count": sample_record_count,
+            "target_eligible_count": len(eligible_rows),
+            "successful_sample_count": successful_count,
+            "eligible_missing_count": eligible_missing_count,
+            "usable_rate_percent": (
+                round(successful_count / len(eligible_rows) * 100, 4)
+                if eligible_rows else None
+            ),
+            "not_yet_due_count": len(trackable_rows) - len(eligible_rows),
+            "due_backlog_count": len(due_targets),
+            "oldest_due_lag_seconds": (
+                round(max(now - target for target in due_targets), 4)
+                if due_targets else None
+            ),
+            "horizon_missed_count": missed_count,
+            "no_route_count": no_route_count,
+            "api_failure_count": api_failure_count,
+            "not_sampled_count": not_sampled_count,
+            "other_missing_count": max(
+                0, eligible_missing_count - classified_missing
+            ),
+            "eligible_missing_reasons": dict(sorted(
+                eligible_missing_reasons.items()
+            )),
+        })
 
     completed_60m = sum(
         str(row.get("status") or "").upper() == "COMPLETE"
@@ -127,8 +203,24 @@ def build_research_lifecycle(
         )
         for row in selected
     )
+    all_samples = [
+        sample
+        for row in selected
+        for sample in (
+            row.get("samples") if isinstance(row.get("samples"), list) else []
+        )
+        if isinstance(sample, dict)
+    ]
+    due_backlog_depth = sum(
+        metrics["due_backlog_count"] for metrics in horizon_rows.values()
+    )
+    due_lags = [
+        metrics["oldest_due_lag_seconds"] for metrics in horizon_rows.values()
+        if metrics["oldest_due_lag_seconds"] is not None
+    ]
     return {
         "since_epoch": since_epoch,
+        "measured_at_epoch": now,
         "signal_count": len(selected),
         "analyzer_success_count": sum(
             bool(row.get("analysis_completed_at"))
@@ -155,6 +247,9 @@ def build_research_lifecycle(
         "completed_60m_count": completed_60m,
         "status_counts": dict(sorted(status_counts.items())),
         "horizons": horizon_rows,
+        "overall_sampling": sampling_timing_metrics(all_samples),
+        "due_backlog_depth": due_backlog_depth,
+        "oldest_due_lag_seconds": max(due_lags) if due_lags else None,
         "missing_60m_reasons": horizon_rows["60m"]["missing_reasons"],
     }
 
@@ -268,7 +363,10 @@ def build_collection_report(
     rows = observations.get("observations")
     if not isinstance(rows, list):
         raise RuntimeError("signal observation rows are malformed")
-    lifecycle = build_research_lifecycle(rows, since_epoch=since_epoch)
+    generated_at = time.time()
+    lifecycle = build_research_lifecycle(
+        rows, since_epoch=since_epoch, now_epoch=generated_at
+    )
     providers = build_provider_report(baseline=baseline)
     metrics_document = state_store.read_json(
         state_store.GLOBAL_METRICS_PATH,
@@ -295,7 +393,7 @@ def build_collection_report(
         )
     }
     return {
-        "generated_at_epoch": time.time(),
+        "generated_at_epoch": generated_at,
         "research": lifecycle,
         "providers": providers,
         "websocket": websocket,

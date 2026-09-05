@@ -10,7 +10,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 import aiohttp
 from dotenv import load_dotenv
@@ -34,6 +34,7 @@ OBSERVATION_INTERVALS = (
 MAX_OBSERVATIONS = 1_000
 MAX_ACTIVE_OBSERVATIONS = 200
 OBSERVATION_SAMPLE_BATCH_SIZE = 20
+OBSERVATION_SAMPLE_CONCURRENCY = 4
 MAX_SAMPLE_ATTEMPTS = 3
 MAX_HORIZON_SAMPLE_LAG_SECONDS = 60.0
 OBSERVER_HEALTH_INTERVAL_SECONDS = 60.0
@@ -260,6 +261,8 @@ def _sampled_at_epoch(sample: dict[str, Any]) -> float | None:
 
 def observation_runtime_metrics(
     document: dict[str, Any] | None = None,
+    *,
+    now_epoch: float | None = None,
 ) -> dict[str, int | float | None]:
     """원장을 변경하지 않고 observer 운영 지표를 계산한다."""
     source = (
@@ -293,11 +296,17 @@ def observation_runtime_metrics(
                 missed_count += 1
                 if sampled_at is not None:
                     last_missed = max(last_missed or sampled_at, sampled_at)
+    now = time.time() if now_epoch is None else float(now_epoch)
+    due = _due_sample_candidates(rows, now)
     return {
         "pending_research_observations": pending,
         "last_successful_horizon_sample_at": last_success,
         "horizon_missed_count": missed_count,
         "last_horizon_missed_at": last_missed,
+        "observer_due_backlog_depth": len(due),
+        "observer_oldest_due_lag_seconds": (
+            round(max(0.0, now - due[0][4]), 4) if due else None
+        ),
     }
 
 
@@ -875,11 +884,12 @@ def mark_paper_experiment_status(
     return bool(changed)
 
 
-def due_observation_samples(now: float) -> list[tuple[str, str, str, int, float]]:
-    """정확한 최신 horizon을 우선하며 observation당 하나만 반환한다."""
-    document = ensure_observations_migrated()
-    due: list[tuple[str, str, str, int, int]] = []
-    for row in document.get("observations", []):
+def _due_sample_candidates(
+    rows: list[Any], now: float,
+) -> list[tuple[str, str, str, int, float]]:
+    """모든 due horizon을 deadline 우선순위로 반환한다."""
+    due: list[tuple[str, str, str, int, float]] = []
+    for row in rows:
         if (
             not isinstance(row, dict)
             or row.get("status") != "PENDING"
@@ -891,7 +901,7 @@ def due_observation_samples(now: float) -> list[tuple[str, str, str, int, float]
             if isinstance(sample, dict)
         }
         started_at = float(row.get("started_at_epoch", 0) or 0)
-        for label, delay in reversed(OBSERVATION_INTERVALS):
+        for label, delay in OBSERVATION_INTERVALS:
             if label not in completed and now >= started_at + delay:
                 due.append((
                     str(row.get("observation_id", "")),
@@ -900,10 +910,43 @@ def due_observation_samples(now: float) -> list[tuple[str, str, str, int, float]
                     int(row.get("token_amount_raw", 0) or 0),
                     started_at + delay,
                 ))
-                if len(due) >= OBSERVATION_SAMPLE_BATCH_SIZE:
-                    return due
-                break
+    interval_order = {
+        label: index for index, (label, _) in enumerate(OBSERVATION_INTERVALS)
+    }
+    due.sort(key=lambda item: (item[4], interval_order[item[1]], item[0]))
     return due
+
+
+def due_observation_samples(now: float) -> list[tuple[str, str, str, int, float]]:
+    """가장 오래된 deadline부터 bounded batch를 반환한다."""
+    document = ensure_observations_migrated()
+    due = _due_sample_candidates(document.get("observations", []), now)
+    return due[:OBSERVATION_SAMPLE_BATCH_SIZE]
+
+
+def horizon_sample_is_missed(now_epoch: float, target_at_epoch: float) -> bool:
+    """60초 경계는 포함하고 그 이후 표본만 missed로 판정한다."""
+    return now_epoch - target_at_epoch > MAX_HORIZON_SAMPLE_LAG_SECONDS
+
+
+async def run_due_sample_batch(
+    candidates: list[tuple[str, str, str, int, float]],
+    worker: Callable[
+        [tuple[str, str, str, int, float]], Awaitable[bool]
+    ],
+    *,
+    concurrency: int = OBSERVATION_SAMPLE_CONCURRENCY,
+) -> list[bool]:
+    """느린 quote 하나가 전체 batch를 막지 않도록 병행 수를 제한한다."""
+    semaphore = asyncio.Semaphore(max(1, int(concurrency)))
+
+    async def limited(
+        candidate: tuple[str, str, str, int, float],
+    ) -> bool:
+        async with semaphore:
+            return await worker(candidate)
+
+    return list(await asyncio.gather(*(limited(item) for item in candidates)))
 
 
 def record_sample_attempt(
@@ -953,6 +996,8 @@ def record_sample(
     *,
     proceeds_lamports: int | None,
     error: str | None = None,
+    sampled_at_epoch: float | None = None,
+    quote_latency_ms: float | None = None,
 ) -> bool:
     """한 horizon 결과를 멱등 저장하고 필수 horizon이 모이면 완료한다."""
     allowed = {label for label, _ in OBSERVATION_INTERVALS}
@@ -981,7 +1026,12 @@ def record_sample(
             if proceeds_lamports is not None and entry_cost > 0
             else None
         )
-        sampled_at_epoch = time.time()
+        sample_epoch = (
+            time.time() if sampled_at_epoch is None else float(sampled_at_epoch)
+        )
+        latency_ms = _finite_or_none(quote_latency_ms)
+        if latency_ms is not None and latency_ms < 0:
+            latency_ms = None
         delay_seconds = dict(OBSERVATION_INTERVALS)[interval]
         target_at_epoch = float(target.get("started_at_epoch", 0) or 0) + delay_seconds
         samples.append({
@@ -989,11 +1039,16 @@ def record_sample(
             "proceeds_lamports": proceeds_lamports,
             "return_percent": return_percent,
             "error": error[:500] if error else None,
-            "sampled_at": datetime.now(timezone.utc).isoformat(),
+            "sampled_at": datetime.fromtimestamp(
+                sample_epoch, timezone.utc
+            ).isoformat(),
             "target_at_epoch": target_at_epoch,
-            "sampled_at_epoch": sampled_at_epoch,
+            "sampled_at_epoch": sample_epoch,
             "sample_lag_seconds": round(
-                max(0.0, sampled_at_epoch - target_at_epoch), 4
+                max(0.0, sample_epoch - target_at_epoch), 4
+            ),
+            "quote_latency_ms": (
+                round(latency_ms, 4) if latency_ms is not None else None
             ),
         })
         if interval == "1m" and target.get("candidate_v2_eligible") is True:
@@ -1104,88 +1159,138 @@ async def observation_loop(interval_seconds: float = 15.0) -> None:
 
     timeout = aiohttp.ClientTimeout(total=15)
     async with aiohttp.ClientSession(timeout=timeout) as session:
-        while True:
-            await asyncio.sleep(interval_seconds)
-            due = await asyncio.to_thread(due_observation_samples, time.time())
-            analysis_dirty = False
-            for observation_id, label, mint, amount, target_at_epoch in due:
-                try:
-                    lag_seconds = max(0.0, time.time() - target_at_epoch)
-                    if lag_seconds > MAX_HORIZON_SAMPLE_LAG_SECONDS:
-                        await asyncio.to_thread(
-                            record_sample,
-                            observation_id,
-                            label,
-                            proceeds_lamports=None,
-                            error="HORIZON_MISSED",
-                        )
-                        analysis_dirty = True
-                        logger.warning(
-                            "observation horizon missed: mint=%s interval=%s lag=%.3f",
-                            mint,
-                            label,
-                            lag_seconds,
-                        )
-                        continue
-                    quote = await jupiter_quote(
-                        session,
-                        api_key,
-                        mint,
-                        WSOL_MINT,
-                        amount,
-                        fail_fast_bad_request=True,
-                    )
-                    await asyncio.to_thread(
-                        record_sample,
-                        observation_id,
-                        label,
-                        proceeds_lamports=int(quote["outAmount"]),
-                    )
-                    analysis_dirty = True
-                except JupiterNoRouteError as exc:
+        async def sample_due(
+            candidate: tuple[str, str, str, int, float],
+        ) -> bool:
+            observation_id, label, mint, amount, target_at_epoch = candidate
+            attempted_at = time.time()
+            if horizon_sample_is_missed(attempted_at, target_at_epoch):
+                await asyncio.to_thread(
+                    record_sample,
+                    observation_id,
+                    label,
+                    proceeds_lamports=None,
+                    error="HORIZON_MISSED",
+                    sampled_at_epoch=attempted_at,
+                )
+                logger.warning(
+                    "observation horizon missed: mint=%s interval=%s lag=%.3f",
+                    mint,
+                    label,
+                    max(0.0, attempted_at - target_at_epoch),
+                )
+                return True
+
+            quote_started = time.monotonic()
+            try:
+                quote = await jupiter_quote(
+                    session,
+                    api_key,
+                    mint,
+                    WSOL_MINT,
+                    amount,
+                    fail_fast_bad_request=True,
+                )
+                sampled_at = time.time()
+                latency_ms = (time.monotonic() - quote_started) * 1_000
+                if horizon_sample_is_missed(sampled_at, target_at_epoch):
                     await asyncio.to_thread(
                         record_sample,
                         observation_id,
                         label,
                         proceeds_lamports=None,
-                        error=redact_sensitive_text(exc),
+                        error="HORIZON_MISSED",
+                        sampled_at_epoch=sampled_at,
+                        quote_latency_ms=latency_ms,
                     )
-                    analysis_dirty = True
-                except Exception as exc:
-                    error = redact_sensitive_text(exc)
-                    attempts = await asyncio.to_thread(
-                        record_sample_attempt,
+                    logger.warning(
+                        "observation quote exceeded horizon deadline: "
+                        "mint=%s interval=%s lag=%.3f quote_latency_ms=%.1f",
+                        mint,
+                        label,
+                        max(0.0, sampled_at - target_at_epoch),
+                        latency_ms,
+                    )
+                    return True
+                await asyncio.to_thread(
+                    record_sample,
+                    observation_id,
+                    label,
+                    proceeds_lamports=int(quote["outAmount"]),
+                    sampled_at_epoch=sampled_at,
+                    quote_latency_ms=latency_ms,
+                )
+                return True
+            except JupiterNoRouteError as exc:
+                sampled_at = time.time()
+                latency_ms = (time.monotonic() - quote_started) * 1_000
+                error = (
+                    "HORIZON_MISSED"
+                    if horizon_sample_is_missed(sampled_at, target_at_epoch)
+                    else redact_sensitive_text(exc)
+                )
+                await asyncio.to_thread(
+                    record_sample,
+                    observation_id,
+                    label,
+                    proceeds_lamports=None,
+                    error=error,
+                    sampled_at_epoch=sampled_at,
+                    quote_latency_ms=latency_ms,
+                )
+                return True
+            except Exception as exc:
+                sampled_at = time.time()
+                latency_ms = (time.monotonic() - quote_started) * 1_000
+                error = redact_sensitive_text(exc)
+                attempts = await asyncio.to_thread(
+                    record_sample_attempt,
+                    observation_id,
+                    label,
+                    error=error,
+                )
+                if attempts >= MAX_SAMPLE_ATTEMPTS:
+                    final_error = (
+                        "HORIZON_MISSED"
+                        if horizon_sample_is_missed(
+                            sampled_at, target_at_epoch
+                        )
+                        else error
+                    )
+                    await asyncio.to_thread(
+                        record_sample,
                         observation_id,
                         label,
-                        error=error,
+                        proceeds_lamports=None,
+                        error=final_error,
+                        sampled_at_epoch=sampled_at,
+                        quote_latency_ms=latency_ms,
                     )
-                    if attempts >= MAX_SAMPLE_ATTEMPTS:
-                        await asyncio.to_thread(
-                            record_sample,
-                            observation_id,
-                            label,
-                            proceeds_lamports=None,
-                            error=error,
-                        )
-                        analysis_dirty = True
-                        logger.warning(
-                            "observation sample failed permanently: mint=%s "
-                            "interval=%s attempts=%s error=%s",
-                            mint,
-                            label,
-                            attempts,
-                            error,
-                        )
-                    else:
-                        logger.warning(
-                            "observation sample retry scheduled: mint=%s "
-                            "interval=%s attempt=%s/%s error=%s",
-                            mint,
-                            label,
-                            attempts,
-                            MAX_SAMPLE_ATTEMPTS,
-                            error,
-                        )
+                    logger.warning(
+                        "observation sample failed permanently: mint=%s "
+                        "interval=%s attempts=%s error=%s",
+                        mint,
+                        label,
+                        attempts,
+                        final_error,
+                    )
+                    return True
+                logger.warning(
+                    "observation sample retry scheduled: mint=%s "
+                    "interval=%s attempt=%s/%s error=%s",
+                    mint,
+                    label,
+                    attempts,
+                    MAX_SAMPLE_ATTEMPTS,
+                    error,
+                )
+                return False
+
+        while True:
+            tick_started = time.monotonic()
+            due = await asyncio.to_thread(due_observation_samples, time.time())
+            results = await run_due_sample_batch(due, sample_due)
+            analysis_dirty = any(results)
             if analysis_dirty:
                 try:
                     from src.observation_analysis import refresh_observation_analysis
@@ -1205,6 +1310,10 @@ async def observation_loop(interval_seconds: float = 15.0) -> None:
                     **observation_runtime_metrics(),
                 })
                 last_health_refresh = time.monotonic()
+            await asyncio.sleep(max(
+                0.0,
+                interval_seconds - (time.monotonic() - tick_started),
+            ))
 
 
 async def observation_supervisor(

@@ -72,6 +72,9 @@ jobs:
             sleep "$OBSERVATION_SECONDS"
 
             ./venv/bin/python -m src.research.alpha_discovery
+            echo "RESEARCH_REPORT_SCOPE=cumulative"
+            ./venv/bin/python -m src.research.collection_stability
+            echo "RESEARCH_REPORT_SCOPE=observation_window"
             ./venv/bin/python -m src.research.collection_stability \
               --since-epoch "$since_epoch" \
               --baseline "$baseline"

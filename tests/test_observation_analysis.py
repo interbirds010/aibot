@@ -261,6 +261,7 @@ class ResearchMetricsTests(unittest.TestCase):
         self.assertEqual(horizon["median_sample_lag_seconds"], 3.0)
         self.assertEqual(horizon["p90_sample_lag_seconds"], 49.4)
         self.assertEqual(horizon["p95_sample_lag_seconds"], 55.2)
+        self.assertEqual(horizon["p99_sample_lag_seconds"], 59.84)
         self.assertEqual(horizon["max_sample_lag_seconds"], 61.0)
 
     def test_group_horizons_include_coverage_and_lag_metrics(self) -> None:

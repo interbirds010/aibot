@@ -26,6 +26,8 @@ class DeployWorkflowTests(unittest.TestCase):
         self.assertIn("OBSERVATION_SECONDS > 1800", workflow)
         self.assertIn("--write-baseline", workflow)
         self.assertIn("--baseline", workflow)
+        self.assertIn("RESEARCH_REPORT_SCOPE=cumulative", workflow)
+        self.assertIn("RESEARCH_REPORT_SCOPE=observation_window", workflow)
 
 
 if __name__ == "__main__":

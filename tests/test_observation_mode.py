@@ -508,7 +508,99 @@ class ObservationLedgerTests(unittest.TestCase):
         with patch.object(observation_tracker, "OBSERVATION_SAMPLE_BATCH_SIZE", 2):
             due = observation_tracker.due_observation_samples(2_000)
         self.assertEqual(len(due), 2)
-        self.assertTrue(all(item[1] == "15m" for item in due))
+        self.assertTrue(all(item[1] == "1m" for item in due))
+        self.assertEqual([item[4] for item in due], sorted(item[4] for item in due))
+
+    def test_due_samples_use_deadline_order_not_row_insertion_order(self) -> None:
+        with patch.object(observation_tracker.time, "time", return_value=1_000):
+            self.record(mint="NEW", signature="NEW")
+        with patch.object(observation_tracker.time, "time", return_value=900):
+            self.record(mint="OLD", signature="OLD")
+
+        due = observation_tracker.due_observation_samples(1_061)
+
+        self.assertEqual(due[0][2], "OLD")
+        self.assertEqual(due[0][1], "1m")
+        self.assertEqual(due[0][4], 960)
+        self.assertEqual(due[1][2], "NEW")
+
+    def test_due_samples_include_multiple_overdue_horizons_for_one_row(self) -> None:
+        with patch.object(observation_tracker.time, "time", return_value=1_000):
+            self.record()
+
+        due = observation_tracker.due_observation_samples(2_000)
+
+        self.assertEqual(
+            [item[1] for item in due],
+            ["1m", "3m", "5m", "15m"],
+        )
+        self.assertEqual([item[4] for item in due], [1_060, 1_180, 1_300, 1_900])
+
+    def test_horizon_missed_boundary_is_strictly_over_60_seconds(self) -> None:
+        self.assertFalse(observation_tracker.horizon_sample_is_missed(160.0, 100.0))
+        self.assertTrue(observation_tracker.horizon_sample_is_missed(160.0001, 100.0))
+
+    def test_simultaneous_due_samples_use_bounded_concurrency(self) -> None:
+        candidates = [
+            (str(index), "1m", f"MINT-{index}", 1, 100.0)
+            for index in range(8)
+        ]
+        active = 0
+        maximum_active = 0
+
+        async def worker(candidate: tuple[str, str, str, int, float]) -> bool:
+            nonlocal active, maximum_active
+            active += 1
+            maximum_active = max(maximum_active, active)
+            await asyncio.sleep(0.01)
+            active -= 1
+            return candidate[0] != "0"
+
+        results = asyncio.run(observation_tracker.run_due_sample_batch(
+            candidates,
+            worker,
+            concurrency=4,
+        ))
+
+        self.assertEqual(maximum_active, 4)
+        self.assertEqual(results, [False, True, True, True, True, True, True, True])
+
+    def test_runtime_metrics_include_due_backlog_depth_and_oldest_lag(self) -> None:
+        metrics = observation_tracker.observation_runtime_metrics({
+            "observations": [{
+                "observation_id": "PENDING",
+                "status": "PENDING",
+                "started_at_epoch": 100.0,
+                "mint": "MINT",
+                "token_amount_raw": 1,
+                "samples": [],
+            }],
+        }, now_epoch=401.0)
+
+        self.assertEqual(metrics["observer_due_backlog_depth"], 3)
+        self.assertEqual(metrics["observer_oldest_due_lag_seconds"], 241.0)
+
+    def test_record_sample_persists_response_time_and_quote_latency(self) -> None:
+        with patch.object(observation_tracker.time, "time", return_value=1_000):
+            self.record()
+        row = observation_tracker.read_json(
+            observation_tracker.OBSERVATION_PATH,
+            observation_tracker.empty_observations(),
+        )["observations"][0]
+
+        self.assertTrue(observation_tracker.record_sample(
+            row["observation_id"],
+            "1m",
+            proceeds_lamports=1_100,
+            sampled_at_epoch=1_070.0,
+            quote_latency_ms=1_234.5,
+        ))
+        sample = observation_tracker.read_json(
+            observation_tracker.OBSERVATION_PATH,
+            observation_tracker.empty_observations(),
+        )["observations"][0]["samples"][0]
+        self.assertEqual(sample["sample_lag_seconds"], 10.0)
+        self.assertEqual(sample["quote_latency_ms"], 1_234.5)
 
     def test_active_backlog_expires_oldest_unopened_observation(self) -> None:
         with patch.object(observation_tracker, "MAX_ACTIVE_OBSERVATIONS", 2):

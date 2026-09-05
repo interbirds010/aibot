@@ -84,13 +84,13 @@ def _interval_sample(
     return None
 
 
-def _outcome_trackable(row: dict[str, Any]) -> bool:
+def outcome_trackable(row: dict[str, Any]) -> bool:
     """진입 견적 부재로 outcome을 만들 수 없는 신호를 구분한다."""
     quote_status = str(row.get("quote_status") or "").strip().upper()
     return quote_status not in UNTRACKABLE_QUOTE_STATUSES
 
 
-def _missing_outcome_reason(
+def canonical_missing_outcome_reason(
     row: dict[str, Any], sample: dict[str, Any] | None
 ) -> str:
     quote_status = str(row.get("quote_status") or "").strip().upper()
@@ -118,7 +118,13 @@ def _missing_outcome_reason(
     return "UNKNOWN"
 
 
-def _lag_metrics(samples: list[dict[str, Any]]) -> dict[str, Any]:
+# 기존 내부 호출과 테스트 호환성을 유지한다.
+_outcome_trackable = outcome_trackable
+_missing_outcome_reason = canonical_missing_outcome_reason
+
+
+def sampling_timing_metrics(samples: list[dict[str, Any]]) -> dict[str, Any]:
+    """표본 지연과 Jupiter quote latency를 bounded percentile로 요약한다."""
     lags = sorted(
         lag
         for sample in samples
@@ -131,8 +137,28 @@ def _lag_metrics(samples: list[dict[str, Any]]) -> dict[str, Any]:
         "median_sample_lag_seconds": _rounded(_quantile(lags, 0.50)),
         "p90_sample_lag_seconds": _rounded(_quantile(lags, 0.90)),
         "p95_sample_lag_seconds": _rounded(_quantile(lags, 0.95)),
+        "p99_sample_lag_seconds": _rounded(_quantile(lags, 0.99)),
         "max_sample_lag_seconds": _rounded(max(lags) if lags else None),
+        **_quote_latency_metrics(samples),
     }
+
+
+def _quote_latency_metrics(samples: list[dict[str, Any]]) -> dict[str, Any]:
+    latencies = sorted(
+        latency
+        for sample in samples
+        if (latency := _finite_number(sample.get("quote_latency_ms"))) is not None
+        and latency >= 0
+    )
+    return {
+        "quote_latency_sample_count": len(latencies),
+        "median_quote_latency_ms": _rounded(_quantile(latencies, 0.50)),
+        "p95_quote_latency_ms": _rounded(_quantile(latencies, 0.95)),
+        "max_quote_latency_ms": _rounded(max(latencies) if latencies else None),
+    }
+
+
+_lag_metrics = sampling_timing_metrics
 
 
 def _stable_mean(values: list[float]) -> float | None:

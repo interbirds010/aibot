@@ -60,6 +60,34 @@ class CollectionStabilityTests(unittest.TestCase):
         )
         self.assertEqual(report["completed_60m_count"], 1)
 
+    def test_lifecycle_distinguishes_eligible_backlog_from_not_yet_due(self) -> None:
+        report = build_research_lifecycle([
+            row(100, samples=[{
+                "interval": "1m",
+                "return_percent": 2.0,
+                "sample_lag_seconds": 4.0,
+                "quote_latency_ms": 250.0,
+            }]),
+            row(200),
+            row(500),
+        ], now_epoch=400)
+
+        horizon = report["horizons"]["1m"]
+        self.assertEqual(horizon["target_eligible_count"], 2)
+        self.assertEqual(horizon["successful_sample_count"], 1)
+        self.assertEqual(horizon["eligible_missing_count"], 1)
+        self.assertEqual(horizon["not_yet_due_count"], 1)
+        self.assertEqual(horizon["due_backlog_count"], 1)
+        self.assertEqual(horizon["oldest_due_lag_seconds"], 140.0)
+        self.assertEqual(horizon["usable_rate_percent"], 50.0)
+        self.assertEqual(horizon["not_sampled_count"], 1)
+        self.assertEqual(report["due_backlog_depth"], 4)
+        self.assertEqual(report["oldest_due_lag_seconds"], 140.0)
+        self.assertEqual(
+            report["overall_sampling"]["median_quote_latency_ms"],
+            250.0,
+        )
+
     def test_alchemy_gate_requires_sustained_failure_and_sufficient_window(self) -> None:
         lifecycle = {
             "signal_count": 50,

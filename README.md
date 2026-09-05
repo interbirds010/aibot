@@ -112,13 +112,15 @@ Live 모드는 평문 개인키를 거부합니다. 암호화 키의 공개주�
 
 ## Research 수집 안정성 진단
 
-현재 누적 Research lifecycle, horizon별 coverage·missing reason·sample lag, provider circuit 상태와 WebSocket canonical 장애 원인은 endpoint를 출력하지 않는 다음 명령으로 확인합니다.
+현재 누적 Research lifecycle, horizon별 eligible·coverage·missing reason·sample lag p50/p90/p95/p99, due backlog, Jupiter quote latency, provider circuit 상태와 WebSocket canonical 장애 원인은 endpoint를 출력하지 않는 다음 명령으로 확인합니다.
 
 ```powershell
 python -m src.research.collection_stability
 ```
 
 장시간 관찰 전에는 `--write-baseline <PATH>`로 provider 누적값을 저장하고, 관찰 후 `--baseline <PATH>`를 전달하면 해당 구간 delta를 계산합니다. GitHub의 `Research collection observation` workflow도 같은 진단을 수동으로 실행하며 일반 배포를 기다리게 하지 않습니다.
+
+Observer는 15초 cadence와 최대 20개 batch를 유지하되 모든 due horizon을 scheduled `target_at_epoch` 오름차순으로 처리합니다. 한 batch 안에서는 최대 4개 작업만 병행하고 Jupiter의 기존 프로세스 공용 1.25초 request slot을 그대로 준수합니다. target 이후 60초를 넘긴 quote는 과거 horizon 값으로 저장하지 않고 `HORIZON_MISSED`로 마감합니다. 1,000-row 제한은 active observation을 우선 보존하고 terminal history만 제거하지만, active backlog가 200개를 넘으면 가장 오래된 미완료 row를 명시적으로 만료합니다. 따라서 장기 Research 전체 이력은 향후 별도 archive로 분리해야 합니다.
 
 Alchemy Free 추가는 자동화하지 않습니다. 동일 관찰 구간에 Research signal 50건 이상과 Solana Public 요청 100건 이상이 모두 쌓였을 때만 판단하며, `RPC_ALL_PROVIDERS_EXHAUSTED`가 5건 이상이면서 signal의 25% 이상이고 Public 성공률도 90% 미만인 세 조건이 동시에 지속될 때 추가를 권고합니다. 이 기준은 수집 인프라 운영 기준이며 거래·전략 threshold가 아닙니다. 표본이 그보다 작거나 조건 중 하나라도 충족하지 않으면 Public RPC 관찰을 유지합니다.
 
