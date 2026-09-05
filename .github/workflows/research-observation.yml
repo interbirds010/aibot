@@ -105,6 +105,7 @@ jobs:
                     f"event_trackable={event['trackable_count']} "
                     f"event_sampled={event['sampled_count']} "
                     f"event_missing={event['missing_count']} "
+                    f"event_missing_reasons={json.dumps(event['missing_reasons'], sort_keys=True)} "
                     f"event_raw_coverage={event['raw_coverage_rate_percent']} "
                     f"event_trackable_coverage={event['trackable_coverage_rate_percent']} "
                     f"unique_trackable={unique['trackable_count']} "
