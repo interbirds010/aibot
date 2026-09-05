@@ -17,7 +17,7 @@ jobs:
     name: Deploy to Ubuntu
     runs-on: ubuntu-latest
     environment: production
-    timeout-minutes: 15
+    timeout-minutes: 25
 
     steps:
       - name: Check out main
@@ -75,6 +75,7 @@ jobs:
                 "shadow_trades.json",
                 "paper_trades.json",
                 "wallet_performance.json",
+                "global_metrics.json",
             )
 
             def sized(value):
@@ -108,11 +109,23 @@ jobs:
                         "position_count": sized(document.get("positions")),
                         "event_count": sized(document.get("events")),
                     }
+                if name == "global_metrics.json":
+                    metrics = document.get("metrics")
+                    if not isinstance(metrics, dict):
+                        raise RuntimeError("global metrics are malformed")
+                    return {
+                        "metric_count": len(metrics),
+                        "observer_state": metrics.get("observer_state"),
+                        "pending_research_observations": metrics.get(
+                            "pending_research_observations"
+                        ),
+                    }
                 return {"wallet_count": sized(document.get("wallets"))}
 
             manifest = {
                 "deploy_sha": deploy_sha,
                 "created_at": datetime.now(timezone.utc).isoformat(),
+                "created_at_epoch": datetime.now(timezone.utc).timestamp(),
                 "files": {},
             }
             for name in names:
@@ -147,6 +160,25 @@ jobs:
                 print(
                     f"BACKUP_FILE name={name} exists=true summary={summary}"
                 )
+
+            provider_state_root = root / "solana_rpc_providers"
+            manifest["rpc_provider_states"] = {}
+            for provider in (
+                "alchemy", "chainstack", "ankr", "helius", "solana_public"
+            ):
+                state_path = provider_state_root / f"{provider}.json"
+                if not state_path.exists():
+                    continue
+                state = json.loads(state_path.read_text(encoding="utf-8"))
+                if not isinstance(state, dict):
+                    raise RuntimeError(f"RPC provider state malformed: {provider}")
+                manifest["rpc_provider_states"][provider] = {
+                    key: state.get(key)
+                    for key in (
+                        "request_count", "success_count", "failure_count",
+                        "rate_limit_count", "circuit_state",
+                    )
+                }
 
             manifest_path = target / "manifest.json"
             temporary = target / "manifest.json.tmp"
@@ -432,6 +464,98 @@ jobs:
             )
             PY
 
+            ./venv/bin/python - <<'PY'
+            import asyncio
+
+            import aiohttp
+
+            from src.solana_rpc import (
+                canonical_rpc_failure_reason,
+                provider_configs_from_env,
+                provider_state,
+                solana_rpc_call,
+            )
+
+            async def main():
+                providers = provider_configs_from_env()
+                names = ",".join(provider.name for provider in providers)
+                print(f"RPC_ACTIVE_PROVIDERS names={names or 'NONE'}")
+                timeout = aiohttp.ClientTimeout(total=10)
+                async with aiohttp.ClientSession(timeout=timeout) as session:
+                    for provider in providers:
+                        outcome = "SUCCESS"
+                        reason = "NONE"
+                        try:
+                            await solana_rpc_call(
+                                session,
+                                "getHealth",
+                                [],
+                                workload="deployment_smoke",
+                                providers=[provider],
+                                provider_local_attempts=1,
+                                overall_attempt_budget=1,
+                            )
+                        except Exception as exc:
+                            outcome = "FAILURE"
+                            reason = (
+                                canonical_rpc_failure_reason(exc)
+                                or type(exc).__name__
+                            )
+                        state = provider_state(provider.name, providers)
+                        print(
+                            "RPC_PROVIDER_SMOKE "
+                            f"provider={provider.name} enabled={state['enabled']} "
+                            f"outcome={outcome} reason={reason} "
+                            f"requests={state['request_count']} "
+                            f"successes={state['success_count']} "
+                            f"failures={state['failure_count']} "
+                            f"rate_limits={state['rate_limit_count']} "
+                            f"circuit={state['circuit_state']} "
+                            f"last_success={state['last_success_at_epoch']}"
+                        )
+
+                    before = {
+                        provider.name: int(
+                            provider_state(provider.name, providers).get(
+                                "success_count", 0
+                            ) or 0
+                        )
+                        for provider in providers
+                    }
+                    result = "SUCCESS"
+                    reason = "NONE"
+                    try:
+                        await solana_rpc_call(
+                            session,
+                            "getHealth",
+                            [],
+                            workload="deployment_smoke",
+                            providers=providers,
+                        )
+                    except Exception as exc:
+                        result = "FAILURE"
+                        reason = (
+                            canonical_rpc_failure_reason(exc)
+                            or type(exc).__name__
+                        )
+                    winners = [
+                        provider.name
+                        for provider in providers
+                        if int(
+                            provider_state(provider.name, providers).get(
+                                "success_count", 0
+                            ) or 0
+                        ) > before[provider.name]
+                    ]
+                    print(
+                        "RPC_ROUTER_SMOKE "
+                        f"outcome={result} reason={reason} "
+                        f"successful_provider={','.join(winners) or 'NONE'}"
+                    )
+
+            asyncio.run(main())
+            PY
+
             ./venv/bin/python -m src.research.alpha_discovery
             ./venv/bin/python - <<'PY'
             import json
@@ -459,6 +583,195 @@ jobs:
                 f"unstable={counts['UNSTABLE']} "
                 f"insufficient={counts['INSUFFICIENT_DATA']}"
             )
+            PY
+
+            # Observe real market traffic only. Six minutes covers the first
+            # 1m/3m/5m horizons without holding deployment for the 60m result.
+            sleep 360
+            ./venv/bin/python -m src.research.alpha_discovery
+            ./venv/bin/python - "$DEPLOY_SHA" <<'PY'
+            import json
+            import subprocess
+            import sys
+            import time
+            from collections import Counter
+            from pathlib import Path
+
+            from src.solana_rpc import provider_configs_from_env, provider_state
+
+            deploy_sha = sys.argv[1]
+            backup_root = Path("/home/deploy/aibot-backups")
+            marker = backup_root / f"latest-{deploy_sha}.txt"
+            backup_dir = Path(marker.read_text(encoding="utf-8").strip())
+            manifest = json.loads(
+                (backup_dir / "manifest.json").read_text(encoding="utf-8")
+            )
+            since_epoch = float(manifest["created_at_epoch"])
+            observations = json.loads(
+                Path("data/signal_observations.json").read_text(encoding="utf-8")
+            )
+            rows = observations.get("observations")
+            if not isinstance(rows, list):
+                raise SystemExit("signal observation rows are malformed")
+            new_rows = [
+                row for row in rows
+                if isinstance(row, dict)
+                and float(row.get("started_at_epoch", 0) or 0) >= since_epoch
+            ]
+
+            def reasons(row):
+                values = row.get("decision_reasons")
+                return {
+                    str(value).upper()
+                    for value in values if isinstance(value, str)
+                } if isinstance(values, list) else set()
+
+            analyzer_success = sum(
+                1 for row in new_rows
+                if row.get("analysis_completed_at")
+                and str(row.get("decision_status") or "").upper()
+                != "DISCOVERED"
+            )
+            all_exhausted = sum(
+                "RPC_ALL_PROVIDERS_EXHAUSTED" in reasons(row)
+                for row in new_rows
+            )
+            processing_failed = sum(
+                str(row.get("quote_status") or "").upper()
+                == "PROCESSING_FAILED"
+                for row in new_rows
+            )
+            executable = sum(
+                str(row.get("quote_status") or "").upper() == "EXECUTABLE"
+                for row in new_rows
+            )
+            pending_trackable = sum(
+                str(row.get("quote_status") or "").upper() == "EXECUTABLE"
+                and str(row.get("status") or "").upper() == "PENDING"
+                and row.get("tracking_profile") == "research_v1_60m"
+                for row in new_rows
+            )
+            sample_counts = Counter(
+                str(sample.get("interval"))
+                for row in new_rows
+                for sample in (
+                    row.get("samples") if isinstance(row.get("samples"), list)
+                    else []
+                )
+                if isinstance(sample, dict)
+            )
+            print(
+                "RESEARCH_FUNNEL "
+                f"signals={len(new_rows)} analyzer_success={analyzer_success} "
+                f"rpc_all_providers_exhausted={all_exhausted} "
+                f"processing_failed={processing_failed} "
+                f"executable={executable} "
+                f"pending_trackable={pending_trackable}"
+            )
+            print(
+                "RESEARCH_HORIZONS "
+                f"sample_1m={sample_counts['1m']} "
+                f"sample_3m={sample_counts['3m']} "
+                f"sample_5m={sample_counts['5m']} "
+                f"first_executable_pending={pending_trackable > 0}"
+            )
+
+            stranded = [
+                row for row in rows
+                if isinstance(row, dict)
+                and str(row.get("status") or "").upper() == "DISCOVERED"
+                and str(row.get("decision_status") or "").upper() == "DISCOVERED"
+                and str(row.get("quote_status") or "").upper() == "NOT_REQUESTED"
+            ]
+            ages = [
+                max(0.0, time.time() - float(row.get("started_at_epoch", 0) or 0))
+                for row in stranded
+                if float(row.get("started_at_epoch", 0) or 0) > 0
+            ]
+            print(
+                "STRANDED_DISCOVERED "
+                f"count={len(stranded)} "
+                f"missing_analysis_completed={sum(not row.get('analysis_completed_at') for row in stranded)} "
+                f"empty_decision_reasons={sum(not row.get('decision_reasons') for row in stranded)} "
+                f"oldest_age_seconds={max(ages) if ages else None} "
+                f"newest_age_seconds={min(ages) if ages else None}"
+            )
+
+            providers = provider_configs_from_env()
+            baseline_states = manifest.get("rpc_provider_states", {})
+            for provider in providers:
+                state = provider_state(provider.name, providers)
+                baseline = baseline_states.get(provider.name, {})
+                print(
+                    "RPC_PROVIDER_DELTA "
+                    f"provider={provider.name} enabled={state['enabled']} "
+                    f"requests={state['request_count']} "
+                    f"successes={state['success_count']} "
+                    f"failures={state['failure_count']} "
+                    f"rate_limits={state['rate_limit_count']} "
+                    f"request_delta={int(state['request_count']) - int(baseline.get('request_count', 0) or 0)} "
+                    f"success_delta={int(state['success_count']) - int(baseline.get('success_count', 0) or 0)} "
+                    f"failure_delta={int(state['failure_count']) - int(baseline.get('failure_count', 0) or 0)} "
+                    f"rate_limit_delta={int(state['rate_limit_count']) - int(baseline.get('rate_limit_count', 0) or 0)} "
+                    f"circuit={state['circuit_state']} "
+                    f"last_success={state['last_success_at_epoch']}"
+                )
+
+            metrics_document = json.loads(
+                Path("data/global_metrics.json").read_text(encoding="utf-8")
+            )
+            metrics = metrics_document.get("metrics", {})
+            ws_heartbeat = metrics.get("monitor_process_heartbeat_at")
+            print(
+                "COLLECTION_HEALTH "
+                f"wallet_ws_state={metrics.get('wallet_ws_state')} "
+                f"monitor_heartbeat_age_seconds="
+                f"{time.time() - ws_heartbeat if isinstance(ws_heartbeat, (int, float)) else None} "
+                f"observer_state={metrics.get('observer_state')}"
+            )
+
+            alpha = json.loads(
+                Path("data/alpha_discovery.json").read_text(encoding="utf-8")
+            )
+            candidate_fields = {
+                "family", "analysis_type", "labels", "status",
+                "sampled_count", "trackable_coverage_rate_percent",
+                "train_expectancy_percent", "holdout_expectancy_percent",
+                "train_profit_factor", "holdout_profit_factor",
+                "holdout_expectancy_retention_ratio",
+            }
+            top_candidates = alpha.get("top_candidates")
+            top_candidates = top_candidates if isinstance(top_candidates, list) else []
+            missing_top_fields = sorted({
+                field
+                for candidate in top_candidates
+                if isinstance(candidate, dict)
+                for field in candidate_fields - set(candidate)
+            })
+            print(
+                "ALPHA_DASHBOARD_READINESS "
+                f"families={isinstance(alpha.get('families'), dict)} "
+                f"candidate_counts={isinstance(alpha.get('candidate_counts'), dict)} "
+                f"top_candidates={isinstance(alpha.get('top_candidates'), list)} "
+                f"missing_top_fields={','.join(missing_top_fields) or 'NONE'} "
+                f"has_flat_unstable_candidates="
+                f"{isinstance(alpha.get('unstable_candidates'), list)}"
+            )
+
+            apps = json.loads(subprocess.check_output(["pm2", "jlist"]))
+            wanted = {
+                "aibot-monitor", "aibot-risk-manager",
+                "aibot-dashboard", "wallet_feeder",
+            }
+            for app in apps:
+                if app.get("name") not in wanted:
+                    continue
+                env = app.get("pm2_env", {})
+                print(
+                    "PM2_DELAYED_HEALTH "
+                    f"name={app.get('name')} status={env.get('status')} "
+                    f"pid={app.get('pid')} restarts={env.get('restart_time', 0)}"
+                )
             PY
 
             upstream_status="$(curl --silent --show-error --output /dev/null \
