@@ -1,14 +1,19 @@
 from __future__ import annotations
 
+import copy
+import io
 import json
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 
 from src.research.alpha_regime_review import (
     CANDIDATES,
     MAX_TIME_BLOCKS,
+    MAX_OUTPUT_LINE_CHARS,
     _utc_time_blocks,
     build_alpha_regime_review,
+    emit_alpha_regime_report,
     expanding_performance,
     extreme_sensitivity,
     holdout_concentration,
@@ -114,6 +119,33 @@ class AlphaRegimeMetricTests(unittest.TestCase):
 
 
 class AlphaRegimeReviewTests(unittest.TestCase):
+    def test_section_output_is_bounded_and_does_not_mutate_result(self) -> None:
+        report = build_alpha_regime_review(
+            [
+                momentum_event(index, -5.0 if index < 80 else 10.0)
+                for index in range(100)
+            ],
+            {"candidate_counts": {
+                "PROMISING": 0,
+                "UNSTABLE": 26,
+                "INSUFFICIENT_DATA": 252,
+            }},
+        )
+        original = copy.deepcopy(report)
+        output = io.StringIO()
+
+        with redirect_stdout(output):
+            emit_alpha_regime_report(report)
+
+        lines = output.getvalue().splitlines()
+        self.assertTrue(lines)
+        self.assertLessEqual(max(map(len, lines)), MAX_OUTPUT_LINE_CHARS)
+        self.assertEqual(report, original)
+        self.assertNotIn("ALPHA_REGIME_REVIEW {", output.getvalue())
+        for section in "ABCDEFGHIJK":
+            self.assertIn(f"ALPHA_REGIME_SECTION_{section}_", output.getvalue())
+        self.assertIn("ALPHA_REGIME_FINAL_VERDICT", output.getvalue())
+
     def test_observation_workflow_runs_read_only_review(self) -> None:
         workflow = Path(".github/workflows/research-observation.yml").read_text(
             encoding="utf-8"

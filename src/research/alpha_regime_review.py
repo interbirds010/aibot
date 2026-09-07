@@ -31,6 +31,7 @@ BOOTSTRAP_ITERATIONS = 1_000
 ROLLING_WINDOWS = (30, 50, 100)
 MAX_LATEST_WINDOWS = 5
 MAX_TIME_BLOCKS = 24
+MAX_OUTPUT_LINE_CHARS = 8_000
 HISTOGRAM_CUTS = (-100, -50, -20, -10, 0, 10, 25, 50, 100, 200, 500)
 
 
@@ -634,6 +635,158 @@ def build_alpha_regime_review(raw_rows: list[Any], alpha_report: dict[str, Any])
     }
 
 
+def _emit_record(prefix: str, payload: Any) -> None:
+    """GitHub/SSH 로그의 단일 행 제한보다 작게 JSON record를 출력한다."""
+    encoded = json.dumps(
+        payload, ensure_ascii=True, sort_keys=True, separators=(",", ":")
+    )
+    available = max(1, MAX_OUTPUT_LINE_CHARS - len(prefix) - 40)
+    if len(encoded) <= available:
+        print(f"{prefix} {encoded}")
+        return
+    chunks = [encoded[index:index + available] for index in range(0, len(encoded), available)]
+    for index, chunk in enumerate(chunks, 1):
+        print(f"{prefix}_CHUNK part={index}/{len(chunks)} data={chunk}")
+
+
+def _recent_positive_block_run(blocks: list[dict[str, Any]]) -> int:
+    run = 0
+    for block in reversed(blocks):
+        if (
+            (block.get("expectancy_percent") or 0) > 0
+            and _profit_factor_above_one(block)
+        ):
+            run += 1
+        else:
+            break
+    return run
+
+
+def emit_alpha_regime_report(result: dict[str, Any]) -> None:
+    """계산 결과를 A-K bounded section으로만 전달한다."""
+    smart = result["smart_money"]
+    momentum = result["momentum"]
+    candidates = momentum["candidates"]
+
+    _emit_record("ALPHA_REGIME_SECTION_A_DATASET", {
+        "basis": result["basis"],
+        "SMART_MONEY": smart["inventory"],
+        "MOMENTUM": momentum["inventory"],
+    })
+
+    smart_review = smart["production_candidate_review"]
+    _emit_record("ALPHA_REGIME_SECTION_B_SMART_MONEY", {
+        "verdict": smart["verdict"],
+        "overall": smart["overall"],
+        "chronological_80_20": smart["chronological_80_20"],
+        "candidate_counts": {
+            key: smart_review.get(key)
+            for key in ("evaluated", "PROMISING", "UNSTABLE", "INSUFFICIENT_DATA")
+        },
+        "gate_failure_distribution": smart_review.get(
+            "gate_failure_distribution", {}
+        ),
+    })
+    for index, evidence in enumerate(smart_review.get("near_misses", []), 1):
+        _emit_record(
+            "ALPHA_REGIME_SECTION_B_SMART_EVIDENCE",
+            {"rank": index, **evidence},
+        )
+
+    _emit_record("ALPHA_REGIME_SECTION_C_MOMENTUM_OVERALL", momentum["overall"])
+    for period in momentum["quartiles"]:
+        _emit_record("ALPHA_REGIME_SECTION_C_MOMENTUM_QUARTILE", period)
+    for period in momentum["quintiles"]:
+        _emit_record("ALPHA_REGIME_SECTION_C_MOMENTUM_QUINTILE", period)
+
+    for key, candidate in candidates.items():
+        identity = {"candidate": key, "feature": candidate["feature"], "label": candidate["label"]}
+        for window, summary in candidate["rolling"].items():
+            if summary is None:
+                _emit_record(
+                    "ALPHA_REGIME_SECTION_D_ROLLING",
+                    {**identity, "window": int(window), "available": False},
+                )
+                continue
+            _emit_record("ALPHA_REGIME_SECTION_D_ROLLING", {
+                **identity,
+                "available": True,
+                "window": int(window),
+                "window_count": summary["window_count"],
+                "latest": summary["latest"][-1],
+                "positive_expectancy_window_rate_percent": summary[
+                    "positive_expectancy_window_rate_percent"
+                ],
+                "profit_factor_above_one_window_rate_percent": summary[
+                    "profit_factor_above_one_window_rate_percent"
+                ],
+                "maximum_consecutive_positive_expectancy_windows": summary[
+                    "maximum_consecutive_positive_expectancy_windows"
+                ],
+                "maximum_consecutive_positive_expectancy_and_pf_windows": summary[
+                    "maximum_consecutive_positive_expectancy_and_pf_windows"
+                ],
+                "minimum_expectancy_percent": summary["minimum_expectancy_percent"],
+                "maximum_expectancy_percent": summary["maximum_expectancy_percent"],
+                "overlapping_windows": True,
+            })
+        _emit_record("ALPHA_REGIME_SECTION_E_EXPANDING", {
+            **identity,
+            "checkpoints": candidate["expanding"],
+        })
+        _emit_record("ALPHA_REGIME_SECTION_F_EXTREME_SENSITIVITY", {
+            **identity,
+            "overall": candidate["extreme_sensitivity"],
+            "production_80_20_holdout": candidate[
+                "holdout_extreme_sensitivity"
+            ],
+        })
+        _emit_record("ALPHA_REGIME_SECTION_G_DRAWDOWN_STREAK", {
+            **identity,
+            **candidate["drawdown_and_streak"],
+        })
+        _emit_record("ALPHA_REGIME_SECTION_I_HOLDOUT_CONCENTRATION", {
+            **identity,
+            **candidate["holdout_concentration"],
+        })
+        _emit_record("ALPHA_REGIME_SECTION_J_MULTI_SPLIT", {
+            **identity,
+            "splits": candidate["pseudo_holdouts"],
+        })
+        time_blocks = candidate["utc_two_day_blocks"]
+        latest_blocks = time_blocks["latest_blocks"]
+        _emit_record("ALPHA_REGIME_SECTION_K_MULTIPLE_TESTING_TIME_BLOCK", {
+            **identity,
+            "multiple_testing": candidate["multiple_testing_diagnostic"],
+            "diagnostic_verdict": candidate["diagnostic_verdict"],
+            "time_blocks": {
+                "total_block_count": time_blocks["total_block_count"],
+                "positive_block_count": time_blocks["positive_block_count"],
+                "omitted_older_block_count": time_blocks[
+                    "omitted_older_block_count"
+                ],
+                "latest_positive_block_run": _recent_positive_block_run(
+                    latest_blocks
+                ),
+                "latest_five_blocks": latest_blocks[-5:],
+            },
+        })
+
+    for overlap in momentum["candidate_overlap"]:
+        _emit_record("ALPHA_REGIME_SECTION_H_OVERLAP", overlap)
+
+    _emit_record("ALPHA_REGIME_SECTION_K_MULTIPLE_TESTING_SUMMARY", {
+        **result["multiple_testing"],
+        "momentum_time_blocks": momentum["utc_two_day_blocks"],
+        "candidate_verdict_counts": momentum["candidate_verdict_counts"],
+    })
+    _emit_record("ALPHA_REGIME_FINAL_VERDICT", {
+        "SMART_MONEY": smart["verdict"],
+        "MOMENTUM": momentum["verdict"],
+        "read_only": result["read_only"],
+    })
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Run read-only Alpha regime review")
     parser.add_argument("--archive", type=Path, default=RESEARCH_ARCHIVE_PATH)
@@ -646,10 +799,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     alpha_report = read_json(args.alpha_report, {})
     result = build_alpha_regime_review(rows, alpha_report)
-    print(
-        "ALPHA_REGIME_REVIEW "
-        + json.dumps(result, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-    )
+    emit_alpha_regime_report(result)
     return 0
 
 
