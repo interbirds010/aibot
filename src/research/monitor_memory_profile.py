@@ -19,6 +19,7 @@ MONITOR_NAME = "aibot-monitor"
 MIN_DURATION_SECONDS = 60
 MAX_DURATION_SECONDS = 1_800
 DEFAULT_INTERVAL_SECONDS = 10.0
+MAX_RSS_STEP_EVENTS = 20
 SERIES_KEYS = (
     "asyncio_live_task_count",
     "signal_task_count",
@@ -26,6 +27,7 @@ SERIES_KEYS = (
     "shadow_signal_task_count",
     "shadow_signal_done_task_count",
     "analyzer_cache_entry_count",
+    "analyzer_cache_estimated_bytes",
     "analyzer_flight_task_count",
     "analyzer_done_flight_task_count",
     "signature_window_size",
@@ -47,6 +49,7 @@ COUNTER_KEYS = (
     "monitor_signal_task_completed_count",
     "monitor_shadow_signal_task_created_count",
     "monitor_shadow_signal_task_completed_count",
+    "monitor_transaction_payload_count",
 )
 
 
@@ -132,6 +135,125 @@ def _final_pid_slope(samples: list[dict[str, Any]]) -> float | None:
     )
 
 
+def _phase_count(sample: dict[str, Any], phase: str) -> int | None:
+    stats = sample.get("monitor_memory_phase_stats")
+    if not isinstance(stats, dict):
+        return None
+    values = stats.get(phase)
+    return _integer(values.get("count")) if isinstance(values, dict) else None
+
+
+def _phase_window_stats(samples: list[dict[str, Any]]) -> dict[str, Any]:
+    phases = sorted({
+        str(phase)
+        for sample in samples
+        for phase in (
+            sample.get("monitor_memory_phase_stats", {}).keys()
+            if isinstance(sample.get("monitor_memory_phase_stats"), dict)
+            else ()
+        )
+    })
+    results: dict[str, Any] = {}
+    for phase in phases:
+        counts = [
+            count for sample in samples
+            if (count := _phase_count(sample, phase)) is not None
+        ]
+        last = next((
+            values
+            for sample in reversed(samples)
+            if isinstance((stats := sample.get("monitor_memory_phase_stats")), dict)
+            and isinstance((values := stats.get(phase)), dict)
+        ), {})
+        results[phase] = {
+            "start_count": counts[0] if counts else None,
+            "end_count": counts[-1] if counts else None,
+            "count_delta": _nested_counter_delta(samples, phase),
+            "max_after_rss_bytes": _integer(last.get("max_after_rss_bytes")),
+            "max_rss_increase_bytes": _integer(
+                last.get("max_rss_increase_bytes")
+            ),
+        }
+    return results
+
+
+def _nested_counter_delta(samples: list[dict[str, Any]], phase: str) -> int:
+    flattened = [
+        {
+            "pid": sample.get("pid"),
+            "phase_count": _phase_count(sample, phase),
+        }
+        for sample in samples
+    ]
+    return _counter_delta(flattened, "phase_count")
+
+
+def _largest_rss_steps(samples: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    events: list[dict[str, Any]] = []
+    phases = sorted({
+        str(phase)
+        for sample in samples
+        for phase in (
+            sample.get("monitor_memory_phase_stats", {}).keys()
+            if isinstance(sample.get("monitor_memory_phase_stats"), dict)
+            else ()
+        )
+    })
+    for previous, current in zip(samples, samples[1:]):
+        if previous.get("pid") != current.get("pid"):
+            continue
+        before = _integer(previous.get("rss_bytes"))
+        after = _integer(current.get("rss_bytes"))
+        if before is None or after is None:
+            continue
+        phase_deltas = {
+            phase: current_count - previous_count
+            for phase in phases
+            if (previous_count := _phase_count(previous, phase)) is not None
+            and (current_count := _phase_count(current, phase)) is not None
+            and current_count >= previous_count
+            and current_count != previous_count
+        }
+        counter_deltas = {
+            key: current_count - previous_count
+            for key in COUNTER_KEYS
+            if (previous_count := _integer(previous.get(key))) is not None
+            and (current_count := _integer(current.get(key))) is not None
+            and current_count >= previous_count
+            and current_count != previous_count
+        }
+        events.append({
+            "sampled_at_epoch": _number(current.get("sampled_at_epoch")),
+            "rss_delta_bytes": after - before,
+            "rss_bytes": after,
+            "vms_bytes": _integer(current.get("vms_bytes")),
+            "asyncio_live_task_count": _integer(
+                current.get("monitor_asyncio_live_task_count")
+            ),
+            "signal_task_count": _integer(
+                current.get("monitor_signal_task_count")
+            ),
+            "shadow_signal_task_count": _integer(
+                current.get("monitor_shadow_signal_task_count")
+            ),
+            "analyzer_cache_entry_count": _integer(
+                current.get("monitor_analyzer_cache_entry_count")
+            ),
+            "signature_window_size": _integer(
+                current.get("monitor_signature_window_size")
+            ),
+            "pending_research": _integer(
+                current.get("pending_research_observations")
+            ),
+            "phase_deltas": phase_deltas,
+            "counter_deltas": counter_deltas,
+        })
+    return sorted(
+        events,
+        key=lambda item: (-item["rss_delta_bytes"], item["sampled_at_epoch"] or 0),
+    )[:MAX_RSS_STEP_EVENTS]
+
+
 def summarize_memory_samples(
     samples: list[dict[str, Any]], *, deployed_sha: str
 ) -> dict[str, Any]:
@@ -176,7 +298,7 @@ def summarize_memory_samples(
         ]
         series[key] = _series(values)
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "deployed_sha": sha,
         "sample_count": len(samples),
         "pid_count": len({sample.get("pid") for sample in samples if sample.get("pid")}),
@@ -213,6 +335,8 @@ def summarize_memory_samples(
             samples[-1].get("monitor_memory_phase_stats", {})
             if samples else {}
         ),
+        "phase_window_stats": _phase_window_stats(samples),
+        "largest_rss_steps": _largest_rss_steps(samples),
         "websocket_mode_at_end": (
             samples[-1].get("wallet_ws_mode") if samples else None
         ),

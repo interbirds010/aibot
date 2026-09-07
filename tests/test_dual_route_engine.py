@@ -400,6 +400,30 @@ class MarketMomentumTests(unittest.TestCase):
             shadows[0].rejection_reasons,
             ("MOMENTUM_VOLUME_UNDER_MIN",),
         )
+
+    def test_momentum_payloads_are_projected_without_overlapping_fetches(self) -> None:
+        active = 0
+        maximum_active = 0
+        calls: list[str] = []
+
+        async def fetch(_session, url, **_params):
+            nonlocal active, maximum_active
+            active += 1
+            maximum_active = max(maximum_active, active)
+            calls.append(url)
+            await asyncio.sleep(0)
+            active -= 1
+            return {"pairs": []} if "search" in url else []
+
+        with patch.object(monitor, "_dexscreener_json", new=fetch):
+            asyncio.run(monitor.fetch_momentum_candidate_cohorts(object()))
+
+        self.assertEqual(maximum_active, 1)
+        self.assertEqual(calls, [
+            monitor.DEX_SCREENER_SEARCH_URL,
+            monitor.DEX_SCREENER_PROFILES_URL,
+            monitor.DEX_SCREENER_BOOSTS_URL,
+        ])
     def test_route_a_never_inherits_relaxed_route_b_analysis(self) -> None:
         self.assertTrue(monitor.route_report_allowed("A", "A"))
         self.assertFalse(monitor.route_report_allowed("A", "B"))

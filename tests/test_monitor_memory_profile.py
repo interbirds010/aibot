@@ -20,6 +20,13 @@ class MonitorMemoryProfileTests(unittest.TestCase):
                 "monitor_memory_vms_bytes": 500 * mib,
                 "monitor_memory_system_available_bytes": 300 * mib,
                 "wallet_ws_notification_process_count": 4,
+                "monitor_memory_phase_stats": {
+                    "momentum_candidate_fetch": {
+                        "count": 10,
+                        "max_after_rss_bytes": 120 * mib,
+                        "max_rss_increase_bytes": 20 * mib,
+                    }
+                },
             },
             {
                 "sampled_at_epoch": 160.0,
@@ -32,6 +39,13 @@ class MonitorMemoryProfileTests(unittest.TestCase):
                 "monitor_memory_vms_bytes": 480 * mib,
                 "monitor_memory_system_available_bytes": 280 * mib,
                 "wallet_ws_notification_process_count": 1,
+                "monitor_memory_phase_stats": {
+                    "momentum_candidate_fetch": {
+                        "count": 1,
+                        "max_after_rss_bytes": 80 * mib,
+                        "max_rss_increase_bytes": 5 * mib,
+                    }
+                },
             },
             {
                 "sampled_at_epoch": 220.0,
@@ -44,6 +58,13 @@ class MonitorMemoryProfileTests(unittest.TestCase):
                 "monitor_memory_vms_bytes": 485 * mib,
                 "monitor_memory_system_available_bytes": 290 * mib,
                 "wallet_ws_notification_process_count": 3,
+                "monitor_memory_phase_stats": {
+                    "momentum_candidate_fetch": {
+                        "count": 4,
+                        "max_after_rss_bytes": 90 * mib,
+                        "max_rss_increase_bytes": 8 * mib,
+                    }
+                },
             },
         ]
 
@@ -64,6 +85,17 @@ class MonitorMemoryProfileTests(unittest.TestCase):
         self.assertEqual(
             report["counter_deltas"]["wallet_ws_notification_process_count"],
             3,
+        )
+        self.assertEqual(
+            report["phase_window_stats"]["momentum_candidate_fetch"][
+                "count_delta"
+            ],
+            4,
+        )
+        self.assertEqual(report["largest_rss_steps"][0]["rss_delta_bytes"], 10 * mib)
+        self.assertEqual(
+            report["largest_rss_steps"][0]["phase_deltas"],
+            {"momentum_candidate_fetch": 3},
         )
 
     def test_invalid_sha_is_not_echoed(self) -> None:

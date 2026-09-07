@@ -1640,20 +1640,22 @@ async def fetch_momentum_candidate_cohorts(
     session: aiohttp.ClientSession,
 ) -> tuple[list[MomentumCandidate], list[MomentumShadowCandidate]]:
     """승인 후보와 현행 임계값 바로 아래 shadow 후보를 함께 반환한다."""
-    search, profiles, boosts = await asyncio.gather(
-        _dexscreener_json(session, DEX_SCREENER_SEARCH_URL, q="solana"),
-        _dexscreener_json(session, DEX_SCREENER_PROFILES_URL),
-        _dexscreener_json(session, DEX_SCREENER_BOOSTS_URL),
-    )
     pairs: list[dict[str, Any]] = []
+    # 세 응답을 동시에 보존하면 매 5초마다 큰 JSON object graph의 수명이
+    # 겹친다. 기존 처리 순서를 유지하되 필요한 bounded projection만 남긴다.
+    search = await _dexscreener_json(
+        session, DEX_SCREENER_SEARCH_URL, q="solana"
+    )
     if isinstance(search, dict):
         for pair in search.get("pairs") or []:
             if isinstance(pair, dict):
                 pairs.append(pair)
             if len(pairs) >= MOMENTUM_MAX_RAW_PAIRS:
                 break
+    del search
     discovered_mints: list[str] = []
-    for payload in (profiles, boosts):
+    for url in (DEX_SCREENER_PROFILES_URL, DEX_SCREENER_BOOSTS_URL):
+        payload = await _dexscreener_json(session, url)
         rows = payload if isinstance(payload, list) else [payload]
         for row in rows:
             if not isinstance(row, dict) or row.get("chainId") != "solana":
@@ -1663,6 +1665,7 @@ async def fetch_momentum_candidate_cohorts(
                 discovered_mints.append(mint)
             if len(discovered_mints) >= MOMENTUM_MAX_DISCOVERY_TOKENS:
                 break
+        del rows, payload
     if discovered_mints:
         token_pairs = await _dexscreener_json(
             session,

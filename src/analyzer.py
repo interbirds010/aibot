@@ -15,6 +15,7 @@ import aiohttp
 from dotenv import load_dotenv
 from solders.pubkey import Pubkey
 from src.logging_utils import configure_safe_logging, redact_sensitive_text
+from src.runtime_memory import estimate_object_size_bytes
 from src.solana_rpc import provider_configs_from_env, solana_rpc_call
 
 RUGCHECK_BASE = "https://api.rugcheck.xyz/v1/tokens"
@@ -318,9 +319,14 @@ _analysis_cache_lock = asyncio.Lock()
 
 
 def analyzer_runtime_metrics() -> dict[str, int]:
-    """분석기 single-flight/cache의 크기만 노출하는 운영 진단 지표다."""
+    """분석기 cache의 개수와 내용 비노출 크기만 운영 지표로 제공한다."""
+    cache_bytes, truncated = estimate_object_size_bytes(
+        _analysis_cache, maximum_nodes=5_000
+    )
     return {
         "monitor_analyzer_cache_entry_count": len(_analysis_cache),
+        "monitor_analyzer_cache_estimated_bytes": cache_bytes,
+        "monitor_analyzer_cache_size_estimate_truncated": int(truncated),
         "monitor_analyzer_flight_task_count": len(_analysis_flights),
         "monitor_analyzer_done_flight_task_count": sum(
             task.done() for task in _analysis_flights.values()
