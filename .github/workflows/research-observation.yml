@@ -78,6 +78,7 @@ jobs:
             ./venv/bin/python -m src.observation_analysis
             ./venv/bin/python -m src.research.alpha_discovery
             ./venv/bin/python -m src.research.alpha_review
+            ./venv/bin/python -m src.research.alpha_regime_review
             ./venv/bin/python - <<'PY'
             import json
             from pathlib import Path
