@@ -26,6 +26,7 @@ from websockets.exceptions import ConnectionClosed, InvalidHandshake, InvalidSta
 from src import state_store
 from src.solana_rpc import (
     SolanaRpcExhaustedError,
+    SolanaRpcRateLimitExhaustedError,
     canonical_rpc_failure_reason,
     solana_rpc_call,
 )
@@ -37,6 +38,11 @@ from src.runtime_memory import (
     runtime_memory_metrics,
 )
 from src.research.prospective_features import MomentumSnapshotStore
+from src.research.coverage_telemetry import (
+    flush_coverage_telemetry,
+    record_confirmation_result,
+    record_funnel_stage,
+)
 
 logger = logging.getLogger("smart-money-monitor")
 
@@ -650,6 +656,10 @@ async def monitor_heartbeat(wallet_count: int) -> None:
             state_store.set_global_metrics,
             metrics,
         )
+        try:
+            await asyncio.to_thread(flush_coverage_telemetry)
+        except Exception:
+            logger.exception("research coverage telemetry flush failed")
         rss = metrics.get("monitor_memory_rss_bytes")
         logger.info(
             "heartbeat: wallets=%s rss_mib=%s ceiling_percent=%s "
@@ -955,6 +965,8 @@ async def process_paper_signal(
         safety_snapshot: dict[str, Any] = {}
         analysis_completed_at: str | None = None
         analyzer_started = False
+        quote_preflight_started = False
+        quote_preflight_finished = False
         try:
             from src.observation_tracker import (
                 approved_signal_max_open_positions,
@@ -992,6 +1004,26 @@ async def process_paper_signal(
                     ),
                 )
                 observation_id = discovered.observation_id
+                if discovered.created:
+                    record_funnel_stage(
+                        "observation_created",
+                        mint=mint,
+                        family=requested_route,
+                    )
+                    from src.research.prospective_features import (
+                        prospective_feature_collection_eligible,
+                    )
+                    if prospective_feature_collection_eligible({
+                        "prospective_feature_collection": (
+                            prospective_feature_collection
+                        ),
+                        "signal_detected_at": signal_detected_at,
+                    }):
+                        record_funnel_stage(
+                            "prospective_eligible",
+                            mint=mint,
+                            family=requested_route,
+                        )
                 if requested_route == "A" and discovered.created:
                     record_wallet_ws_activity(
                         "research_discovered",
@@ -1055,13 +1087,23 @@ async def process_paper_signal(
                     "analyzer_reached",
                     discovery_source or "unknown",
                 )
-                analyzer_started = True
+            analyzer_started = True
+            record_funnel_stage(
+                "analyzer_started",
+                mint=mint,
+                family=requested_route,
+            )
             analyzer_memory_start = current_rss_bytes()
             try:
                 report = await analyze_token(mint)
             finally:
                 record_memory_phase("analyzer", analyzer_memory_start)
             analysis_completed_at = datetime.now(timezone.utc).isoformat()
+            record_funnel_stage(
+                "analyzer_completed",
+                mint=mint,
+                family=requested_route,
+            )
             if requested_route == "A":
                 record_wallet_ws_activity(
                     "analyzer_success",
@@ -1132,6 +1174,12 @@ async def process_paper_signal(
             )
 
             timeout = aiohttp.ClientTimeout(total=20)
+            quote_preflight_started = True
+            record_funnel_stage(
+                "quote_preflight_started",
+                mint=mint,
+                family=requested_route,
+            )
             async with aiohttp.ClientSession(timeout=timeout) as session:
                 quote = await jupiter_quote(
                     session, os.getenv("JUPITER_API_KEY", "").strip(),
@@ -1173,9 +1221,15 @@ async def process_paper_signal(
                         MAX_EXIT_PRICE_IMPACT_PCT,
                     )
                     decision_reasons.append("EXIT_PREFLIGHT_FAILED")
+                    record_funnel_stage(
+                        "quote_preflight_failed",
+                        mint=mint,
+                        family=requested_route,
+                    )
                     quote_status = "ENTRY_ONLY"
                     if not observation_enabled:
                         return
+            quote_preflight_finished = True
             entry_quote_at = datetime.now(timezone.utc).isoformat()
             whale_reference_price = (
                 whale_paid_lamports / whale_token_amount_raw
@@ -1329,6 +1383,18 @@ async def process_paper_signal(
                 report.safety_score, wallet, signature,
             )
         except RuntimeError as exc:
+            if analyzer_started and not analysis_completed_at:
+                record_funnel_stage(
+                    "analyzer_failed",
+                    mint=mint,
+                    family=requested_route,
+                )
+            if quote_preflight_started and not quote_preflight_finished:
+                record_funnel_stage(
+                    "quote_preflight_failed",
+                    mint=mint,
+                    family=requested_route,
+                )
             if (
                 requested_route == "A"
                 and analyzer_started
@@ -1374,6 +1440,18 @@ async def process_paper_signal(
                 redact_sensitive_text(exc),
             )
         except Exception:
+            if analyzer_started and not analysis_completed_at:
+                record_funnel_stage(
+                    "analyzer_failed",
+                    mint=mint,
+                    family=requested_route,
+                )
+            if quote_preflight_started and not quote_preflight_finished:
+                record_funnel_stage(
+                    "quote_preflight_failed",
+                    mint=mint,
+                    family=requested_route,
+                )
             if (
                 requested_route == "A"
                 and analyzer_started
@@ -1712,6 +1790,12 @@ async def fetch_momentum_candidate_cohorts(
         if evaluated is None:
             continue
         candidate = evaluated.candidate
+        record_funnel_stage(
+            "poll_candidate_observed",
+            mint=candidate.mint,
+            family="MOMENTUM",
+            timestamp=snapshot_at_epoch,
+        )
         if evaluated.rejection_reasons:
             incumbent_shadow = shadow_by_mint.get(candidate.mint)
             if (
@@ -1765,6 +1849,20 @@ async def fetch_momentum_candidate_cohorts(
             -item.candidate.volume_m5_usd,
         ),
     )[:MOMENTUM_MAX_SHADOW_CANDIDATES]
+    for candidate in approved:
+        record_funnel_stage(
+            "candidate_considered",
+            mint=candidate.mint,
+            family="MOMENTUM",
+            timestamp=snapshot_at_epoch,
+        )
+    for shadow in shadows:
+        record_funnel_stage(
+            "candidate_considered",
+            mint=shadow.candidate.mint,
+            family="MOMENTUM",
+            timestamp=snapshot_at_epoch,
+        )
     return approved, shadows
 
 
@@ -1918,6 +2016,78 @@ def momentum_prospective_feature_collection(
     )
 
 
+def _confirmation_failure_telemetry(
+    error: BaseException,
+) -> tuple[str, str, str]:
+    """민감정보 없이 confirmation failure dimension을 정규화한다."""
+    method = str(getattr(error, "method", "confirmation_bundle") or "unknown")
+    provider = str(getattr(error, "last_provider", "router") or "router")
+    if isinstance(error, SolanaRpcRateLimitExhaustedError):
+        result = "rate_limit"
+    elif isinstance(error, asyncio.TimeoutError) or (
+        str(getattr(error, "last_category", "")).upper() == "TIMEOUT"
+    ):
+        result = "timeout"
+    elif str(getattr(error, "last_category", "")).upper() == "CONNECTION":
+        result = "connection"
+    elif isinstance(error, SolanaRpcExhaustedError):
+        result = "exhausted"
+    else:
+        result = "other"
+    return method, provider, result
+
+
+async def _confirm_unknown_whales_with_telemetry(
+    session: aiohttp.ClientSession,
+    http_url: str,
+    candidate: MomentumCandidate,
+    watched_wallets: set[str],
+) -> list[UnknownWhaleBuy]:
+    """Observation 이전 confirmation funnel도 누락 없이 집계한다."""
+    record_funnel_stage(
+        "rpc_confirmation_started",
+        mint=candidate.mint,
+        family="MOMENTUM",
+    )
+    try:
+        whales = await asyncio.wait_for(
+            confirm_unknown_whales(
+                session, http_url, candidate, watched_wallets
+            ),
+            timeout=ROUTE_B_CONFIRM_TIMEOUT_SECONDS,
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        method, provider, result = _confirmation_failure_telemetry(exc)
+        record_funnel_stage(
+            "rpc_confirmation_failed",
+            mint=candidate.mint,
+            family="MOMENTUM",
+        )
+        record_confirmation_result(
+            mint=candidate.mint,
+            family="MOMENTUM",
+            method=method,
+            provider=provider,
+            result=result,
+        )
+        raise
+    record_funnel_stage(
+        "rpc_confirmation_succeeded",
+        mint=candidate.mint,
+        family="MOMENTUM",
+    )
+    record_confirmation_result(
+        mint=candidate.mint,
+        family="MOMENTUM",
+        method="confirmation_bundle",
+        provider="router",
+        result="success",
+    )
+    return whales
+
+
 def schedule_market_shadow(
     candidate: MomentumCandidate,
     rejection_reasons: tuple[str, ...],
@@ -2028,11 +2198,11 @@ async def run_market_momentum_route(settings: MonitorSettings) -> None:
                 if candidate is not None:
                     momentum_whale_memory_start = current_rss_bytes()
                     try:
-                        whales = await asyncio.wait_for(
-                            confirm_unknown_whales(
-                                session, settings.http_url, candidate, wallets
-                            ),
-                            timeout=ROUTE_B_CONFIRM_TIMEOUT_SECONDS,
+                        whales = await _confirm_unknown_whales_with_telemetry(
+                            session,
+                            settings.http_url,
+                            candidate,
+                            wallets,
                         )
                     finally:
                         record_memory_phase(

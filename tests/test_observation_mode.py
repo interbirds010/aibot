@@ -602,6 +602,57 @@ class ObservationLedgerTests(unittest.TestCase):
         self.assertEqual(sample["sample_lag_seconds"], 10.0)
         self.assertEqual(sample["quote_latency_ms"], 1_234.5)
 
+    def test_sixty_minute_coverage_outcomes_are_canonical_and_idempotent(self) -> None:
+        for suffix in ("SUCCESS", "MISSED", "UNAVAILABLE"):
+            self.record(mint=suffix, signature=suffix)
+        rows = observation_tracker.read_json(
+            observation_tracker.OBSERVATION_PATH,
+            observation_tracker.empty_observations(),
+        )["observations"]
+        by_mint = {row["mint"]: row["observation_id"] for row in rows}
+
+        with patch.object(observation_tracker, "record_funnel_stage") as metric:
+            self.assertTrue(observation_tracker.record_sample(
+                by_mint["SUCCESS"], "60m", proceeds_lamports=1_100
+            ))
+            self.assertTrue(observation_tracker.record_sample(
+                by_mint["MISSED"],
+                "60m",
+                proceeds_lamports=None,
+                error="HORIZON_MISSED",
+            ))
+            self.assertTrue(observation_tracker.record_sample(
+                by_mint["UNAVAILABLE"],
+                "60m",
+                proceeds_lamports=None,
+                error="EXIT_NO_ROUTE",
+            ))
+            self.assertFalse(observation_tracker.record_sample(
+                by_mint["SUCCESS"], "60m", proceeds_lamports=900
+            ))
+
+        self.assertEqual(
+            [call.args[0] for call in metric.call_args_list],
+            [
+                "horizon_60m_successful",
+                "horizon_60m_missed",
+                "horizon_60m_unavailable",
+            ],
+        )
+
+    def test_sixty_minute_due_counter_keeps_route_family(self) -> None:
+        with patch.object(observation_tracker.time, "time", return_value=1_000):
+            self.record(route="B")
+        with patch.object(observation_tracker, "record_funnel_stage") as metric:
+            due = observation_tracker.due_observation_samples(10_000)
+
+        self.assertIn("60m", [item[1] for item in due])
+        metric.assert_called_once_with(
+            "horizon_60m_due",
+            mint="MINT",
+            family="MOMENTUM",
+        )
+
     def test_active_backlog_expires_oldest_unopened_observation(self) -> None:
         with patch.object(observation_tracker, "MAX_ACTIVE_OBSERVATIONS", 2):
             for index in range(3):

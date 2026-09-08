@@ -6,7 +6,9 @@ import asyncio
 import logging
 import math
 import os
+import threading
 import time
+import weakref
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -23,10 +25,15 @@ from src.state_store import atomic_write_json, exclusive_file_lock, read_json
 
 logger = logging.getLogger("solana-rpc")
 
+_reservation_lock_guard = threading.Lock()
+_reservation_locks: weakref.WeakKeyDictionary[
+    asyncio.AbstractEventLoop, dict[str, asyncio.Lock]
+] = weakref.WeakKeyDictionary()
+
 RPC_PROVIDER_STATE_DIR = (
     Path(__file__).resolve().parents[1] / "data" / "solana_rpc_providers"
 )
-RPC_PROVIDER_STATE_SCHEMA_VERSION = 2
+RPC_PROVIDER_STATE_SCHEMA_VERSION = 3
 SOLANA_PUBLIC_DEFAULT_URL = "https://api.mainnet.solana.com"
 RPC_CIRCUIT_FAILURE_THRESHOLD = 3
 RPC_CIRCUIT_COOLDOWN_SECONDS = 60.0
@@ -112,6 +119,14 @@ RPC_FAILURE_REASONS = frozenset({
     RPC_ALL_PROVIDERS_EXHAUSTED,
     RPC_NO_PROVIDER_CONFIGURED,
 })
+RPC_METHOD_METRIC_NAMES = frozenset({
+    *METHOD_RATE_LIMIT_REASONS,
+    "getProgramAccounts",
+    "getMultipleAccounts",
+    "getBlock",
+    "other",
+})
+RPC_LATENCY_BUCKET_LIMITS_MS = (250.0, 1_000.0, 5_000.0)
 
 
 @dataclass(frozen=True, slots=True)
@@ -156,9 +171,18 @@ class SolanaRpcConfigurationError(SolanaRpcError):
 class SolanaRpcExhaustedError(SolanaRpcError):
     """전체 provider/attempt budget 소진 오류다."""
 
-    def __init__(self, method: str, attempts: int) -> None:
+    def __init__(
+        self,
+        method: str,
+        attempts: int,
+        *,
+        last_provider: str | None = None,
+        last_category: str | None = None,
+    ) -> None:
         self.method = str(method)
         self.attempts = int(attempts)
+        self.last_provider = str(last_provider or "") or None
+        self.last_category = str(last_category or "") or None
         self.canonical_reason = RPC_ALL_PROVIDERS_EXHAUSTED
         super().__init__(self.canonical_reason)
 
@@ -166,9 +190,18 @@ class SolanaRpcExhaustedError(SolanaRpcError):
 class SolanaRpcRateLimitExhaustedError(SolanaRpcExhaustedError):
     """시도한 모든 provider가 rate limit으로 소진된 오류다."""
 
-    def __init__(self, method: str, attempts: int) -> None:
+    def __init__(
+        self,
+        method: str,
+        attempts: int,
+        *,
+        last_provider: str | None = None,
+        last_category: str | None = None,
+    ) -> None:
         self.method = str(method)
         self.attempts = int(attempts)
+        self.last_provider = str(last_provider or "") or None
+        self.last_category = str(last_category or "") or None
         self.canonical_reason = METHOD_RATE_LIMIT_REASONS.get(
             self.method,
             "RPC_RATE_LIMIT_EXHAUSTED",
@@ -314,7 +347,79 @@ def _empty_provider_state(provider_name: str) -> dict[str, Any]:
         "circuit_state": "CLOSED",
         "circuit_open_count": 0,
         "half_open_lease_until_epoch": 0.0,
+        "method_metrics": {},
     }
+
+
+def _method_metric() -> dict[str, Any]:
+    return {
+        "request_count": 0,
+        "success_count": 0,
+        "failure_count": 0,
+        "rate_limit_count": 0,
+        "exhaustion_count": 0,
+        "retry_count": 0,
+        "failover_count": 0,
+        "latency_sample_count": 0,
+        "latency_sum_ms": 0.0,
+        "latency_max_ms": 0.0,
+        "latency_buckets": {
+            "le_250_ms": 0,
+            "le_1000_ms": 0,
+            "le_5000_ms": 0,
+            "gt_5000_ms": 0,
+        },
+    }
+
+
+def _metric_method(method: str) -> str:
+    normalized = str(method)
+    return normalized if normalized in RPC_METHOD_METRIC_NAMES else "other"
+
+
+def _state_method_metric(
+    state: dict[str, Any], method: str,
+) -> dict[str, Any]:
+    metrics = state.setdefault("method_metrics", {})
+    name = _metric_method(method)
+    raw = metrics.get(name)
+    if not isinstance(raw, dict):
+        raw = _method_metric()
+        metrics[name] = raw
+    defaults = _method_metric()
+    for key, value in defaults.items():
+        raw.setdefault(key, value)
+    buckets = raw.get("latency_buckets")
+    if not isinstance(buckets, dict):
+        buckets = {}
+        raw["latency_buckets"] = buckets
+    for key, value in defaults["latency_buckets"].items():
+        buckets.setdefault(key, value)
+    return raw
+
+
+def _record_latency(metric: dict[str, Any], latency_ms: float) -> None:
+    value = max(0.0, float(latency_ms))
+    metric["latency_sample_count"] = (
+        int(metric.get("latency_sample_count", 0) or 0) + 1
+    )
+    metric["latency_sum_ms"] = round(
+        float(metric.get("latency_sum_ms", 0.0) or 0.0) + value,
+        3,
+    )
+    metric["latency_max_ms"] = round(max(
+        float(metric.get("latency_max_ms", 0.0) or 0.0), value
+    ), 3)
+    if value <= RPC_LATENCY_BUCKET_LIMITS_MS[0]:
+        bucket = "le_250_ms"
+    elif value <= RPC_LATENCY_BUCKET_LIMITS_MS[1]:
+        bucket = "le_1000_ms"
+    elif value <= RPC_LATENCY_BUCKET_LIMITS_MS[2]:
+        bucket = "le_5000_ms"
+    else:
+        bucket = "gt_5000_ms"
+    buckets = metric.setdefault("latency_buckets", {})
+    buckets[bucket] = int(buckets.get(bucket, 0) or 0) + 1
 
 
 def _migrate_provider_state(
@@ -327,6 +432,15 @@ def _migrate_provider_state(
         state.setdefault(key, value)
     state["schema_version"] = RPC_PROVIDER_STATE_SCHEMA_VERSION
     state["provider"] = provider_name
+    metrics = state.get("method_metrics")
+    if not isinstance(metrics, dict):
+        state["method_metrics"] = {}
+    else:
+        for method in list(metrics):
+            if method not in RPC_METHOD_METRIC_NAMES:
+                metrics.pop(method, None)
+                continue
+            _state_method_metric(state, method)
     return state
 
 
@@ -345,6 +459,9 @@ def _increment_state_version(state: dict[str, Any]) -> None:
 def _reserve_provider_slot_sync(
     provider: RpcProvider,
     *,
+    method: str = "other",
+    retry: bool = False,
+    failover: bool = False,
     now_epoch: float | None = None,
 ) -> ProviderReservation | None:
     """provider별 전역 slot을 확보하고 OPEN/HALF_OPEN을 원자적으로 처리한다."""
@@ -388,21 +505,51 @@ def _reserve_provider_slot_sync(
         state["provider"] = provider.name
         state["enabled"] = True
         state["request_count"] = int(state.get("request_count", 0) or 0) + 1
+        metric = _state_method_metric(state, method)
+        metric["request_count"] = int(metric.get("request_count", 0) or 0) + 1
+        if retry:
+            metric["retry_count"] = int(metric.get("retry_count", 0) or 0) + 1
+        if failover:
+            metric["failover_count"] = (
+                int(metric.get("failover_count", 0) or 0) + 1
+            )
         state["last_request_at_epoch"] = now
         _increment_state_version(state)
         atomic_write_json(path, state)
         return ProviderReservation(half_open_probe=half_open_probe)
 
 
+def _process_reservation_lock(provider_name: str) -> asyncio.Lock:
+    """같은 event loop의 provider 예약 순서를 결정적으로 직렬화한다."""
+    loop = asyncio.get_running_loop()
+    with _reservation_lock_guard:
+        locks = _reservation_locks.setdefault(loop, {})
+        return locks.setdefault(provider_name, asyncio.Lock())
+
+
 async def _reserve_provider_slot(
     provider: RpcProvider,
+    *,
+    method: str = "other",
+    retry: bool = False,
+    failover: bool = False,
 ) -> ProviderReservation | None:
-    return await asyncio.to_thread(_reserve_provider_slot_sync, provider)
+    async with _process_reservation_lock(provider.name):
+        return await asyncio.to_thread(
+            _reserve_provider_slot_sync,
+            provider,
+            method=method,
+            retry=retry,
+            failover=failover,
+        )
 
 
 def _record_provider_success_sync(
     provider: RpcProvider,
     reservation: ProviderReservation,
+    *,
+    method: str = "other",
+    latency_ms: float = 0.0,
 ) -> None:
     path = _state_path(provider.name)
     with exclusive_file_lock(path, timeout_seconds=180.0):
@@ -411,6 +558,9 @@ def _record_provider_success_sync(
             read_json(path, _empty_provider_state(provider.name)),
         )
         state["success_count"] = int(state.get("success_count", 0) or 0) + 1
+        metric = _state_method_metric(state, method)
+        metric["success_count"] = int(metric.get("success_count", 0) or 0) + 1
+        _record_latency(metric, latency_ms)
         state["consecutive_failures"] = 0
         state["last_success_at_epoch"] = time.time()
         state["last_failure_category"] = None
@@ -425,6 +575,9 @@ def _record_provider_failure_sync(
     provider: RpcProvider,
     reservation: ProviderReservation,
     failure: ProviderFailure,
+    *,
+    method: str = "other",
+    latency_ms: float = 0.0,
 ) -> None:
     path = _state_path(provider.name)
     with exclusive_file_lock(path, timeout_seconds=180.0):
@@ -435,11 +588,17 @@ def _record_provider_failure_sync(
         now = time.time()
         prior_circuit = str(state.get("circuit_state") or "CLOSED").upper()
         state["failure_count"] = int(state.get("failure_count", 0) or 0) + 1
+        metric = _state_method_metric(state, method)
+        metric["failure_count"] = int(metric.get("failure_count", 0) or 0) + 1
+        _record_latency(metric, latency_ms)
         state["last_failure_at_epoch"] = now
         state["last_failure_category"] = failure.category
         if failure.rate_limited:
             state["rate_limit_count"] = (
                 int(state.get("rate_limit_count", 0) or 0) + 1
+            )
+            metric["rate_limit_count"] = (
+                int(metric.get("rate_limit_count", 0) or 0) + 1
             )
         if failure.transient:
             consecutive = int(state.get("consecutive_failures", 0) or 0) + 1
@@ -469,6 +628,26 @@ def _record_provider_failure_sync(
             state["circuit_state"] = "CLOSED"
             state["cooldown_until_epoch"] = 0.0
         state["half_open_lease_until_epoch"] = 0.0
+        _increment_state_version(state)
+        atomic_write_json(path, state)
+
+
+def _record_provider_exhaustion_sync(
+    provider: RpcProvider,
+    *,
+    method: str,
+) -> None:
+    """최종 logical-call exhaustion을 마지막 실제 provider에 귀속한다."""
+    path = _state_path(provider.name)
+    with exclusive_file_lock(path, timeout_seconds=180.0):
+        state = _migrate_provider_state(
+            provider.name,
+            read_json(path, _empty_provider_state(provider.name)),
+        )
+        metric = _state_method_metric(state, method)
+        metric["exhaustion_count"] = (
+            int(metric.get("exhaustion_count", 0) or 0) + 1
+        )
         _increment_state_version(state)
         atomic_write_json(path, state)
 
@@ -583,7 +762,21 @@ async def _provider_request_once(
             payload = await response.json()
     except _ProviderRequestError:
         raise
-    except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+    except asyncio.TimeoutError as exc:
+        raise _ProviderRequestError(
+            transient=True,
+            rate_limited=False,
+            status=None,
+            category="TIMEOUT",
+        ) from exc
+    except aiohttp.ClientConnectionError as exc:
+        raise _ProviderRequestError(
+            transient=True,
+            rate_limited=False,
+            status=None,
+            category="CONNECTION",
+        ) from exc
+    except aiohttp.ClientError as exc:
         raise _ProviderRequestError(
             transient=True,
             rate_limited=False,
@@ -673,14 +866,22 @@ async def solana_rpc_call(
     )
     failures: list[ProviderFailure] = []
     attempts_used = 0
+    last_attempted_provider: RpcProvider | None = None
     for provider_index, provider in enumerate(ordered):
         for local_attempt in range(local_budget):
             if attempts_used >= total_budget:
                 break
-            reservation = await _reserve_provider_slot(provider)
+            reservation = await _reserve_provider_slot(
+                provider,
+                method=str(method),
+                retry=local_attempt > 0,
+                failover=provider_index > 0,
+            )
             if reservation is None:
                 break
             attempts_used += 1
+            last_attempted_provider = provider
+            request_started = time.monotonic()
             try:
                 result = await _provider_request_once(
                     session,
@@ -689,6 +890,7 @@ async def solana_rpc_call(
                     params,
                 )
             except _ProviderRequestError as exc:
+                latency_ms = (time.monotonic() - request_started) * 1_000
                 failure = _failure_from_error(provider, exc, local_attempt)
                 failures.append(failure)
                 await asyncio.to_thread(
@@ -696,6 +898,8 @@ async def solana_rpc_call(
                     provider,
                     reservation,
                     failure,
+                    method=str(method),
+                    latency_ms=latency_ms,
                 )
                 logger.warning(
                     "Solana RPC provider failure: provider=%s method=%s "
@@ -722,10 +926,33 @@ async def solana_rpc_call(
                 _record_provider_success_sync,
                 provider,
                 reservation,
+                method=str(method),
+                latency_ms=(time.monotonic() - request_started) * 1_000,
             )
             return result
         if attempts_used >= total_budget:
             break
+    if last_attempted_provider is not None:
+        await asyncio.to_thread(
+            _record_provider_exhaustion_sync,
+            last_attempted_provider,
+            method=str(method),
+        )
+    last_provider_name = (
+        last_attempted_provider.name
+        if last_attempted_provider is not None else None
+    )
+    last_category = failures[-1].category if failures else None
     if failures and all(failure.rate_limited for failure in failures):
-        raise SolanaRpcRateLimitExhaustedError(str(method), attempts_used)
-    raise SolanaRpcExhaustedError(str(method), attempts_used)
+        raise SolanaRpcRateLimitExhaustedError(
+            str(method),
+            attempts_used,
+            last_provider=last_provider_name,
+            last_category=last_category,
+        )
+    raise SolanaRpcExhaustedError(
+        str(method),
+        attempts_used,
+        last_provider=last_provider_name,
+        last_category=last_category,
+    )

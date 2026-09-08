@@ -46,6 +46,15 @@ class FakeSession:
         return self.responses[url].popleft()
 
 
+class FailingSession:
+    def __init__(self, error: BaseException) -> None:
+        self.error = error
+
+    def post(self, _url: str, *, json: dict[str, object]) -> FakeResponse:
+        del json
+        raise self.error
+
+
 def provider(name: str, *, max_rps: float = 1_000.0) -> solana_rpc.RpcProvider:
     return solana_rpc.RpcProvider(
         name=name,
@@ -109,6 +118,18 @@ class SolanaRpcRouterTests(unittest.TestCase):
         state = solana_rpc.provider_state("alchemy", [primary, secondary])
         self.assertEqual(state["rate_limit_count"], 1)
         self.assertEqual(state["last_failure_category"], "RATE_LIMIT")
+        primary_metric = state["method_metrics"]["getAccountInfo"]
+        self.assertEqual(primary_metric["request_count"], 1)
+        self.assertEqual(primary_metric["failure_count"], 1)
+        self.assertEqual(primary_metric["rate_limit_count"], 1)
+        secondary_state = solana_rpc.provider_state(
+            "chainstack", [primary, secondary]
+        )
+        secondary_metric = secondary_state["method_metrics"]["getAccountInfo"]
+        self.assertEqual(secondary_metric["request_count"], 1)
+        self.assertEqual(secondary_metric["success_count"], 1)
+        self.assertEqual(secondary_metric["failover_count"], 1)
+        self.assertEqual(secondary_metric["latency_sample_count"], 1)
 
     def test_three_transient_failures_open_circuit(self) -> None:
         target = provider("ankr")
@@ -208,6 +229,15 @@ class SolanaRpcRouterTests(unittest.TestCase):
             caught.exception.canonical_reason,
             solana_rpc.RPC_ALL_PROVIDERS_EXHAUSTED,
         )
+        final_state = solana_rpc.provider_state("ankr", [primary, secondary])
+        self.assertEqual(
+            final_state["method_metrics"]["getTokenSupply"][
+                "exhaustion_count"
+            ],
+            1,
+        )
+        self.assertEqual(caught.exception.last_provider, "ankr")
+        self.assertEqual(caught.exception.last_category, "HTTP_TRANSIENT")
 
         async def fail_closed() -> bool:
             with patch.object(
@@ -332,6 +362,69 @@ class SolanaRpcRouterTests(unittest.TestCase):
             failure.retry_delay_seconds,
             solana_rpc.RPC_MAX_INLINE_BACKOFF_SECONDS,
         )
+
+    def test_timeout_and_connection_failures_have_stable_categories(self) -> None:
+        target = provider("alchemy")
+        cases = (
+            (asyncio.TimeoutError(), "TIMEOUT"),
+            (solana_rpc.aiohttp.ClientConnectionError(), "CONNECTION"),
+        )
+        for error, category in cases:
+            with self.subTest(category=category):
+                with self.assertRaises(
+                    solana_rpc._ProviderRequestError
+                ) as caught:
+                    asyncio.run(solana_rpc._provider_request_once(
+                        FailingSession(error),
+                        target,
+                        "getHealth",
+                        [],
+                    ))
+                self.assertEqual(caught.exception.category, category)
+                self.assertTrue(caught.exception.transient)
+
+    def test_local_retry_is_counted_separately_from_failover(self) -> None:
+        target = provider("alchemy")
+        session = FakeSession({
+            target.url: [
+                FakeResponse(500, {}),
+                FakeResponse(200, {"result": "ok"}),
+            ],
+        })
+        immediate_failure = solana_rpc.ProviderFailure(
+            provider="alchemy",
+            transient=True,
+            rate_limited=False,
+            retry_delay_seconds=0.0,
+            retry_source="exponential-fallback",
+            category="HTTP_TRANSIENT",
+        )
+        with (
+            patch.object(
+                solana_rpc,
+                "_failure_from_error",
+                return_value=immediate_failure,
+            ),
+            patch.object(solana_rpc.asyncio, "sleep", new=AsyncMock()),
+        ):
+            result = asyncio.run(solana_rpc.solana_rpc_call(
+                session,
+                "getBalance",
+                [],
+                providers=[target],
+            ))
+
+        self.assertEqual(result, "ok")
+        metric = solana_rpc.provider_state("alchemy", [target])[
+            "method_metrics"
+        ]["getBalance"]
+        self.assertEqual(metric["request_count"], 2)
+        self.assertEqual(metric["failure_count"], 1)
+        self.assertEqual(metric["success_count"], 1)
+        self.assertEqual(metric["retry_count"], 1)
+        self.assertEqual(metric["failover_count"], 0)
+        self.assertEqual(metric["latency_sample_count"], 2)
+        self.assertEqual(sum(metric["latency_buckets"].values()), 2)
 
     def test_rate_limit_exhaustion_uses_method_canonical_reason(self) -> None:
         primary, secondary = provider("alchemy"), provider("ankr")

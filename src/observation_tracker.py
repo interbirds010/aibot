@@ -19,6 +19,7 @@ from src.logging_utils import redact_sensitive_text
 from src.research.prospective_features import (
     normalize_prospective_feature_collection,
 )
+from src.research.coverage_telemetry import record_funnel_stage
 from src.runtime_memory import current_rss_bytes, record_memory_phase
 from src.state_store import migrate_json, read_json, set_global_metrics, update_json
 
@@ -989,7 +990,22 @@ def due_observation_samples(now: float) -> list[tuple[str, str, str, int, float]
     """가장 오래된 deadline부터 bounded batch를 반환한다."""
     document = ensure_observations_migrated()
     due = _due_sample_candidates(document.get("observations", []), now)
-    return due[:OBSERVATION_SAMPLE_BATCH_SIZE]
+    selected = due[:OBSERVATION_SAMPLE_BATCH_SIZE]
+    rows_by_id = {
+        str(row.get("observation_id", "")): row
+        for row in document.get("observations", [])
+        if isinstance(row, dict)
+    }
+    for observation_id, label, mint, _, _ in selected:
+        if label != "60m":
+            continue
+        row = rows_by_id.get(observation_id, {})
+        record_funnel_stage(
+            "horizon_60m_due",
+            mint=mint,
+            family=signal_type_for_route(row.get("route_type")),
+        )
+    return selected
 
 
 def horizon_sample_is_missed(now_epoch: float, target_at_epoch: float) -> bool:
@@ -1159,6 +1175,18 @@ def record_sample(
     snapshot, _ = update_json(
         OBSERVATION_PATH, empty_observations(), mutate
     )
+    if snapshot is not None and interval == "60m":
+        if proceeds_lamports is not None:
+            stage = "horizon_60m_successful"
+        elif "HORIZON_MISSED" in str(error or "").upper():
+            stage = "horizon_60m_missed"
+        else:
+            stage = "horizon_60m_unavailable"
+        record_funnel_stage(
+            stage,
+            mint=str(snapshot.get("mint", "")),
+            family=signal_type_for_route(snapshot.get("route_type")),
+        )
     if (
         snapshot is not None
         and str(snapshot.get("status", "")).upper() == "COMPLETE"
