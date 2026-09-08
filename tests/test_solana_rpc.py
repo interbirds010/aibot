@@ -10,6 +10,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 from src import analyzer, solana_rpc
+from src.research import coverage_telemetry
 from src.state_store import atomic_write_json
 
 
@@ -69,9 +70,21 @@ class SolanaRpcRouterTests(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory()
         self.original_state_dir = solana_rpc.RPC_PROVIDER_STATE_DIR
         solana_rpc.RPC_PROVIDER_STATE_DIR = Path(self.temporary.name)
+        self.original_telemetry_path = coverage_telemetry.TELEMETRY_PATH
+        self.original_hourly_path = coverage_telemetry.HOURLY_TELEMETRY_PATH
+        coverage_telemetry.TELEMETRY_PATH = (
+            Path(self.temporary.name) / "coverage.json"
+        )
+        coverage_telemetry.HOURLY_TELEMETRY_PATH = (
+            Path(self.temporary.name) / "coverage-hourly.json"
+        )
+        coverage_telemetry.reset_pending_telemetry()
 
     def tearDown(self) -> None:
         solana_rpc.RPC_PROVIDER_STATE_DIR = self.original_state_dir
+        coverage_telemetry.reset_pending_telemetry()
+        coverage_telemetry.TELEMETRY_PATH = self.original_telemetry_path
+        coverage_telemetry.HOURLY_TELEMETRY_PATH = self.original_hourly_path
         self.temporary.cleanup()
 
     def test_primary_success_updates_provider_state(self) -> None:
@@ -95,6 +108,18 @@ class SolanaRpcRouterTests(unittest.TestCase):
         self.assertEqual(state["failure_count"], 0)
         self.assertEqual(state["circuit_state"], "CLOSED")
         self.assertEqual(state["version"], 2)
+
+        coverage_telemetry.flush_coverage_telemetry()
+        coverage = json.loads(
+            coverage_telemetry.TELEMETRY_PATH.read_text("utf-8")
+        )
+        rpc = coverage["buckets"][-1]["rpc_methods"][
+            "alchemy|getBalance"
+        ]
+        self.assertEqual(rpc["request_count"], 1)
+        self.assertEqual(rpc["success_count"], 1)
+        self.assertEqual(rpc["failure_count"], 0)
+        self.assertEqual(rpc["latency_count"], 1)
 
     def test_primary_429_fails_over_to_secondary(self) -> None:
         primary, secondary = provider("alchemy"), provider("chainstack")
@@ -130,6 +155,19 @@ class SolanaRpcRouterTests(unittest.TestCase):
         self.assertEqual(secondary_metric["success_count"], 1)
         self.assertEqual(secondary_metric["failover_count"], 1)
         self.assertEqual(secondary_metric["latency_sample_count"], 1)
+        coverage_telemetry.flush_coverage_telemetry()
+        coverage = json.loads(
+            coverage_telemetry.TELEMETRY_PATH.read_text("utf-8")
+        )["buckets"][-1]["rpc_methods"]
+        self.assertEqual(
+            coverage["alchemy|getAccountInfo"]["rate_limit_count"], 1
+        )
+        self.assertEqual(
+            coverage["chainstack|getAccountInfo"]["success_count"], 1
+        )
+        self.assertEqual(
+            coverage["chainstack|getAccountInfo"]["failover_count"], 1
+        )
 
     def test_three_transient_failures_open_circuit(self) -> None:
         target = provider("ankr")

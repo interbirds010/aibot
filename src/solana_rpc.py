@@ -21,6 +21,7 @@ from src.helius_rpc import (
     helius_backoff_seconds,
     jittered_backoff_seconds,
 )
+from src.research.coverage_telemetry import record_rpc_method_metric
 from src.state_store import atomic_write_json, exclusive_file_lock, read_json
 
 logger = logging.getLogger("solana-rpc")
@@ -456,6 +457,14 @@ def _increment_state_version(state: dict[str, Any]) -> None:
     state["version"] = int(state.get("version", 0) or 0) + 1
 
 
+def _record_coverage_rpc_metric(**values: Any) -> None:
+    """진단 계측 실패가 RPC 결과를 바꾸지 않도록 격리한다."""
+    try:
+        record_rpc_method_metric(**values)
+    except Exception:
+        logger.exception("research RPC method telemetry record failed")
+
+
 def _reserve_provider_slot_sync(
     provider: RpcProvider,
     *,
@@ -516,6 +525,14 @@ def _reserve_provider_slot_sync(
         state["last_request_at_epoch"] = now
         _increment_state_version(state)
         atomic_write_json(path, state)
+        _record_coverage_rpc_metric(
+            provider=provider.name,
+            method=method,
+            request_count=1,
+            retry_count=int(retry),
+            failover_count=int(failover),
+            timestamp=now,
+        )
         return ProviderReservation(half_open_probe=half_open_probe)
 
 
@@ -569,6 +586,12 @@ def _record_provider_success_sync(
         state["half_open_lease_until_epoch"] = 0.0
         _increment_state_version(state)
         atomic_write_json(path, state)
+        _record_coverage_rpc_metric(
+            provider=provider.name,
+            method=method,
+            success_count=1,
+            latency_ms=latency_ms,
+        )
 
 
 def _record_provider_failure_sync(
@@ -630,6 +653,14 @@ def _record_provider_failure_sync(
         state["half_open_lease_until_epoch"] = 0.0
         _increment_state_version(state)
         atomic_write_json(path, state)
+        _record_coverage_rpc_metric(
+            provider=provider.name,
+            method=method,
+            failure_count=1,
+            rate_limit_count=int(failure.rate_limited),
+            latency_ms=latency_ms,
+            timestamp=now,
+        )
 
 
 def _record_provider_exhaustion_sync(
@@ -650,6 +681,11 @@ def _record_provider_exhaustion_sync(
         )
         _increment_state_version(state)
         atomic_write_json(path, state)
+        _record_coverage_rpc_metric(
+            provider=provider.name,
+            method=method,
+            exhaustion_count=1,
+        )
 
 
 def provider_state(
