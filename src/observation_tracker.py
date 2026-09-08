@@ -16,6 +16,9 @@ import aiohttp
 from dotenv import load_dotenv
 
 from src.logging_utils import redact_sensitive_text
+from src.research.prospective_features import (
+    normalize_prospective_feature_collection,
+)
 from src.runtime_memory import current_rss_bytes, record_memory_phase
 from src.state_store import migrate_json, read_json, set_global_metrics, update_json
 
@@ -527,6 +530,7 @@ async def record_candidate_discovery(
     dex_momentum_score: float = 0.0,
     momentum_metrics: dict[str, int | float] | None = None,
     discovery_metadata: dict[str, Any] | None = None,
+    prospective_feature_collection: dict[str, Any] | None = None,
 ) -> ObservationDecision:
     """거래 게이트 전에 후보를 원자적으로 기록해 탈락 표본도 보존한다."""
     observation_id = f"{source_signature}:{source_wallet}:{mint}"
@@ -548,7 +552,7 @@ async def record_candidate_discovery(
                 existing.get("candidate_v2_eligible") is True,
                 tuple(existing.get("strategy_variants") or variants),
             )
-        rows.append({
+        payload = {
             "observation_id": observation_id,
             "mint": mint,
             "route_type": str(route_type).upper(),
@@ -592,7 +596,14 @@ async def record_candidate_discovery(
             "excursion_basis": "scheduled_jupiter_executable_quotes",
             "tracking_profile": "research_v1_60m",
             "status": "DISCOVERED",
-        })
+        }
+        normalized_collection = normalize_prospective_feature_collection(
+            prospective_feature_collection,
+            signal_timestamp=signal_detected_at,
+        )
+        if normalized_collection:
+            payload["prospective_feature_collection"] = normalized_collection
+        rows.append(payload)
         expire_observation_backlog(rows)
         document["observations"] = archive_and_retain_observations(rows)
         document["schema_version"] = OBSERVATION_SCHEMA_VERSION
@@ -706,8 +717,10 @@ async def record_observation_decision(
     analysis_completed_at: str,
     entry_quote_at: str,
     entry_latency_ms: int,
+    copy_price_gap_pct: float | None = None,
     momentum_metrics: dict[str, int | float] | None = None,
     safety_metrics: dict[str, Any] | None = None,
+    prospective_feature_collection: dict[str, Any] | None = None,
     decision_status: str = "APPROVED",
     decision_reasons: list[str] | tuple[str, ...] = (),
     quote_status: str = "EXECUTABLE",
@@ -759,6 +772,15 @@ async def record_observation_decision(
             candidate_reasons.append("MINT_SEEN_WITHIN_24H")
         variants = strategy_variants(route_type, score)
         metrics = momentum_metrics if route_type == "B" else None
+        normalized_collection = normalize_prospective_feature_collection(
+            prospective_feature_collection,
+            signal_timestamp=signal_detected_at,
+        )
+        if not normalized_collection and isinstance(existing, dict):
+            normalized_collection = normalize_prospective_feature_collection(
+                existing.get("prospective_feature_collection"),
+                signal_timestamp=signal_detected_at,
+            )
         payload = {
             "observation_id": observation_id,
             "mint": mint,
@@ -800,6 +822,7 @@ async def record_observation_decision(
             "analysis_completed_at": analysis_completed_at,
             "entry_quote_at": entry_quote_at,
             "entry_latency_ms": int(entry_latency_ms),
+            "copy_price_gap_pct": _finite_or_none(copy_price_gap_pct),
             "started_at_epoch": started_at,
             "started_at": datetime.now(timezone.utc).isoformat(),
             "samples": [],
@@ -818,6 +841,8 @@ async def record_observation_decision(
                 else {}
             ),
         }
+        if normalized_collection:
+            payload["prospective_feature_collection"] = normalized_collection
         if isinstance(existing, dict):
             payload["started_at_epoch"] = existing.get("started_at_epoch", started_at)
             payload["started_at"] = existing.get("started_at", payload["started_at"])
@@ -854,8 +879,10 @@ async def record_observation(
     analysis_completed_at: str,
     entry_quote_at: str,
     entry_latency_ms: int,
+    copy_price_gap_pct: float | None = None,
     momentum_metrics: dict[str, int | float] | None = None,
     safety_metrics: dict[str, Any] | None = None,
+    prospective_feature_collection: dict[str, Any] | None = None,
 ) -> bool:
     """Record one approved hypothetical entry without changing trading state."""
     decision = await record_observation_decision(
@@ -871,8 +898,10 @@ async def record_observation(
         exit_price_impact_pct=exit_price_impact_pct,
         expected_slippage_bps=expected_slippage_bps,
         dex_momentum_score=dex_momentum_score,
+        copy_price_gap_pct=copy_price_gap_pct,
         momentum_metrics=momentum_metrics,
         safety_metrics=safety_metrics,
+        prospective_feature_collection=prospective_feature_collection,
         signal_detected_at=signal_detected_at,
         analysis_completed_at=analysis_completed_at,
         entry_quote_at=entry_quote_at,

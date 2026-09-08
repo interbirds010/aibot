@@ -1299,6 +1299,9 @@ class ObservationEntryGateTests(unittest.TestCase):
                 "A",
             ))
         observed.assert_awaited_once()
+        self.assertEqual(
+            observed.await_args.kwargs["copy_price_gap_pct"], -99.0
+        )
         record_buy.assert_not_awaited()
         record_buy_success.assert_not_awaited()
         self.assertEqual(quote.await_count, 2)

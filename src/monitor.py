@@ -36,6 +36,7 @@ from src.runtime_memory import (
     record_transaction_payload,
     runtime_memory_metrics,
 )
+from src.research.prospective_features import MomentumSnapshotStore
 
 logger = logging.getLogger("smart-money-monitor")
 
@@ -131,6 +132,7 @@ _whale_buy_history: dict[tuple[str, str], deque[tuple[float, int]]] = {}
 _last_history_cleanup_at = 0.0
 _market_entry_cooldowns: dict[str, float] = {}
 _market_shadow_cooldowns: dict[str, float] = {}
+_momentum_snapshot_store = MomentumSnapshotStore()
 _last_route_b_health_write_at = 0.0
 _route_b_consecutive_failures = 0
 _last_market_shadow_capture_at = 0.0
@@ -361,6 +363,12 @@ def monitor_runtime_metrics(wallet_count: int) -> dict[str, Any]:
         ),
         "monitor_market_entry_cooldown_count": len(_market_entry_cooldowns),
         "monitor_market_shadow_cooldown_count": len(_market_shadow_cooldowns),
+        "monitor_momentum_snapshot_series_count": (
+            _momentum_snapshot_store.series_count
+        ),
+        "monitor_momentum_snapshot_count": (
+            _momentum_snapshot_store.snapshot_count
+        ),
         "monitor_ws_metric_source_bucket_count": sum(
             len(values) for values in _wallet_ws_activity_by_source.values()
         ),
@@ -383,6 +391,7 @@ class MomentumCandidate:
     liquidity_usd: float
     momentum_score: float
     pair_age_seconds: float = 0.0
+    price_usd: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -934,6 +943,7 @@ async def process_paper_signal(
     dex_momentum_score: float = 0.0,
     *,
     momentum_metrics: dict[str, int | float] | None = None,
+    prospective_feature_collection: dict[str, Any] | None = None,
     prefilter_reasons: tuple[str, ...] = (),
     discovery_source: str | None = None,
 ) -> None:
@@ -977,6 +987,9 @@ async def process_paper_signal(
                     dex_momentum_score=dex_momentum_score,
                     momentum_metrics=momentum_metrics,
                     discovery_metadata=discovery_details,
+                    prospective_feature_collection=(
+                        prospective_feature_collection
+                    ),
                 )
                 observation_id = discovered.observation_id
                 if requested_route == "A" and discovered.created:
@@ -1200,6 +1213,10 @@ async def process_paper_signal(
                     analysis_completed_at=analysis_completed_at,
                     entry_quote_at=entry_quote_at,
                     entry_latency_ms=entry_latency_ms,
+                    copy_price_gap_pct=copy_price_gap_pct,
+                    prospective_feature_collection=(
+                        prospective_feature_collection
+                    ),
                     decision_status=(
                         "APPROVED" if not decision_reasons else "REJECTED"
                     ),
@@ -1580,6 +1597,7 @@ def momentum_shadow_candidate_from_pair(
     sells_value = finite_value(txns_m5.get("sells"))
     liquidity_value = finite_value((pair.get("liquidity") or {}).get("usd"))
     created_value = finite_value(pair.get("pairCreatedAt"))
+    price_value = finite_value(pair.get("priceUsd"))
     if any(value is None for value in (
         volume_value, buys_value, sells_value, liquidity_value
     )):
@@ -1620,6 +1638,11 @@ def momentum_shadow_candidate_from_pair(
         liquidity_usd=liquidity,
         momentum_score=momentum_score(volume_m5, buys_m5, sells_m5),
         pair_age_seconds=pair_age_seconds,
+        price_usd=(
+            price_value
+            if price_value is not None and price_value >= 0
+            else None
+        ),
     )
     return MomentumShadowCandidate(candidate, tuple(reasons))
 
@@ -1681,8 +1704,11 @@ async def fetch_momentum_candidate_cohorts(
 
     best_by_mint: dict[str, MomentumCandidate] = {}
     shadow_by_mint: dict[str, MomentumShadowCandidate] = {}
+    snapshot_at_epoch = time.time()
     for pair in pairs:
-        evaluated = momentum_shadow_candidate_from_pair(pair)
+        evaluated = momentum_shadow_candidate_from_pair(
+            pair, now_ms=snapshot_at_epoch * 1000
+        )
         if evaluated is None:
             continue
         candidate = evaluated.candidate
@@ -1708,6 +1734,20 @@ async def fetch_momentum_candidate_cohorts(
             best_by_mint[candidate.mint] = candidate
     for mint in best_by_mint:
         shadow_by_mint.pop(mint, None)
+    projected_candidates = list(best_by_mint.values()) + [
+        item.candidate for item in shadow_by_mint.values()
+    ]
+    for candidate in projected_candidates:
+        _momentum_snapshot_store.record(
+            mint=candidate.mint,
+            pair_address=candidate.pair_address,
+            snapshot_at_epoch=snapshot_at_epoch,
+            volume_m5_usd=candidate.volume_m5_usd,
+            buys_m5=candidate.buys_m5,
+            sells_m5=candidate.sells_m5,
+            liquidity_usd=candidate.liquidity_usd,
+            price_usd=candidate.price_usd,
+        )
     approved = sorted(
         best_by_mint.values(),
         key=lambda item: (
@@ -1865,6 +1905,19 @@ def momentum_observation_metrics(
     }
 
 
+def momentum_prospective_feature_collection(
+    candidate: MomentumCandidate,
+    *,
+    signal_detected_at: str,
+) -> dict[str, Any]:
+    """현재 pair와 signal 시각에 맞는 과거 projection만 반환한다."""
+    return _momentum_snapshot_store.collection(
+        mint=candidate.mint,
+        pair_address=candidate.pair_address,
+        signal_timestamp=signal_detected_at,
+    )
+
+
 def schedule_market_shadow(
     candidate: MomentumCandidate,
     rejection_reasons: tuple[str, ...],
@@ -1894,6 +1947,7 @@ def schedule_market_shadow(
         f"dexscreener-shadow:{candidate.pair_address}:"
         f"{int(time.time() // MOMENTUM_ENTRY_COOLDOWN_SECONDS)}"
     )
+    signal_detected_at = datetime.now(timezone.utc).isoformat()
     task = asyncio.create_task(
         process_paper_signal(
             candidate.mint,
@@ -1902,12 +1956,18 @@ def schedule_market_shadow(
             0,
             "market-near-miss",
             shadow_signature,
-            datetime.now(timezone.utc).isoformat(),
+            signal_detected_at,
             "B",
             candidate.momentum_score,
             momentum_metrics=momentum_observation_metrics(
                 candidate,
                 unknown_whale_count=unknown_whale_count,
+            ),
+            prospective_feature_collection=(
+                momentum_prospective_feature_collection(
+                    candidate,
+                    signal_detected_at=signal_detected_at,
+                )
             ),
             prefilter_reasons=rejection_reasons,
         )
@@ -2033,6 +2093,7 @@ async def run_market_momentum_route(settings: MonitorSettings) -> None:
                             f"dexscreener:{candidate.pair_address}:"
                             f"{int(time.time())}"
                         )
+                        signal_detected_at = datetime.now(timezone.utc).isoformat()
                         logger.info(
                             "[ROUTE_B] momentum confirmed mint=%s score=%.2f "
                             "volume_m5=$%.2f unknown_whales=%d",
@@ -2049,7 +2110,7 @@ async def run_market_momentum_route(settings: MonitorSettings) -> None:
                                 strongest.paid_lamports,
                                 strongest.wallet,
                                 signal_signature,
-                                datetime.now(timezone.utc).isoformat(),
+                                signal_detected_at,
                                 "B",
                                 candidate.momentum_score,
                                 momentum_metrics={
@@ -2067,6 +2128,12 @@ async def run_market_momentum_route(settings: MonitorSettings) -> None:
                                     "pair_age_seconds": candidate.pair_age_seconds,
                                     "unknown_whale_count": len(whales),
                                 },
+                                prospective_feature_collection=(
+                                    momentum_prospective_feature_collection(
+                                        candidate,
+                                        signal_detected_at=signal_detected_at,
+                                    )
+                                ),
                             )
                         )
                         track_signal_task(task)

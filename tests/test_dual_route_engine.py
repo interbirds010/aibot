@@ -424,6 +424,48 @@ class MarketMomentumTests(unittest.TestCase):
             monitor.DEX_SCREENER_PROFILES_URL,
             monitor.DEX_SCREENER_BOOSTS_URL,
         ])
+
+    def test_existing_fetch_populates_only_projected_snapshot_fields(self) -> None:
+        pair = {
+            "chainId": "solana",
+            "pairAddress": "PAIR",
+            "baseToken": {"address": "MINT"},
+            "txns": {"m5": {"buys": 36, "sells": 20}},
+            "volume": {"m5": 15_000},
+            "liquidity": {"usd": 10_000},
+            "priceUsd": "0.0012",
+            "pairCreatedAt": 1_000_000,
+            "raw_payload_marker": "must-not-survive",
+        }
+        store = monitor.MomentumSnapshotStore()
+        fetch = AsyncMock(side_effect=[{"pairs": [pair]}, [], []])
+        with (
+            patch.object(monitor.time, "time", return_value=2_000),
+            patch.object(monitor, "_momentum_snapshot_store", store),
+            patch.object(monitor, "_dexscreener_json", new=fetch),
+        ):
+            approved, _ = asyncio.run(
+                monitor.fetch_momentum_candidate_cohorts(object())
+            )
+        self.assertEqual(len(approved), 1)
+        collection = store.collection(
+            mint="MINT", pair_address="PAIR", signal_timestamp=2_001
+        )
+        self.assertEqual(collection["snapshot_count"], 1)
+        self.assertEqual(
+            set(collection["pre_signal_snapshots"][0]),
+            {
+                "snapshot_at_epoch",
+                "volume_m5_usd",
+                "buys_m5",
+                "sells_m5",
+                "liquidity_usd",
+                "price_usd",
+            },
+        )
+        self.assertNotIn("raw_payload_marker", repr(collection))
+        self.assertEqual(fetch.await_count, 3)
+
     def test_route_a_never_inherits_relaxed_route_b_analysis(self) -> None:
         self.assertTrue(monitor.route_report_allowed("A", "A"))
         self.assertFalse(monitor.route_report_allowed("A", "B"))
