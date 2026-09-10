@@ -1271,6 +1271,8 @@ async def observation_loop(interval_seconds: float = 15.0) -> None:
         **{f"research_{key}": value for key, value in archive_metrics.items()},
         **observation_runtime_metrics(observation_document),
     })
+    # 시작 계측에만 필요한 원장 snapshot을 장기 실행 coroutine에서 해제한다.
+    del observation_document, archive_metrics
     last_health_refresh = time.monotonic()
 
     timeout = aiohttp.ClientTimeout(total=15)

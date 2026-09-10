@@ -113,6 +113,7 @@ def atomic_write_json(path: Path, document: dict[str, Any]) -> None:
         with tempfile.NamedTemporaryFile(
             "w", encoding="utf-8", dir=path.parent, delete=False
         ) as file:
+            temporary = file.name
             # Compact encoding shortens fsync and therefore the cross-process
             # lock hold time on the 1 GB production VPS.
             json.dump(
@@ -124,7 +125,6 @@ def atomic_write_json(path: Path, document: dict[str, Any]) -> None:
             file.write("\n")
             file.flush()
             os.fsync(file.fileno())
-            temporary = file.name
         os.replace(temporary, path)
     finally:
         if temporary and os.path.exists(temporary):

@@ -148,6 +148,44 @@ class ShadowTradeLedgerTests(unittest.TestCase):
                 saved = json.loads(path.read_text(encoding="utf-8"))
                 self.assertEqual(len(saved["trades"]), 2)
 
+    def test_backfill_releases_prefilter_document_before_locked_update(self) -> None:
+        released = []
+
+        class TrackedDocument(dict):
+            def __del__(self) -> None:
+                released.append(True)
+
+        def prefilter_document() -> dict:
+            return TrackedDocument({
+                "schema_version": 2,
+                "trades": [{"shadow_trade_id": "EXISTING"}],
+                "version": 1,
+            })
+
+        def locked_update(path, fallback, mutator):
+            self.assertEqual(released, [True])
+            document = shadow_trade_ledger.empty_shadow_trades()
+            return mutator(document), document
+
+        with (
+            patch.object(
+                shadow_trade_ledger,
+                "ensure_shadow_trades_migrated",
+                side_effect=prefilter_document,
+            ),
+            patch.object(
+                shadow_trade_ledger,
+                "update_json",
+                side_effect=locked_update,
+            ),
+        ):
+            self.assertEqual(
+                shadow_trade_ledger.backfill_completed_shadow_trades(
+                    [completed_row("OBS-NEW")]
+                ),
+                1,
+            )
+
     def test_only_sixty_minute_sample_completes_and_archives_trade(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             observation_path = Path(tmp) / "signal_observations.json"

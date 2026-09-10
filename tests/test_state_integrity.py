@@ -5,8 +5,26 @@ import multiprocessing
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from src import risk_manager, state_store
+
+
+class AtomicStateStoreTests(unittest.TestCase):
+    def test_write_failure_removes_its_incomplete_temporary_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target = root / "state.json"
+            with patch.object(
+                state_store.json,
+                "dump",
+                side_effect=OSError("simulated write failure"),
+            ):
+                with self.assertRaises(OSError):
+                    state_store.atomic_write_json(target, {"value": 1})
+
+            self.assertFalse(target.exists())
+            self.assertEqual(list(root.iterdir()), [])
 
 
 def competing_exit_worker(

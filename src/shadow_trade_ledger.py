@@ -265,6 +265,9 @@ def backfill_completed_shadow_trades(rows: list[Any]) -> int:
     if not candidates:
         return 0
 
+    # 잠금 안의 최종 중복 검증 전에 큰 사전 조회 문서를 해제한다.
+    del current, current_ids
+
     def mutate(document: dict[str, Any]) -> int:
         migrate_shadow_trade_document(document)
         trades = document.setdefault("trades", [])
