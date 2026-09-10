@@ -14,6 +14,8 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 import aiohttp
+
+from src.phase_memory_telemetry import add_current_phase_metadata
 from dotenv import load_dotenv
 
 from src.helius_rpc import (
@@ -780,6 +782,16 @@ async def _provider_request_once(
         async with session.post(provider.url, json=request) as response:
             status = int(response.status)
             headers = response.headers
+            content_length = getattr(response, "content_length", None)
+            content_length_known = (
+                isinstance(content_length, int) and content_length >= 0
+            )
+            add_current_phase_metadata(
+                response_count=1,
+                response_bytes=int(content_length) if content_length_known else 0,
+                missing_length_count=int(not content_length_known),
+                content_length_known=content_length_known,
+            )
             if status in RPC_RETRYABLE_HTTP_STATUSES:
                 raise _ProviderRequestError(
                     transient=True,

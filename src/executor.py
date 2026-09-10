@@ -28,6 +28,7 @@ from solders.transaction import VersionedTransaction
 
 from src.analyzer import analyze_token
 from src.logging_utils import configure_safe_logging, redact_sensitive_text
+from src.phase_memory_telemetry import add_current_phase_metadata
 from src.solana_rpc import solana_rpc_call
 from src.state_store import (
     atomic_write_json,
@@ -323,6 +324,18 @@ async def jupiter_quote(
             async with session.get(
                 f"{JUPITER_BASE}/quote", params=params, headers=headers
             ) as response:
+                content_length = getattr(response, "content_length", None)
+                content_length_known = (
+                    isinstance(content_length, int) and content_length >= 0
+                )
+                add_current_phase_metadata(
+                    response_count=1,
+                    response_bytes=(
+                        int(content_length) if content_length_known else 0
+                    ),
+                    missing_length_count=int(not content_length_known),
+                    content_length_known=content_length_known,
+                )
                 if response.status == 400 and fail_fast_bad_request:
                     raise JupiterNoRouteError(
                         "Jupiter returned HTTP 400 without an executable route"

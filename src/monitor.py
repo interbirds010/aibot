@@ -24,6 +24,11 @@ from websockets.asyncio.client import ClientConnection, connect
 from websockets.exceptions import ConnectionClosed, InvalidHandshake, InvalidStatus
 
 from src import state_store
+from src.phase_memory_telemetry import (
+    add_current_phase_metadata,
+    flush_phase_memory_telemetry,
+    phase_memory,
+)
 from src.solana_rpc import (
     SolanaRpcExhaustedError,
     SolanaRpcRateLimitExhaustedError,
@@ -660,6 +665,10 @@ async def monitor_heartbeat(wallet_count: int) -> None:
             await asyncio.to_thread(flush_coverage_telemetry)
         except Exception:
             logger.exception("research coverage telemetry flush failed")
+        try:
+            await asyncio.to_thread(flush_phase_memory_telemetry)
+        except Exception:
+            logger.exception("phase memory telemetry flush failed")
         rss = metrics.get("monitor_memory_rss_bytes")
         logger.info(
             "heartbeat: wallets=%s rss_mib=%s ceiling_percent=%s "
@@ -1733,11 +1742,21 @@ async def _dexscreener_json(
         params=params or None,
         headers={"accept": "application/json"},
     ) as response:
+        content_length = getattr(response, "content_length", None)
+        content_length_known = (
+            isinstance(content_length, int) and content_length >= 0
+        )
+        add_current_phase_metadata(
+            response_count=1,
+            response_bytes=int(content_length) if content_length_known else 0,
+            missing_length_count=int(not content_length_known),
+            content_length_known=content_length_known,
+        )
         response.raise_for_status()
         return await response.json()
 
 
-async def fetch_momentum_candidate_cohorts(
+async def _fetch_momentum_candidate_cohorts(
     session: aiohttp.ClientSession,
 ) -> tuple[list[MomentumCandidate], list[MomentumShadowCandidate]]:
     """승인 후보와 현행 임계값 바로 아래 shadow 후보를 함께 반환한다."""
@@ -1863,14 +1882,44 @@ async def fetch_momentum_candidate_cohorts(
             family="MOMENTUM",
             timestamp=snapshot_at_epoch,
         )
+    add_current_phase_metadata(
+        row_count=len(pairs),
+        approved_count=len(approved),
+        shadow_count=len(shadows),
+        active_series_count=_momentum_snapshot_store.series_count,
+        snapshot_count=_momentum_snapshot_store.snapshot_count,
+    )
     return approved, shadows
+
+
+async def fetch_momentum_candidate_cohorts(
+    session: aiohttp.ClientSession,
+    *,
+    revalidation: bool = False,
+) -> tuple[list[MomentumCandidate], list[MomentumShadowCandidate]]:
+    """후보 fetch/parse/projection 전체의 sub-minute high-water를 기록한다."""
+    with phase_memory(
+        "candidate_fetch",
+        metadata={
+            "workload": "momentum",
+            "operation": "fetch",
+            "revalidation": bool(revalidation),
+        },
+        include_gc_counts=True,
+        include_object_count=True,
+    ) as scope:
+        approved, shadows = await _fetch_momentum_candidate_cohorts(session)
+        scope.add_metadata(candidate_count=len(approved) + len(shadows))
+        return approved, shadows
 
 
 async def fetch_momentum_candidates(
     session: aiohttp.ClientSession,
 ) -> list[MomentumCandidate]:
     """기존 거래 경로에는 현행 필터 승인 후보만 반환한다."""
-    approved, _ = await fetch_momentum_candidate_cohorts(session)
+    approved, _ = await fetch_momentum_candidate_cohorts(
+        session, revalidation=True
+    )
     return approved
 
 
@@ -1952,12 +2001,14 @@ async def confirm_unknown_whales(
         for row in (signatures or [])
         if isinstance(row, dict) and row.get("signature") and row.get("err") is None
     ]
+    add_current_phase_metadata(signature_count=len(transaction_signatures))
     if not transaction_signatures:
         return []
     by_wallet: dict[str, UnknownWhaleBuy] = {}
     # Sequential early-exit reads keep peak memory flat and stop as soon as
     # three qualifying wallets exist.
     for signature in transaction_signatures:
+        add_current_phase_metadata(transaction_count=1)
         transaction = await _solana_rpc(
             session,
             http_url,
@@ -1981,6 +2032,10 @@ async def confirm_unknown_whales(
                 by_wallet[buy.wallet] = buy
         if len(by_wallet) >= UNKNOWN_WHALE_MIN_COUNT:
             break
+    add_current_phase_metadata(
+        candidate_count=len(by_wallet),
+        early_exit=len(by_wallet) >= UNKNOWN_WHALE_MIN_COUNT,
+    )
     return sorted(
         by_wallet.values(), key=lambda buy: buy.paid_lamports, reverse=True
     )
@@ -2037,7 +2092,7 @@ def _confirmation_failure_telemetry(
     return method, provider, result
 
 
-async def _confirm_unknown_whales_with_telemetry(
+async def _confirm_unknown_whales_with_funnel_telemetry(
     session: aiohttp.ClientSession,
     http_url: str,
     candidate: MomentumCandidate,
@@ -2086,6 +2141,26 @@ async def _confirm_unknown_whales_with_telemetry(
         result="success",
     )
     return whales
+
+
+async def _confirm_unknown_whales_with_telemetry(
+    session: aiohttp.ClientSession,
+    http_url: str,
+    candidate: MomentumCandidate,
+    watched_wallets: set[str],
+) -> list[UnknownWhaleBuy]:
+    """기존 funnel과 별도로 confirmation memory high-water를 기록한다."""
+    with phase_memory(
+        "whale_confirmation",
+        metadata={"workload": "momentum", "operation": "confirm"},
+        include_gc_counts=True,
+        include_object_count=True,
+    ) as scope:
+        whales = await _confirm_unknown_whales_with_funnel_telemetry(
+            session, http_url, candidate, watched_wallets
+        )
+        scope.add_metadata(success_count=len(whales))
+        return whales
 
 
 def schedule_market_shadow(
@@ -2387,14 +2462,50 @@ async def fetch_transaction(
     return None
 
 
+@contextlib.asynccontextmanager
+async def _connect_with_memory_phase(
+    url: str, *, phase_mode: str, **options: Any
+):
+    connection = connect(url, **options)
+    with phase_memory(
+        "ws_refresh_reconnect",
+        metadata={
+            "workload": "websocket",
+            "operation": "connect",
+            "mode": phase_mode,
+            "kind": "steady",
+            "result": "unknown",
+        },
+        include_gc_counts=True,
+        include_object_count=True,
+    ) as scope:
+        try:
+            socket = await connection.__aenter__()
+        except BaseException:
+            scope.set_metadata({"result": "failure"})
+            raise
+        scope.set_metadata({"result": "success"})
+    try:
+        yield socket
+    except BaseException as exc:
+        suppressed = await connection.__aexit__(
+            type(exc), exc, exc.__traceback__
+        )
+        if not suppressed:
+            raise
+    else:
+        await connection.__aexit__(None, None, None)
+
+
 async def monitor_standard_once(
     settings: MonitorSettings, wallets: tuple[str, ...]
 ) -> None:
     """Public fallback: wallet logs, then fetch only matching DEX transactions."""
     seen = SignatureWindow()
     timeout = aiohttp.ClientTimeout(total=15)
-    async with connect(
+    async with _connect_with_memory_phase(
         settings.standard_ws_url,
+        phase_mode="standard",
         ping_interval=20,
         ping_timeout=20,
         open_timeout=20,
@@ -2417,92 +2528,120 @@ async def monitor_standard_once(
                 "params": [{"mentions": [wallet]}, {"commitment": "confirmed"}],
             }))
         acknowledgements = 0
+        subscriptions_ready = False
         async for raw_message in socket:
-            message = json.loads(raw_message)
-            if "id" in message:
-                if "error" in message:
-                    raise WebSocketSubscriptionRejected(
-                        websocket_subscription_failure_reason(message["error"])
+            memory_context = (
+                phase_memory(
+                    "ws_refresh_reconnect",
+                    metadata={
+                        "workload": "websocket",
+                        "operation": "connect",
+                        "mode": "standard",
+                        "kind": "steady",
+                        "result": "unknown",
+                    },
+                )
+                if not subscriptions_ready else contextlib.nullcontext()
+            )
+            with memory_context as ws_scope:
+                if ws_scope is not None:
+                    ws_scope.add_metadata(payload_bytes=len(raw_message))
+                message = json.loads(raw_message)
+                if "id" in message:
+                    if "error" in message:
+                        if ws_scope is not None:
+                            ws_scope.set_metadata({"result": "failure"})
+                        raise WebSocketSubscriptionRejected(
+                            websocket_subscription_failure_reason(message["error"])
+                        )
+                    acknowledgements += 1
+                    if acknowledgements == len(wallets):
+                        subscriptions_ready = True
+                        if ws_scope is not None:
+                            ws_scope.add_metadata(
+                                subscription_count=acknowledgements
+                            )
+                            ws_scope.set_metadata({"result": "success"})
+                        record_wallet_ws_activity(
+                            "subscription_success", DISCOVERY_SOURCE_SOLANA
+                        )
+                        await asyncio.to_thread(
+                            state_store.set_global_metrics,
+                            {
+                                "wallet_ws_state": "SUBSCRIBED",
+                                "wallet_ws_subscribed_at": time.time(),
+                                "wallet_ws_mode": "STANDARD",
+                                "wallet_ws_active_source": DISCOVERY_SOURCE_SOLANA,
+                                "wallet_ws_last_success_at": time.time(),
+                                "wallet_ws_consecutive_failures": 0,
+                                "wallet_ws_state_changed_at": time.time(),
+                            },
+                        )
+                        logger.info(
+                            "standard fallback subscribed to %s wallets", len(wallets)
+                        )
+                        logger.info(
+                            "SUCCESS: actively monitoring %s verified whale wallets in real time",
+                            len(wallets),
+                        )
+                    continue
+                value = ((message.get("params") or {}).get("result") or {}).get("value") or {}
+                signature = value.get("signature")
+                if not signature or value.get("err") is not None:
+                    continue
+                record_wallet_ws_activity("notification", DISCOVERY_SOURCE_SOLANA)
+                if not seen.add(str(signature)):
+                    continue
+                record_wallet_ws_activity(
+                    "unique_signature", DISCOVERY_SOURCE_SOLANA
+                )
+                logs = value.get("logs") or []
+                dex_name = next(
+                    (name for name, program in DEX_PROGRAMS.items()
+                     if any(program in line for line in logs)), None,
+                )
+                if not dex_name:
+                    continue
+                record_wallet_ws_activity("dex_log_match", DISCOVERY_SOURCE_SOLANA)
+                record_wallet_ws_activity("transaction_fetch", DISCOVERY_SOURCE_SOLANA)
+                try:
+                    transaction = await fetch_transaction(
+                        session, settings.http_url, signature
                     )
-                acknowledgements += 1
-                if acknowledgements == len(wallets):
+                except Exception as exc:
+                    failure_reason = record_transaction_restore_failure(
+                        DISCOVERY_SOURCE_SOLANA, exc
+                    )
+                    logger.warning(
+                        "standard transaction restore failed category=%s",
+                        failure_reason,
+                    )
+                    continue
+                if transaction:
                     record_wallet_ws_activity(
-                        "subscription_success", DISCOVERY_SOURCE_SOLANA
+                        "transaction_restore_success", DISCOVERY_SOURCE_SOLANA
                     )
-                    await asyncio.to_thread(
-                        state_store.set_global_metrics,
-                        {
-                            "wallet_ws_state": "SUBSCRIBED",
-                            "wallet_ws_subscribed_at": time.time(),
-                            "wallet_ws_mode": "STANDARD",
-                            "wallet_ws_active_source": DISCOVERY_SOURCE_SOLANA,
-                            "wallet_ws_last_success_at": time.time(),
-                            "wallet_ws_consecutive_failures": 0,
-                            "wallet_ws_state_changed_at": time.time(),
-                        },
+                    record_wallet_ws_activity(
+                        "transaction_parsed", DISCOVERY_SOURCE_SOLANA
                     )
-                    logger.info("standard fallback subscribed to %s wallets", len(wallets))
-                    logger.info(
-                        "SUCCESS: actively monitoring %s verified whale wallets in real time",
-                        len(wallets),
+                    print_buys(
+                        transaction,
+                        dex_name,
+                        set(wallets),
+                        discovery_source=DISCOVERY_SOURCE_SOLANA,
                     )
-                continue
-            value = ((message.get("params") or {}).get("result") or {}).get("value") or {}
-            signature = value.get("signature")
-            if not signature or value.get("err") is not None:
-                continue
-            record_wallet_ws_activity("notification", DISCOVERY_SOURCE_SOLANA)
-            if not seen.add(str(signature)):
-                continue
-            record_wallet_ws_activity(
-                "unique_signature", DISCOVERY_SOURCE_SOLANA
-            )
-            logs = value.get("logs") or []
-            dex_name = next(
-                (name for name, program in DEX_PROGRAMS.items()
-                 if any(program in line for line in logs)), None,
-            )
-            if not dex_name:
-                continue
-            record_wallet_ws_activity("dex_log_match", DISCOVERY_SOURCE_SOLANA)
-            record_wallet_ws_activity("transaction_fetch", DISCOVERY_SOURCE_SOLANA)
-            try:
-                transaction = await fetch_transaction(
-                    session, settings.http_url, signature
-                )
-            except Exception as exc:
-                failure_reason = record_transaction_restore_failure(
-                    DISCOVERY_SOURCE_SOLANA, exc
-                )
-                logger.warning(
-                    "standard transaction restore failed category=%s",
-                    failure_reason,
-                )
-                continue
-            if transaction:
-                record_wallet_ws_activity(
-                    "transaction_restore_success", DISCOVERY_SOURCE_SOLANA
-                )
-                record_wallet_ws_activity(
-                    "transaction_parsed", DISCOVERY_SOURCE_SOLANA
-                )
-                print_buys(
-                    transaction,
-                    dex_name,
-                    set(wallets),
-                    discovery_source=DISCOVERY_SOURCE_SOLANA,
-                )
-            else:
-                record_transaction_restore_failure(
-                    DISCOVERY_SOURCE_SOLANA, None
-                )
+                else:
+                    record_transaction_restore_failure(
+                        DISCOVERY_SOURCE_SOLANA, None
+                    )
 
 
 async def monitor_once(settings: MonitorSettings, wallets: tuple[str, ...]) -> None:
     request_to_dex = {index: name for index, name in enumerate(DEX_PROGRAMS, start=1)}
     subscription_to_dex: dict[int, str] = {}
-    async with connect(
+    async with _connect_with_memory_phase(
         settings.ws_url,
+        phase_mode="enhanced",
         ping_interval=20,
         ping_timeout=20,
         open_timeout=20,
@@ -2523,54 +2662,79 @@ async def monitor_once(settings: MonitorSettings, wallets: tuple[str, ...]) -> N
             await socket.send(json.dumps(subscription_request(request_id, wallets, program)))
 
         ping_task = asyncio.create_task(keepalive(socket))
+        subscriptions_ready = False
         try:
             async for raw_message in socket:
-                message = json.loads(raw_message)
-                if "id" in message:
-                    if "error" in message:
-                        if "not available on the free plan" in str(message["error"]):
-                            raise EnhancedSubscriptionUnavailable
-                        raise WebSocketSubscriptionRejected(
-                            websocket_subscription_failure_reason(message["error"])
-                        )
-                    request_id = int(message["id"])
-                    subscription_to_dex[int(message["result"])] = request_to_dex[request_id]
-                    if len(subscription_to_dex) == len(DEX_PROGRAMS):
-                        record_wallet_ws_activity(
-                            "subscription_success", DISCOVERY_SOURCE_HELIUS
-                        )
-                        await asyncio.to_thread(
-                            state_store.set_global_metrics,
-                            {
-                                "wallet_ws_state": "SUBSCRIBED",
-                                "wallet_ws_subscribed_at": time.time(),
-                                "wallet_ws_mode": "ENHANCED",
-                                "wallet_ws_active_source": DISCOVERY_SOURCE_HELIUS,
-                                "wallet_ws_last_success_at": time.time(),
-                                "wallet_ws_consecutive_failures": 0,
-                                "wallet_ws_state_changed_at": time.time(),
-                            },
-                        )
-                    logger.info("subscribed: %s", request_to_dex[request_id])
-                    continue
+                memory_context = (
+                    phase_memory(
+                        "ws_refresh_reconnect",
+                        metadata={
+                            "workload": "websocket",
+                            "operation": "connect",
+                            "mode": "enhanced",
+                            "kind": "steady",
+                            "result": "unknown",
+                        },
+                    )
+                    if not subscriptions_ready else contextlib.nullcontext()
+                )
+                with memory_context as ws_scope:
+                    if ws_scope is not None:
+                        ws_scope.add_metadata(payload_bytes=len(raw_message))
+                    message = json.loads(raw_message)
+                    if "id" in message:
+                        if "error" in message:
+                            if ws_scope is not None:
+                                ws_scope.set_metadata({"result": "failure"})
+                            if "not available on the free plan" in str(message["error"]):
+                                raise EnhancedSubscriptionUnavailable
+                            raise WebSocketSubscriptionRejected(
+                                websocket_subscription_failure_reason(message["error"])
+                            )
+                        request_id = int(message["id"])
+                        subscription_to_dex[int(message["result"])] = request_to_dex[request_id]
+                        if len(subscription_to_dex) == len(DEX_PROGRAMS):
+                            subscriptions_ready = True
+                            if ws_scope is not None:
+                                ws_scope.add_metadata(
+                                    subscription_count=len(subscription_to_dex)
+                                )
+                                ws_scope.set_metadata({"result": "success"})
+                            record_wallet_ws_activity(
+                                "subscription_success", DISCOVERY_SOURCE_HELIUS
+                            )
+                            await asyncio.to_thread(
+                                state_store.set_global_metrics,
+                                {
+                                    "wallet_ws_state": "SUBSCRIBED",
+                                    "wallet_ws_subscribed_at": time.time(),
+                                    "wallet_ws_mode": "ENHANCED",
+                                    "wallet_ws_active_source": DISCOVERY_SOURCE_HELIUS,
+                                    "wallet_ws_last_success_at": time.time(),
+                                    "wallet_ws_consecutive_failures": 0,
+                                    "wallet_ws_state_changed_at": time.time(),
+                                },
+                            )
+                        logger.info("subscribed: %s", request_to_dex[request_id])
+                        continue
 
-                params = message.get("params") or {}
-                subscription_id = params.get("subscription")
-                dex_name = subscription_to_dex.get(subscription_id)
-                value = (params.get("result") or {}).get("value")
-                if dex_name and isinstance(value, dict):
-                    record_wallet_ws_activity(
-                        "notification", DISCOVERY_SOURCE_HELIUS
-                    )
-                    record_wallet_ws_activity(
-                        "transaction_parsed", DISCOVERY_SOURCE_HELIUS
-                    )
-                    print_buys(
-                        value,
-                        dex_name,
-                        set(wallets),
-                        discovery_source=DISCOVERY_SOURCE_HELIUS,
-                    )
+                    params = message.get("params") or {}
+                    subscription_id = params.get("subscription")
+                    dex_name = subscription_to_dex.get(subscription_id)
+                    value = (params.get("result") or {}).get("value")
+                    if dex_name and isinstance(value, dict):
+                        record_wallet_ws_activity(
+                            "notification", DISCOVERY_SOURCE_HELIUS
+                        )
+                        record_wallet_ws_activity(
+                            "transaction_parsed", DISCOVERY_SOURCE_HELIUS
+                        )
+                        print_buys(
+                            value,
+                            dex_name,
+                            set(wallets),
+                            discovery_source=DISCOVERY_SOURCE_HELIUS,
+                        )
         finally:
             ping_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
@@ -2581,12 +2745,30 @@ async def run_forever(settings: MonitorSettings) -> None:
     global _active_signature_window_size
     delay = 3
     route = WalletWsRouteState()
+    first_wallet_load = True
     while True:
         _active_signature_window_size = 0
         connected_at = time.monotonic()
+        cancelled_task_count = 0
         try:
-            wallets = load_wallets(settings.wallets_path)
-            mtime_ns = settings.wallets_path.stat().st_mtime_ns
+            with phase_memory(
+                "wallet_reload",
+                metadata={
+                    "workload": "websocket",
+                    "operation": "read",
+                    "cold_start": first_wallet_load,
+                },
+                include_gc_counts=True,
+                include_object_count=True,
+            ) as wallet_scope:
+                wallets = load_wallets(settings.wallets_path)
+                wallet_stat = settings.wallets_path.stat()
+                mtime_ns = wallet_stat.st_mtime_ns
+                wallet_scope.add_metadata(
+                    wallet_count=len(wallets),
+                    file_bytes=wallet_stat.st_size,
+                )
+            first_wallet_load = False
             logger.info("loaded %s wallets from %s", len(wallets), settings.wallets_path)
             await asyncio.to_thread(
                 state_store.set_global_metrics,
@@ -2622,9 +2804,26 @@ async def run_forever(settings: MonitorSettings) -> None:
                 {monitor_task, watcher_task, heartbeat_task, refresh_task},
                 return_when=asyncio.FIRST_COMPLETED,
             )
-            for task in pending:
-                task.cancel()
-            await asyncio.gather(*pending, return_exceptions=True)
+            with phase_memory(
+                "ws_refresh_reconnect",
+                metadata={
+                    "workload": "websocket",
+                    "operation": "update",
+                    "mode": "standard" if route.uses_standard else "enhanced",
+                    "kind": "steady",
+                    "result": "unknown",
+                },
+                include_gc_counts=True,
+                include_object_count=True,
+            ) as reconnect_scope:
+                for task in pending:
+                    task.cancel()
+                cancelled_task_count = len(pending)
+                await asyncio.gather(*pending, return_exceptions=True)
+                reconnect_scope.add_metadata(
+                    task_count=len(done) + len(pending),
+                    cancelled_task_count=cancelled_task_count,
+                )
             results = await asyncio.gather(*done, return_exceptions=True)
             for result in results:
                 if isinstance(result, WalletListChanged):
@@ -2634,79 +2833,123 @@ async def run_forever(settings: MonitorSettings) -> None:
                     raise result
             raise ConnectionError("WebSocket stream ended")
         except WalletListChanged:
-            logger.info("wallet list updated; reloading file and rebuilding RPC subscriptions")
+            with phase_memory(
+                "ws_refresh_reconnect",
+                metadata={
+                    "workload": "websocket",
+                    "operation": "update",
+                    "mode": "standard" if route.uses_standard else "enhanced",
+                    "kind": "steady",
+                    "result": "success",
+                    "cancelled_task_count": cancelled_task_count,
+                },
+            ):
+                logger.info(
+                    "wallet list updated; reloading file and rebuilding RPC subscriptions"
+                )
             delay = 3
             continue
         except SubscriptionRefresh:
-            logger.info(
-                "wallet WebSocket refresh interval reached; rebuilding subscriptions"
-            )
-            await asyncio.to_thread(
-                state_store.set_global_metrics,
-                {
-                    "wallet_ws_state": "REFRESHING",
-                    "wallet_ws_state_changed_at": time.time(),
+            with phase_memory(
+                "ws_refresh_reconnect",
+                metadata={
+                    "workload": "websocket",
+                    "operation": "update",
+                    "mode": "standard" if route.uses_standard else "enhanced",
+                    "kind": "steady",
+                    "result": "success",
+                    "cancelled_task_count": cancelled_task_count,
                 },
-            )
-            route.refresh(time.monotonic())
+            ):
+                logger.info(
+                    "wallet WebSocket refresh interval reached; rebuilding subscriptions"
+                )
+                await asyncio.to_thread(
+                    state_store.set_global_metrics,
+                    {
+                        "wallet_ws_state": "REFRESHING",
+                        "wallet_ws_state_changed_at": time.time(),
+                    },
+                )
+                route.refresh(time.monotonic())
             delay = 3
             continue
         except EnhancedSubscriptionUnavailable:
-            record_wallet_ws_activity(
-                "subscription_failure", DISCOVERY_SOURCE_HELIUS
-            )
-            logger.warning(
-                "enhanced transactionSubscribe unavailable; switching to wallet-filtered logsSubscribe"
-            )
-            route.activate_standard(time.monotonic())
-            await asyncio.to_thread(
-                state_store.set_global_metrics,
-                {
-                    "wallet_ws_enhanced_fallback_reason": (
-                        "WS_ENHANCED_NOT_AVAILABLE"
-                    ),
-                    "wallet_ws_enhanced_fallback_at": time.time(),
+            with phase_memory(
+                "ws_refresh_reconnect",
+                metadata={
+                    "workload": "websocket",
+                    "operation": "update",
+                    "mode": "enhanced",
+                    "result": "failure",
+                    "cancelled_task_count": cancelled_task_count,
                 },
-            )
+            ):
+                record_wallet_ws_activity(
+                    "subscription_failure", DISCOVERY_SOURCE_HELIUS
+                )
+                logger.warning(
+                    "enhanced transactionSubscribe unavailable; switching to wallet-filtered logsSubscribe"
+                )
+                route.activate_standard(time.monotonic())
+                await asyncio.to_thread(
+                    state_store.set_global_metrics,
+                    {
+                        "wallet_ws_enhanced_fallback_reason": (
+                            "WS_ENHANCED_NOT_AVAILABLE"
+                        ),
+                        "wallet_ws_enhanced_fallback_at": time.time(),
+                    },
+                )
             delay = 3
             continue
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            category = canonical_websocket_failure_reason(exc)
-            failed_mode = route.mode
-            if isinstance(exc, WebSocketSubscriptionRejected):
-                record_wallet_ws_activity(
-                    "subscription_failure",
-                    DISCOVERY_SOURCE_SOLANA
-                    if route.uses_standard else DISCOVERY_SOURCE_HELIUS,
-                )
-            route.record_failure(time.monotonic())
-            await asyncio.to_thread(
-                record_wallet_ws_failure,
-                category,
-            )
-            if (
-                failed_mode == "HELIUS_ENHANCED"
-                and route.mode == "SOLANA_STANDARD"
+            with phase_memory(
+                "ws_refresh_reconnect",
+                metadata={
+                    "workload": "websocket",
+                    "operation": "update",
+                    "mode": "standard" if route.uses_standard else "enhanced",
+                    "result": "failure",
+                    "cancelled_task_count": cancelled_task_count,
+                },
             ):
+                category = canonical_websocket_failure_reason(exc)
+                failed_mode = route.mode
+                if isinstance(exc, WebSocketSubscriptionRejected):
+                    record_wallet_ws_activity(
+                        "subscription_failure",
+                        DISCOVERY_SOURCE_SOLANA
+                        if route.uses_standard else DISCOVERY_SOURCE_HELIUS,
+                    )
+                route.record_failure(time.monotonic())
                 await asyncio.to_thread(
-                    state_store.set_global_metrics,
-                    {
-                        "wallet_ws_enhanced_fallback_reason": category,
-                        "wallet_ws_enhanced_fallback_at": time.time(),
-                    },
+                    record_wallet_ws_failure,
+                    category,
                 )
-            if time.monotonic() - connected_at >= 60:
-                delay = 3
-            logger.exception(
-                "connection lost; reconnecting in %s seconds category=%s "
-                "failed_mode=%s next_mode=%s",
-                delay,
-                category,
-                failed_mode,
-                route.mode,
-            )
+                if (
+                    failed_mode == "HELIUS_ENHANCED"
+                    and route.mode == "SOLANA_STANDARD"
+                ):
+                    await asyncio.to_thread(
+                        state_store.set_global_metrics,
+                        {
+                            "wallet_ws_enhanced_fallback_reason": category,
+                            "wallet_ws_enhanced_fallback_at": time.time(),
+                        },
+                    )
+                if time.monotonic() - connected_at >= 60:
+                    delay = 3
+                logger.exception(
+                    "connection lost; reconnecting in %s seconds category=%s "
+                    "failed_mode=%s next_mode=%s",
+                    delay,
+                    category,
+                    failed_mode,
+                    route.mode,
+                )
             await asyncio.sleep(delay)
             delay = min(delay * 2, 300)
 
@@ -2755,7 +2998,10 @@ async def run_service() -> None:
 
 def main() -> None:
     configure_safe_logging()
-    asyncio.run(run_service())
+    try:
+        asyncio.run(run_service())
+    finally:
+        flush_phase_memory_telemetry()
 
 
 if __name__ == "__main__":

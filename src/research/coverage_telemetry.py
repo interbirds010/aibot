@@ -11,6 +11,10 @@ from pathlib import Path
 from typing import Any
 
 from src import state_store
+from src.phase_memory_telemetry import (
+    add_current_phase_metadata,
+    phase_memory,
+)
 
 
 TELEMETRY_PATH = (
@@ -597,9 +601,9 @@ def _build_hourly_rollup(
     return hour
 
 
-def _refresh_hourly_rollups(
+def _refresh_hourly_rollups_body(
     raw_document: dict[str, Any], *, now_epoch: float
-) -> None:
+) -> dict[str, Any]:
     current_hour = _hour_start(now_epoch)
     raw_index = {
         int(bucket.get("bucket_start_epoch", 0) or 0): bucket
@@ -655,14 +659,44 @@ def _refresh_hourly_rollups(
             ).isoformat(),
         })
 
-    state_store.update_json(
+    _, saved = state_store.update_json(
         HOURLY_TELEMETRY_PATH,
         _empty_hourly_document(),
         mutate,
     )
+    return saved
 
 
-def flush_coverage_telemetry(*, now_epoch: float | None = None) -> bool:
+def _refresh_hourly_rollups(
+    raw_document: dict[str, Any], *, now_epoch: float
+) -> None:
+    """72-hour rebuild/write의 RSS·HWM과 compact workload만 기록한다."""
+    with phase_memory(
+        "hourly_rollup",
+        metadata={
+            "workload": "coverage",
+            "operation": "rebuild",
+            "source_bucket_count": len(raw_document.get("buckets", [])),
+            "rollup_needed": True,
+        },
+        include_gc_counts=True,
+        include_object_count=True,
+    ) as scope:
+        saved = _refresh_hourly_rollups_body(
+            raw_document, now_epoch=now_epoch
+        )
+        hours = saved.get("hours", [])
+        try:
+            state_bytes = HOURLY_TELEMETRY_PATH.stat().st_size
+        except OSError:
+            state_bytes = 0
+        scope.add_metadata(
+            hour_count=len(hours) if isinstance(hours, list) else 0,
+            file_bytes=state_bytes,
+        )
+
+
+def _flush_coverage_telemetry_body(*, now_epoch: float | None = None) -> bool:
     """메모리 집계를 단일 원자적 write로 병합하고 최근 6시간만 유지한다."""
     global _last_hourly_refresh_bucket_start
     global _last_raw_heartbeat_bucket_start
@@ -672,12 +706,14 @@ def flush_coverage_telemetry(*, now_epoch: float | None = None) -> bool:
     with _pending_lock:
         pending = dict(_pending_buckets)
         _pending_buckets.clear()
+    add_current_phase_metadata(pending_count=len(pending))
     had_pending = bool(pending)
     heartbeat_needed = _last_raw_heartbeat_bucket_start != current_bucket
     rollup_needed = (
         _last_hourly_refresh_bucket_start != current_hour
         or any(_hour_start(start) < current_hour for start in pending)
     )
+    add_current_phase_metadata(rollup_needed=rollup_needed)
     if not had_pending and not heartbeat_needed and not rollup_needed:
         return False
 
@@ -727,10 +763,29 @@ def flush_coverage_telemetry(*, now_epoch: float | None = None) -> bool:
         _merge_pending_back(pending)
         raise
     _last_raw_heartbeat_bucket_start = current_bucket
+    try:
+        state_bytes = TELEMETRY_PATH.stat().st_size
+    except OSError:
+        state_bytes = 0
+    add_current_phase_metadata(
+        bucket_count=len(raw_document.get("buckets", [])),
+        file_bytes=state_bytes,
+    )
     if rollup_needed:
         _refresh_hourly_rollups(raw_document, now_epoch=now)
         _last_hourly_refresh_bucket_start = current_hour
     return had_pending
+
+
+def flush_coverage_telemetry(*, now_epoch: float | None = None) -> bool:
+    """Raw merge와 선택적 hourly rebuild overlap을 함께 계측한다."""
+    with phase_memory(
+        "coverage_telemetry_flush",
+        metadata={"workload": "coverage", "operation": "flush"},
+        include_gc_counts=True,
+        include_object_count=True,
+    ):
+        return _flush_coverage_telemetry_body(now_epoch=now_epoch)
 
 
 def _ratio(

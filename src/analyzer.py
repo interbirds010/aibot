@@ -15,6 +15,10 @@ import aiohttp
 from dotenv import load_dotenv
 from solders.pubkey import Pubkey
 from src.logging_utils import configure_safe_logging, redact_sensitive_text
+from src.phase_memory_telemetry import (
+    add_current_phase_metadata,
+    phase_memory,
+)
 from src.runtime_memory import estimate_object_size_bytes
 from src.solana_rpc import provider_configs_from_env, solana_rpc_call
 
@@ -78,6 +82,16 @@ async def rugcheck_get(
     delay = 2
     for attempt in range(4):
         async with session.get(url, headers={"accept": "application/json"}) as response:
+            content_length = getattr(response, "content_length", None)
+            content_length_known = (
+                isinstance(content_length, int) and content_length >= 0
+            )
+            add_current_phase_metadata(
+                response_count=1,
+                response_bytes=int(content_length) if content_length_known else 0,
+                missing_length_count=int(not content_length_known),
+                content_length_known=content_length_known,
+            )
             if response.status == 404:
                 return None
             if response.status == 429 or response.status >= 500:
@@ -354,7 +368,22 @@ async def _run_analysis_flight(
     settings: AnalyzerSettings,
 ) -> SafetyReport:
     try:
-        report = await _analyze_token_uncached(mint, settings)
+        with phase_memory(
+            "analyzer",
+            metadata={
+                "workload": "analyzer",
+                "operation": "analyze",
+                "request_count": 4,
+                "candidate_count": 1,
+            },
+            include_gc_counts=True,
+            include_object_count=True,
+        ) as scope:
+            report = await _analyze_token_uncached(mint, settings)
+            scope.add_metadata(
+                success_count=1,
+                row_count=len(report.reasons),
+            )
         async with _analysis_cache_lock:
             now = time.monotonic()
             expired = [

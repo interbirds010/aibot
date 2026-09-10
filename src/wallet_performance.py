@@ -16,6 +16,7 @@ from dotenv import load_dotenv
 
 from src import state_store
 from src.logging_utils import redact_sensitive_text
+from src.phase_memory_telemetry import phase_memory
 from src.solana_rpc import solana_rpc_call
 from src.state_store import (
     atomic_write_json,
@@ -74,7 +75,7 @@ def wallet_is_cooling_down(row: Any) -> bool:
     return isinstance(row, dict) and row.get("status") == STATUS_COOL_DOWN
 
 
-def cooldown_and_replace(wallet: str, reason: str) -> None:
+def _cooldown_and_replace(wallet: str, reason: str) -> bool:
     max_wallets = max(1, int(os.getenv("WALLET_MAX_WALLETS", "20")))
     performance = read_json(PERFORMANCE_PATH, {"wallets": {}})
     performance_rows = performance.get("wallets", {}) if isinstance(performance, dict) else {}
@@ -120,6 +121,30 @@ def cooldown_and_replace(wallet: str, reason: str) -> None:
         "wallet cool-down started wallet=%s duration_seconds=%s reason=%s replacement=%s",
         wallet, COOLDOWN_SECONDS, reason, (replacement or {}).get("address"),
     )
+    return replacement is not None
+
+
+def cooldown_and_replace(wallet: str, reason: str) -> None:
+    """Wallet state 교체의 sub-minute memory peak만 별도로 계측한다."""
+    with phase_memory(
+        "wallet_performance_refresh",
+        metadata={"workload": "wallet_performance", "operation": "update"},
+        include_gc_counts=True,
+        include_object_count=True,
+    ) as scope:
+        replacement_added = _cooldown_and_replace(wallet, reason)
+        try:
+            state_bytes = PERFORMANCE_PATH.stat().st_size
+        except OSError:
+            state_bytes = 0
+        try:
+            wallet_bytes = WALLETS_PATH.stat().st_size
+        except OSError:
+            wallet_bytes = 0
+        scope.add_metadata(
+            file_bytes=state_bytes + wallet_bytes,
+            replacement_count=int(replacement_added),
+        )
 
 
 def wallet_row(state: dict[str, Any], wallet: str) -> dict[str, Any]:
@@ -616,41 +641,63 @@ async def performance_loop(interval_seconds: float = 60) -> None:
     async with aiohttp.ClientSession(timeout=timeout) as session:
         while True:
             await asyncio.sleep(interval_seconds)
-            cooldowns: list[tuple[str, str]] = []
-            for wallet, sample in due_observations(time.time()):
+            with phase_memory(
+                "wallet_performance_refresh",
+                metadata={
+                    "workload": "wallet_performance",
+                    "operation": "update",
+                },
+                include_gc_counts=True,
+                include_object_count=True,
+            ) as scope:
+                cooldowns: list[tuple[str, str]] = []
+                due = due_observations(time.time())
                 try:
-                    amount = int(sample.get("acquired_raw", 0) or 0)
-                    if sample.get("legacy_probe"):
-                        amount = await legacy_probe_amount(
-                            session, "solana-rpc-router", str(sample["mint"])
+                    state_bytes = PERFORMANCE_PATH.stat().st_size
+                except OSError:
+                    state_bytes = 0
+                scope.add_metadata(
+                    due_count=len(due),
+                    file_bytes=state_bytes,
+                )
+                for wallet, sample in due:
+                    try:
+                        scope.add_metadata(request_count=1)
+                        amount = int(sample.get("acquired_raw", 0) or 0)
+                        if sample.get("legacy_probe"):
+                            amount = await legacy_probe_amount(
+                                session, "solana-rpc-router", str(sample["mint"])
+                            )
+                        quote = await jupiter_quote(
+                            session,
+                            api_key,
+                            str(sample["mint"]),
+                            WSOL_MINT,
+                            amount,
+                            fail_fast_bad_request=True,
                         )
-                    quote = await jupiter_quote(
-                        session,
-                        api_key,
-                        str(sample["mint"]),
-                        WSOL_MINT,
-                        amount,
-                        fail_fast_bad_request=True,
-                    )
-                    current_price = int(quote["outAmount"]) / amount
-                    reason = complete_observation(wallet, sample, current_price)
-                    if reason:
-                        cooldowns.append((wallet, reason))
-                except JupiterNoRouteError:
-                    if skip_observation(wallet, sample):
-                        logger.info(
-                            "wallet observation skipped: wallet=%s mint=%s "
-                            "reason=NO_ROUTE_PERFORMANCE",
+                        current_price = int(quote["outAmount"]) / amount
+                        reason = complete_observation(wallet, sample, current_price)
+                        scope.add_metadata(success_count=1)
+                        if reason:
+                            cooldowns.append((wallet, reason))
+                    except JupiterNoRouteError:
+                        if skip_observation(wallet, sample):
+                            scope.add_metadata(failure_count=1)
+                            logger.info(
+                                "wallet observation skipped: wallet=%s mint=%s "
+                                "reason=NO_ROUTE_PERFORMANCE",
+                                wallet,
+                                sample.get("mint"),
+                            )
+                    except Exception as exc:
+                        fail_observation(wallet, sample, exc)
+                        scope.add_metadata(failure_count=1)
+                        logger.warning(
+                            "wallet observation retry scheduled: wallet=%s mint=%s error=%s",
                             wallet,
                             sample.get("mint"),
+                            redact_sensitive_text(exc),
                         )
-                except Exception as exc:
-                    fail_observation(wallet, sample, exc)
-                    logger.warning(
-                        "wallet observation retry scheduled: wallet=%s mint=%s error=%s",
-                        wallet,
-                        sample.get("mint"),
-                        redact_sensitive_text(exc),
-                    )
-            for wallet, reason in cooldowns:
-                cooldown_and_replace(wallet, reason)
+                for wallet, reason in cooldowns:
+                    cooldown_and_replace(wallet, reason)

@@ -16,6 +16,7 @@ import aiohttp
 from dotenv import load_dotenv
 
 from src.logging_utils import redact_sensitive_text
+from src.phase_memory_telemetry import phase_memory
 from src.research.prospective_features import (
     normalize_prospective_feature_collection,
 )
@@ -407,18 +408,34 @@ def archive_and_retain_observations(rows: list[Any]) -> list[Any]:
 
     archive_path = OBSERVATION_PATH.parent / "research_archive"
     metrics_path = OBSERVATION_PATH.parent / "research_archive_metrics.json"
-    archive_terminal_rows(
-        (
-            row for row in rows
-            if isinstance(row, dict)
-            and not (
-                row.get("archive_schema_version") == 1
-                and row.get("archived_at")
-            )
-        ),
-        archive_path=archive_path,
-        metrics_path=metrics_path,
-    )
+    with phase_memory(
+        "archive_write",
+        metadata={
+            "workload": "observation",
+            "operation": "archive",
+            "row_count": len(rows),
+        },
+        include_gc_counts=True,
+        include_object_count=True,
+    ) as archive_scope:
+        archive_result = archive_terminal_rows(
+            (
+                row for row in rows
+                if isinstance(row, dict)
+                and not (
+                    row.get("archive_schema_version") == 1
+                    and row.get("archived_at")
+                )
+            ),
+            archive_path=archive_path,
+            metrics_path=metrics_path,
+        )
+        archive_scope.add_metadata(
+            candidate_count=archive_result["eligible"],
+            archive_count=archive_result["archived"],
+            duplicate_count=archive_result["duplicate"],
+            failure_count=archive_result["failed"],
+        )
     unarchived_ids = {
         id(row) for row in rows
         if isinstance(row, dict)
@@ -988,24 +1005,41 @@ def _due_sample_candidates(
 
 def due_observation_samples(now: float) -> list[tuple[str, str, str, int, float]]:
     """가장 오래된 deadline부터 bounded batch를 반환한다."""
-    document = ensure_observations_migrated()
-    due = _due_sample_candidates(document.get("observations", []), now)
-    selected = due[:OBSERVATION_SAMPLE_BATCH_SIZE]
-    rows_by_id = {
-        str(row.get("observation_id", "")): row
-        for row in document.get("observations", [])
-        if isinstance(row, dict)
-    }
-    for observation_id, label, mint, _, _ in selected:
-        if label != "60m":
-            continue
-        row = rows_by_id.get(observation_id, {})
-        record_funnel_stage(
-            "horizon_60m_due",
-            mint=mint,
-            family=signal_type_for_route(row.get("route_type")),
+    with phase_memory(
+        "observation_due_scan",
+        metadata={"workload": "observation", "operation": "scan"},
+        include_gc_counts=True,
+        include_object_count=True,
+    ) as due_scope:
+        document = ensure_observations_migrated()
+        rows = document.get("observations", [])
+        due = _due_sample_candidates(rows, now)
+        selected = due[:OBSERVATION_SAMPLE_BATCH_SIZE]
+        try:
+            observation_file_bytes = OBSERVATION_PATH.stat().st_size
+        except OSError:
+            observation_file_bytes = 0
+        due_scope.add_metadata(
+            row_count=len(rows) if isinstance(rows, list) else 0,
+            due_count=len(due),
+            batch_size=len(selected),
+            file_bytes=observation_file_bytes,
         )
-    return selected
+        rows_by_id = {
+            str(row.get("observation_id", "")): row
+            for row in rows
+            if isinstance(row, dict)
+        }
+        for observation_id, label, mint, _, _ in selected:
+            if label != "60m":
+                continue
+            row = rows_by_id.get(observation_id, {})
+            record_funnel_stage(
+                "horizon_60m_due",
+                mint=mint,
+                family=signal_type_for_route(row.get("route_type")),
+            )
+        return selected
 
 
 def horizon_sample_is_missed(now_epoch: float, target_at_epoch: float) -> bool:
@@ -1228,24 +1262,56 @@ async def observation_loop(interval_seconds: float = 15.0) -> None:
         backfill_research_archive,
     )
 
-    await asyncio.to_thread(ensure_shadow_trades_migrated)
-    archive_backfill = await asyncio.to_thread(
-        backfill_research_archive,
-        observation_document.get("observations", []),
-        archive_path=OBSERVATION_PATH.parent / "research_archive",
-        metrics_path=OBSERVATION_PATH.parent / "research_archive_metrics.json",
-    )
-    logger.info("research archive reconciliation: %s", archive_backfill)
-    archive_metrics = await asyncio.to_thread(
-        archive_integrity_metrics,
-        operational_rows=observation_document.get("observations", []),
-        archive_path=OBSERVATION_PATH.parent / "research_archive",
-        metrics_path=OBSERVATION_PATH.parent / "research_archive_metrics.json",
-    )
-    backfilled = await asyncio.to_thread(
-        backfill_completed_shadow_trades,
-        observation_document.get("observations", []),
-    )
+    observation_rows = observation_document.get("observations", [])
+    with phase_memory(
+        "archive_write",
+        metadata={
+            "workload": "observation",
+            "operation": "archive",
+            "kind": "startup",
+            "row_count": (
+                len(observation_rows) if isinstance(observation_rows, list) else 0
+            ),
+        },
+        include_gc_counts=True,
+        include_object_count=True,
+    ) as archive_scope:
+        await asyncio.to_thread(ensure_shadow_trades_migrated)
+        archive_backfill = await asyncio.to_thread(
+            backfill_research_archive,
+            observation_rows,
+            archive_path=OBSERVATION_PATH.parent / "research_archive",
+            metrics_path=OBSERVATION_PATH.parent / "research_archive_metrics.json",
+        )
+        logger.info("research archive reconciliation: %s", archive_backfill)
+        archive_metrics = await asyncio.to_thread(
+            archive_integrity_metrics,
+            operational_rows=observation_rows,
+            archive_path=OBSERVATION_PATH.parent / "research_archive",
+            metrics_path=OBSERVATION_PATH.parent / "research_archive_metrics.json",
+        )
+        backfilled = await asyncio.to_thread(
+            backfill_completed_shadow_trades,
+            observation_rows,
+        )
+        archive_scope.add_metadata(
+            archive_count=sum(
+                int(value)
+                for key, value in archive_backfill.items()
+                if key.endswith("_archived")
+            ),
+            duplicate_count=sum(
+                int(value)
+                for key, value in archive_backfill.items()
+                if key.endswith("_duplicate")
+            ),
+            failure_count=sum(
+                int(value)
+                for key, value in archive_backfill.items()
+                if key.endswith("_failed")
+            ),
+            success_count=int(backfilled),
+        )
     if backfilled:
         logger.info("completed shadow trades backfilled: count=%s", backfilled)
 
