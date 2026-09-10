@@ -290,9 +290,10 @@ jobs:
             ./venv/bin/python -m compileall -q src
             ./venv/bin/python -c \
               "import fcntl; from src.state_store import exclusive_file_lock; print('fcntl/state_store: OK')"
+            export PM2_HOME=/home/deploy/.pm2
+            ./venv/bin/python scripts/pm2_topology_check.py --phase preflight
             ./venv/bin/python -m src.research_archive
 
-            export PM2_HOME=/home/deploy/.pm2
             pm2 startOrReload ecosystem.config.js --update-env
 
             pm2 describe aibot-monitor >/dev/null
@@ -359,6 +360,7 @@ jobs:
             Path(sys.argv[1]).write_text(json.dumps(selected), encoding="utf-8")
             PY
 
+            ./venv/bin/python scripts/pm2_topology_check.py --phase poststart
             ./venv/bin/python - <<'PY'
             import json
             from pathlib import Path
