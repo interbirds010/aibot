@@ -2124,8 +2124,7 @@ async def confirm_unknown_whales(
                 "workload": "transaction",
                 "operation": "fetch",
                 "transaction_count": 1,
-                # 이전 raw transaction은 다음 fetch 결과가 대입될 때까지 유지된다.
-                # 수명은 바꾸지 않고 해당 overlap만 계측한다.
+                # 이전 raw transaction은 matching 직후 해제되어야 한다.
                 "retained_count": int(isinstance(transaction, dict)),
             },
         ):
@@ -2143,6 +2142,7 @@ async def confirm_unknown_whales(
                 ],
             )
         if not isinstance(transaction, dict):
+            transaction = None
             continue
         add_current_phase_metadata(retained_count=1)
         with phase_memory(
@@ -2157,6 +2157,8 @@ async def confirm_unknown_whales(
                 transaction, candidate.mint, watched_wallets
             )
             matching_scope.add_metadata(projected_count=len(matched_buys))
+        # 이후 단계는 compact projection만 사용하므로 raw graph를 해제한다.
+        transaction = None
         with phase_memory(
             "whale_confirmation_aggregation",
             metadata={"workload": "momentum", "operation": "update"},
@@ -2180,7 +2182,6 @@ async def confirm_unknown_whales(
         metadata={
             "workload": "momentum",
             "operation": "serialize",
-            # 마지막 raw transaction은 함수 frame 반환 시 자연 해제된다.
             "retained_count": int(isinstance(transaction, dict)),
         },
     ) as result_scope:

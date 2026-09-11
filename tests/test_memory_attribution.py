@@ -57,6 +57,7 @@ class SequentialWhaleRpc:
                 {"signature": "SIG-1", "err": None},
                 {"signature": "SIG-2", "err": None},
                 {"signature": "SIG-3", "err": None},
+                {"signature": "SIG-4", "err": None},
             ])
             self.signatures_ref = weakref.ref(rows)
             return rows
@@ -140,7 +141,7 @@ class MemoryAttributionTests(unittest.TestCase):
         telemetry._sampler_stop_event = None
         self.temporary.cleanup()
 
-    def test_whale_subphases_preserve_sequence_and_expose_raw_overlap(self) -> None:
+    def test_whale_subphases_release_raw_before_next_fetch(self) -> None:
         candidate = monitor.MomentumCandidate(
             "MINT", "PAIR", 20_000.0, 40, 10, 20_000.0, 1_000.0
         )
@@ -160,10 +161,14 @@ class MemoryAttributionTests(unittest.TestCase):
 
         self.assertEqual(len(result), 3)
         self.assertEqual(
+            [buy.wallet for buy in result],
+            ["WALLET-1", "WALLET-2", "WALLET-3"],
+        )
+        self.assertEqual(
             rpc.methods,
             ["getSignaturesForAddress"] + ["getTransaction"] * 3,
         )
-        self.assertEqual(rpc.previous_alive_before_next, [True, True])
+        self.assertEqual(rpc.previous_alive_before_next, [False, False])
         self.assertEqual(rpc.signatures_alive_during_fetch, [True, True, True])
         self.assertTrue(all(reference() is None for reference in rpc.transaction_refs))
         self.assertIsNone(rpc.signatures_ref())
@@ -183,13 +188,13 @@ class MemoryAttributionTests(unittest.TestCase):
             document["phases"]["whale_transaction_fetch"]["metadata_maxima"][
                 "retained_count"
             ],
-            1,
+            0,
         )
         self.assertEqual(
             document["phases"]["whale_result_projection"]["metadata_maxima"][
                 "retained_count"
             ],
-            1,
+            0,
         )
         self.assertNotIn("raw-marker", repr(document))
         self.assertNotIn("SIG-1", repr(document))
