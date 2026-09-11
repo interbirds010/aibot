@@ -4,6 +4,8 @@ import asyncio
 import json
 import tempfile
 import unittest
+import weakref
+from dataclasses import fields
 from decimal import Decimal
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -423,6 +425,303 @@ class MarketMomentumTests(unittest.TestCase):
             monitor.DEX_SCREENER_SEARCH_URL,
             monitor.DEX_SCREENER_PROFILES_URL,
             monitor.DEX_SCREENER_BOOSTS_URL,
+        ])
+
+    def test_fetch_projection_preserves_order_dedupe_and_metadata(self) -> None:
+        def pair(
+            mint: str,
+            address: str,
+            *,
+            volume: float,
+            buys: int,
+            sells: int,
+            liquidity: float = 10_000,
+        ) -> dict[str, object]:
+            return {
+                "chainId": "solana",
+                "pairAddress": address,
+                "baseToken": {"address": mint},
+                "txns": {"m5": {"buys": buys, "sells": sells}},
+                "volume": {"m5": volume},
+                "liquidity": {"usd": liquidity},
+                "priceUsd": "0.0012",
+                "pairCreatedAt": 1,
+            }
+
+        search = {
+            "pairs": [
+                pair("A", "A_LOW", volume=16_000, buys=40, sells=10),
+                pair("A", "A_SEARCH", volume=20_000, buys=50, sells=10),
+                pair("B", "B_SHADOW", volume=14_999, buys=36, sells=20),
+                pair("C", "C_BEST", volume=30_000, buys=60, sells=10),
+                {"chainId": "ethereum", "raw": "ignored"},
+            ]
+        }
+        profiles = [
+            {"chainId": "solana", "tokenAddress": "D"},
+            {"chainId": "solana", "tokenAddress": "E"},
+        ]
+        boosts = [
+            {"chainId": "solana", "tokenAddress": "D"},
+            {"chainId": "solana", "tokenAddress": "A"},
+        ]
+        token_pairs = [
+            pair("D", "D_TOKEN", volume=18_000, buys=40, sells=10),
+            pair(
+                "E", "E_SHADOW", volume=30_000, buys=60, sells=10,
+                liquidity=9_999,
+            ),
+            pair("A", "A_TOKEN", volume=25_000, buys=60, sells=10),
+        ]
+        payloads = iter([search, profiles, boosts, token_pairs])
+        calls: list[tuple[str, dict[str, str]]] = []
+
+        async def fetch(_session, url, **params):
+            calls.append((url, params))
+            return next(payloads)
+
+        stages: list[tuple[str, str, str, float]] = []
+
+        def record_stage(stage, *, mint, family, timestamp):
+            stages.append((stage, mint, family, timestamp))
+
+        metadata: list[dict[str, int]] = []
+        store = monitor.MomentumSnapshotStore()
+        with (
+            patch.object(monitor.time, "time", return_value=2_000),
+            patch.object(monitor, "_dexscreener_json", new=fetch),
+            patch.object(monitor, "_momentum_snapshot_store", store),
+            patch.object(monitor, "record_funnel_stage", new=record_stage),
+            patch.object(
+                monitor,
+                "add_current_phase_metadata",
+                side_effect=lambda **values: metadata.append(values),
+            ),
+        ):
+            approved, shadows = asyncio.run(
+                monitor._fetch_momentum_candidate_cohorts(object())
+            )
+
+        self.assertEqual(
+            [(item.mint, item.pair_address, item.momentum_score) for item in approved],
+            [("C", "C_BEST", 100.0), ("A", "A_TOKEN", 90.0), ("D", "D_TOKEN", 76.0)],
+        )
+        self.assertEqual(
+            [
+                (item.candidate.mint, item.candidate.pair_address, item.rejection_reasons)
+                for item in shadows
+            ],
+            [
+                ("E", "E_SHADOW", ("MOMENTUM_LIQUIDITY_UNDER_MIN",)),
+                ("B", "B_SHADOW", ("MOMENTUM_VOLUME_UNDER_MIN",)),
+            ],
+        )
+        self.assertEqual([url for url, _ in calls], [
+            monitor.DEX_SCREENER_SEARCH_URL,
+            monitor.DEX_SCREENER_PROFILES_URL,
+            monitor.DEX_SCREENER_BOOSTS_URL,
+            f"{monitor.DEX_SCREENER_TOKENS_URL}/D,E,A",
+        ])
+        self.assertEqual(calls[0][1], {"q": "solana"})
+        self.assertTrue(all(not params for _, params in calls[1:]))
+        self.assertEqual(
+            [mint for stage, mint, _, _ in stages if stage == "poll_candidate_observed"],
+            ["A", "A", "B", "C", "D", "E", "A"],
+        )
+        self.assertEqual(
+            [mint for stage, mint, _, _ in stages if stage == "candidate_considered"],
+            ["C", "A", "D", "E", "B"],
+        )
+        self.assertTrue(all(family == "MOMENTUM" for _, _, family, _ in stages))
+        self.assertEqual(store.series_count, 5)
+        self.assertEqual(store.snapshot_count, 5)
+        self.assertEqual(metadata, [{
+            "row_count": 8,
+            "approved_count": 3,
+            "shadow_count": 2,
+            "active_series_count": 5,
+            "snapshot_count": 5,
+        }])
+
+    def test_raw_response_objects_end_before_the_next_stage(self) -> None:
+        class WeakDict(dict):
+            pass
+
+        class WeakList(list):
+            pass
+
+        references: dict[str, list[weakref.ReferenceType[object]]] = {}
+        checks: list[tuple[str, bool]] = []
+        call_index = 0
+
+        def remember(name: str, container: object, row: object) -> None:
+            references[name] = [weakref.ref(container), weakref.ref(row)]
+
+        def released(name: str) -> bool:
+            return all(reference() is None for reference in references[name])
+
+        async def fetch(_session, url, **_params):
+            nonlocal call_index
+            call_index += 1
+            if call_index == 1:
+                row = WeakDict({
+                    "chainId": "solana",
+                    "pairAddress": "SEARCH_PAIR",
+                    "baseToken": {"address": "SEARCH_MINT"},
+                    "txns": {"m5": {"buys": 36, "sells": 20}},
+                    "volume": {"m5": 15_000},
+                    "liquidity": {"usd": 10_000},
+                    "pairCreatedAt": 1,
+                    "raw_payload_marker": "search-must-not-survive",
+                })
+                container = WeakDict({"pairs": WeakList([row])})
+                remember("search", container, row)
+                return container
+            if call_index == 2:
+                checks.append(("search_before_profiles", released("search")))
+                row = WeakDict({
+                    "chainId": "solana",
+                    "tokenAddress": "TOKEN_MINT",
+                    "raw_payload_marker": "profile-must-not-survive",
+                })
+                container = WeakList([row])
+                remember("profiles", container, row)
+                return container
+            if call_index == 3:
+                checks.append(("profiles_before_boosts", released("profiles")))
+                row = WeakDict({
+                    "chainId": "solana",
+                    "tokenAddress": "TOKEN_MINT",
+                    "raw_payload_marker": "boost-must-not-survive",
+                })
+                container = WeakList([row])
+                remember("boosts", container, row)
+                return container
+            checks.append(("boosts_before_tokens", released("boosts")))
+            row = WeakDict({
+                "chainId": "solana",
+                "pairAddress": "TOKEN_PAIR",
+                "baseToken": {"address": "TOKEN_MINT"},
+                "txns": {"m5": {"buys": 36, "sells": 20}},
+                "volume": {"m5": 15_000},
+                "liquidity": {"usd": 10_000},
+                "pairCreatedAt": 1,
+                "raw_payload_marker": "token-must-not-survive",
+            })
+            container = WeakList([row])
+            remember("tokens", container, row)
+            return container
+
+        def record_stage(*_args, **_kwargs):
+            if "tokens" in references and not any(
+                name == "tokens_before_evaluation" for name, _ in checks
+            ):
+                checks.append(("tokens_before_evaluation", released("tokens")))
+
+        with (
+            patch.object(monitor.time, "time", return_value=2_000),
+            patch.object(monitor, "_dexscreener_json", new=fetch),
+            patch.object(
+                monitor,
+                "_momentum_snapshot_store",
+                monitor.MomentumSnapshotStore(),
+            ),
+            patch.object(monitor, "record_funnel_stage", new=record_stage),
+        ):
+            asyncio.run(monitor._fetch_momentum_candidate_cohorts(object()))
+
+        self.assertEqual(call_index, 4)
+        self.assertEqual(checks, [
+            ("search_before_profiles", True),
+            ("profiles_before_boosts", True),
+            ("boosts_before_tokens", True),
+            ("tokens_before_evaluation", True),
+        ])
+
+    def test_pair_projection_contains_only_candidate_scalars(self) -> None:
+        projection = monitor._momentum_pair_projection({
+            "chainId": "solana",
+            "pairAddress": "PAIR",
+            "baseToken": {"address": "MINT", "name": "ignored"},
+            "txns": {"m5": {"buys": 36, "sells": 20}, "h1": {"buys": 999}},
+            "volume": {"m5": 15_000, "h24": 999_999},
+            "liquidity": {"usd": 10_000, "base": 999},
+            "priceUsd": "0.0012",
+            "pairCreatedAt": 1,
+            "raw_payload_marker": "must-not-survive",
+        })
+        self.assertEqual(
+            [field.name for field in fields(projection)],
+            [
+                "is_solana", "mint", "pair_address", "buys_m5", "sells_m5",
+                "volume_m5_usd", "liquidity_usd", "pair_created_at_ms",
+                "price_usd", "structural_error",
+            ],
+        )
+        self.assertNotIn("raw_payload_marker", repr(projection))
+        self.assertNotIn("h24", repr(projection))
+        self.assertNotIn("h1", repr(projection))
+
+    def test_pair_projection_does_not_retain_nested_raw_metric_objects(self) -> None:
+        class WeakList(list):
+            pass
+
+        raw_buys = WeakList([{"large": "raw-object-graph"}])
+        reference = weakref.ref(raw_buys)
+        pair = {
+            "chainId": "solana",
+            "pairAddress": "PAIR",
+            "baseToken": {"address": "MINT"},
+            "txns": {"m5": {"buys": raw_buys, "sells": 20}},
+            "volume": {"m5": 15_000},
+            "liquidity": {"usd": 10_000},
+            "pairCreatedAt": 1,
+        }
+
+        projection = monitor._momentum_pair_projection(pair)
+        del pair, raw_buys
+
+        self.assertIsNone(reference())
+        self.assertIsNone(projection.buys_m5)
+        evaluated = monitor._momentum_shadow_candidate_from_projection(
+            projection, now_ms=2_000_000
+        )
+        self.assertIsNotNone(evaluated)
+        assert evaluated is not None
+        self.assertIn("MOMENTUM_METRIC_INVALID", evaluated.rejection_reasons)
+
+    def test_malformed_pair_structure_fails_after_network_sequence(self) -> None:
+        malformed_pair = {
+            "chainId": "solana",
+            "pairAddress": "PAIR",
+            "baseToken": {"address": "MINT"},
+            "txns": ["invalid-structure"],
+        }
+        calls: list[str] = []
+        payloads = iter([
+            {"pairs": [malformed_pair]},
+            [{"chainId": "solana", "tokenAddress": "MINT"}],
+            [],
+            [],
+        ])
+
+        async def fetch(_session, url, **_params):
+            calls.append(url)
+            return next(payloads)
+
+        with patch.object(monitor, "_dexscreener_json", new=fetch):
+            with self.assertRaisesRegex(
+                AttributeError, "malformed DexScreener pair structure"
+            ):
+                asyncio.run(
+                    monitor._fetch_momentum_candidate_cohorts(object())
+                )
+
+        self.assertEqual(calls, [
+            monitor.DEX_SCREENER_SEARCH_URL,
+            monitor.DEX_SCREENER_PROFILES_URL,
+            monitor.DEX_SCREENER_BOOSTS_URL,
+            f"{monitor.DEX_SCREENER_TOKENS_URL}/MINT",
         ])
 
     def test_existing_fetch_populates_only_projected_snapshot_fields(self) -> None:

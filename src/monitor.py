@@ -412,6 +412,20 @@ class MomentumShadowCandidate:
 
 
 @dataclass(frozen=True, slots=True)
+class _MomentumPairProjection:
+    is_solana: bool
+    mint: str
+    pair_address: str
+    buys_m5: float | None = None
+    sells_m5: float | None = None
+    volume_m5_usd: float | None = None
+    liquidity_usd: float | None = None
+    pair_created_at_ms: float | None = None
+    price_usd: float | None = None
+    structural_error: bool = False
+
+
+@dataclass(frozen=True, slots=True)
 class UnknownWhaleBuy:
     wallet: str
     signature: str
@@ -1656,21 +1670,21 @@ def momentum_candidate_from_pair(
     return evaluated.candidate
 
 
-def momentum_shadow_candidate_from_pair(
+def _momentum_pair_projection(
     pair: dict[str, Any],
-    *,
-    now_ms: float | None = None,
-) -> MomentumShadowCandidate | None:
-    """유효 Solana 페어를 파싱하고 현행 B 필터 탈락 사유를 분리한다."""
-    if pair.get("chainId") != "solana":
-        return None
-    base = pair.get("baseToken") or {}
-    mint = str(base.get("address") or "")
+) -> _MomentumPairProjection:
+    """후보 판정에 필요한 scalar만 raw pair에서 즉시 분리한다."""
+    is_solana = pair.get("chainId") == "solana"
+    if not is_solana:
+        return _MomentumPairProjection(False, "", "")
+    try:
+        base = pair.get("baseToken") or {}
+        mint = str(base.get("address") or "")
+    except AttributeError:
+        return _MomentumPairProjection(True, "", "", structural_error=True)
     pair_address = str(pair.get("pairAddress") or "")
     if not mint or not pair_address or mint in {WSOL_MINT, USDC_MINT}:
-        return None
-    txns_m5 = (pair.get("txns") or {}).get("m5") or {}
-    metric_invalid = False
+        return _MomentumPairProjection(True, mint, pair_address)
 
     def finite_value(value: Any) -> float | None:
         try:
@@ -1679,16 +1693,53 @@ def momentum_shadow_candidate_from_pair(
             return None
         return number if math.isfinite(number) else None
 
-    volume_value = finite_value((pair.get("volume") or {}).get("m5"))
-    buys_value = finite_value(txns_m5.get("buys"))
-    sells_value = finite_value(txns_m5.get("sells"))
-    liquidity_value = finite_value((pair.get("liquidity") or {}).get("usd"))
-    created_value = finite_value(pair.get("pairCreatedAt"))
-    price_value = finite_value(pair.get("priceUsd"))
-    if any(value is None for value in (
+    try:
+        txns_m5 = (pair.get("txns") or {}).get("m5") or {}
+        buys_m5 = finite_value(txns_m5.get("buys"))
+        sells_m5 = finite_value(txns_m5.get("sells"))
+        volume_m5_usd = finite_value((pair.get("volume") or {}).get("m5"))
+        liquidity_usd = finite_value(
+            (pair.get("liquidity") or {}).get("usd")
+        )
+    except AttributeError:
+        return _MomentumPairProjection(
+            True, mint, pair_address, structural_error=True
+        )
+    return _MomentumPairProjection(
+        is_solana=True,
+        mint=mint,
+        pair_address=pair_address,
+        buys_m5=buys_m5,
+        sells_m5=sells_m5,
+        volume_m5_usd=volume_m5_usd,
+        liquidity_usd=liquidity_usd,
+        pair_created_at_ms=finite_value(pair.get("pairCreatedAt")),
+        price_usd=finite_value(pair.get("priceUsd")),
+    )
+
+
+def _momentum_shadow_candidate_from_projection(
+    projection: _MomentumPairProjection,
+    *,
+    now_ms: float | None = None,
+) -> MomentumShadowCandidate | None:
+    if not projection.is_solana:
+        return None
+    if projection.structural_error:
+        raise AttributeError("malformed DexScreener pair structure")
+    mint = projection.mint
+    pair_address = projection.pair_address
+    if not mint or not pair_address or mint in {WSOL_MINT, USDC_MINT}:
+        return None
+    volume_value = projection.volume_m5_usd
+    buys_value = projection.buys_m5
+    sells_value = projection.sells_m5
+    liquidity_value = projection.liquidity_usd
+    created_value = projection.pair_created_at_ms
+    price_value = projection.price_usd
+    metric_invalid = any(value is None for value in (
         volume_value, buys_value, sells_value, liquidity_value
-    )):
-        metric_invalid = True
+    ))
     volume_m5 = max(0.0, volume_value or 0.0)
     buys_m5 = max(0, int(buys_value or 0))
     sells_m5 = max(0, int(sells_value or 0))
@@ -1734,6 +1785,56 @@ def momentum_shadow_candidate_from_pair(
     return MomentumShadowCandidate(candidate, tuple(reasons))
 
 
+def momentum_shadow_candidate_from_pair(
+    pair: dict[str, Any],
+    *,
+    now_ms: float | None = None,
+) -> MomentumShadowCandidate | None:
+    """유효 Solana 페어를 파싱하고 현행 B 필터 탈락 사유를 분리한다."""
+    return _momentum_shadow_candidate_from_projection(
+        _momentum_pair_projection(pair),
+        now_ms=now_ms,
+    )
+
+
+def _search_pair_projections(payload: Any) -> list[_MomentumPairProjection]:
+    projections: list[_MomentumPairProjection] = []
+    if not isinstance(payload, dict):
+        return projections
+    for pair in payload.get("pairs") or []:
+        if isinstance(pair, dict):
+            projections.append(_momentum_pair_projection(pair))
+        if len(projections) >= MOMENTUM_MAX_RAW_PAIRS:
+            break
+    return projections
+
+
+def _extend_discovered_mints(payload: Any, discovered_mints: list[str]) -> None:
+    rows = payload if isinstance(payload, list) else [payload]
+    for row in rows:
+        if not isinstance(row, dict) or row.get("chainId") != "solana":
+            continue
+        mint = str(row.get("tokenAddress") or "")
+        if mint and mint not in discovered_mints:
+            discovered_mints.append(mint)
+        if len(discovered_mints) >= MOMENTUM_MAX_DISCOVERY_TOKENS:
+            break
+
+
+def _token_pair_projections(
+    payload: Any,
+    *,
+    limit: int,
+) -> list[_MomentumPairProjection]:
+    if not isinstance(payload, list):
+        return []
+    return [
+        _momentum_pair_projection(pair)
+        for pair in payload[:max(0, int(limit))]
+        if isinstance(pair, dict)
+    ]
+
+
 async def _dexscreener_json(
     session: aiohttp.ClientSession, url: str, **params: str
 ) -> Any:
@@ -1760,51 +1861,37 @@ async def _fetch_momentum_candidate_cohorts(
     session: aiohttp.ClientSession,
 ) -> tuple[list[MomentumCandidate], list[MomentumShadowCandidate]]:
     """승인 후보와 현행 임계값 바로 아래 shadow 후보를 함께 반환한다."""
-    pairs: list[dict[str, Any]] = []
-    # 세 응답을 동시에 보존하면 매 5초마다 큰 JSON object graph의 수명이
-    # 겹친다. 기존 처리 순서를 유지하되 필요한 bounded projection만 남긴다.
-    search = await _dexscreener_json(
-        session, DEX_SCREENER_SEARCH_URL, q="solana"
+    pair_projections = _search_pair_projections(
+        await _dexscreener_json(
+            session, DEX_SCREENER_SEARCH_URL, q="solana"
+        )
     )
-    if isinstance(search, dict):
-        for pair in search.get("pairs") or []:
-            if isinstance(pair, dict):
-                pairs.append(pair)
-            if len(pairs) >= MOMENTUM_MAX_RAW_PAIRS:
-                break
-    del search
     discovered_mints: list[str] = []
     for url in (DEX_SCREENER_PROFILES_URL, DEX_SCREENER_BOOSTS_URL):
-        payload = await _dexscreener_json(session, url)
-        rows = payload if isinstance(payload, list) else [payload]
-        for row in rows:
-            if not isinstance(row, dict) or row.get("chainId") != "solana":
-                continue
-            mint = str(row.get("tokenAddress") or "")
-            if mint and mint not in discovered_mints:
-                discovered_mints.append(mint)
-            if len(discovered_mints) >= MOMENTUM_MAX_DISCOVERY_TOKENS:
-                break
-        del rows, payload
-    if discovered_mints:
-        token_pairs = await _dexscreener_json(
-            session,
-            f"{DEX_SCREENER_TOKENS_URL}/{','.join(discovered_mints)}",
+        _extend_discovered_mints(
+            await _dexscreener_json(session, url),
+            discovered_mints,
         )
-        if isinstance(token_pairs, list):
-            remaining = max(0, MOMENTUM_MAX_RAW_PAIRS - len(pairs))
-            pairs.extend(
-                pair
-                for pair in token_pairs[:remaining]
-                if isinstance(pair, dict)
+    if discovered_mints:
+        remaining = max(
+            0, MOMENTUM_MAX_RAW_PAIRS - len(pair_projections)
+        )
+        pair_projections.extend(
+            _token_pair_projections(
+                await _dexscreener_json(
+                    session,
+                    f"{DEX_SCREENER_TOKENS_URL}/{','.join(discovered_mints)}",
+                ),
+                limit=remaining,
             )
+        )
 
     best_by_mint: dict[str, MomentumCandidate] = {}
     shadow_by_mint: dict[str, MomentumShadowCandidate] = {}
     snapshot_at_epoch = time.time()
-    for pair in pairs:
-        evaluated = momentum_shadow_candidate_from_pair(
-            pair, now_ms=snapshot_at_epoch * 1000
+    for projection in pair_projections:
+        evaluated = _momentum_shadow_candidate_from_projection(
+            projection, now_ms=snapshot_at_epoch * 1000
         )
         if evaluated is None:
             continue
@@ -1883,7 +1970,7 @@ async def _fetch_momentum_candidate_cohorts(
             timestamp=snapshot_at_epoch,
         )
     add_current_phase_metadata(
-        row_count=len(pairs),
+        row_count=len(pair_projections),
         approved_count=len(approved),
         shadow_count=len(shadows),
         active_series_count=_momentum_snapshot_store.series_count,
