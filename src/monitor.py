@@ -28,6 +28,7 @@ from src.phase_memory_telemetry import (
     add_current_phase_metadata,
     flush_phase_memory_telemetry,
     phase_memory,
+    start_memory_attribution_sampler,
 )
 from src.solana_rpc import (
     SolanaRpcExhaustedError,
@@ -2074,58 +2075,120 @@ async def confirm_unknown_whales(
     candidate: MomentumCandidate,
     watched_wallets: set[str],
 ) -> list[UnknownWhaleBuy]:
-    signatures = await _solana_rpc(
-        session,
-        http_url,
-        "getSignaturesForAddress",
-        [
-            candidate.pair_address,
-            {"limit": UNKNOWN_WHALE_SIGNATURE_LIMIT, "commitment": "confirmed"},
-        ],
-    )
-    transaction_signatures = [
-        str(row.get("signature"))
-        for row in (signatures or [])
-        if isinstance(row, dict) and row.get("signature") and row.get("err") is None
-    ]
+    with phase_memory(
+        "whale_signature_retrieval",
+        metadata={"workload": "momentum", "operation": "fetch"},
+    ):
+        signatures = await _solana_rpc(
+            session,
+            http_url,
+            "getSignaturesForAddress",
+            [
+                candidate.pair_address,
+                {
+                    "limit": UNKNOWN_WHALE_SIGNATURE_LIMIT,
+                    "commitment": "confirmed",
+                },
+            ],
+        )
+    with phase_memory(
+        "whale_signature_projection",
+        metadata={"workload": "momentum", "operation": "parse"},
+    ) as projection_scope:
+        transaction_signatures = [
+            str(row.get("signature"))
+            for row in (signatures or [])
+            if (
+                isinstance(row, dict)
+                and row.get("signature")
+                and row.get("err") is None
+            )
+        ]
+        projection_scope.add_metadata(
+            signature_count=len(signatures or []),
+            projected_count=len(transaction_signatures),
+            retained_count=len(transaction_signatures),
+        )
     add_current_phase_metadata(signature_count=len(transaction_signatures))
     if not transaction_signatures:
         return []
     by_wallet: dict[str, UnknownWhaleBuy] = {}
+    transaction: Any = None
     # Sequential early-exit reads keep peak memory flat and stop as soon as
     # three qualifying wallets exist.
     for signature in transaction_signatures:
         add_current_phase_metadata(transaction_count=1)
-        transaction = await _solana_rpc(
-            session,
-            http_url,
-            "getTransaction",
-            [
-                signature,
-                {
-                    "commitment": "confirmed",
-                    "encoding": "jsonParsed",
-                    "maxSupportedTransactionVersion": 0,
-                },
-            ],
-        )
+        with phase_memory(
+            "whale_transaction_fetch",
+            metadata={
+                "workload": "transaction",
+                "operation": "fetch",
+                "transaction_count": 1,
+                # 이전 raw transaction은 다음 fetch 결과가 대입될 때까지 유지된다.
+                # 수명은 바꾸지 않고 해당 overlap만 계측한다.
+                "retained_count": int(isinstance(transaction, dict)),
+            },
+        ):
+            transaction = await _solana_rpc(
+                session,
+                http_url,
+                "getTransaction",
+                [
+                    signature,
+                    {
+                        "commitment": "confirmed",
+                        "encoding": "jsonParsed",
+                        "maxSupportedTransactionVersion": 0,
+                    },
+                ],
+            )
         if not isinstance(transaction, dict):
             continue
-        for buy in unknown_whale_buy_from_transaction(
-            transaction, candidate.mint, watched_wallets
-        ):
-            incumbent = by_wallet.get(buy.wallet)
-            if incumbent is None or buy.paid_lamports > incumbent.paid_lamports:
-                by_wallet[buy.wallet] = buy
+        add_current_phase_metadata(retained_count=1)
+        with phase_memory(
+            "whale_transaction_matching",
+            metadata={
+                "workload": "transaction",
+                "operation": "analyze",
+                "transaction_count": 1,
+            },
+        ) as matching_scope:
+            matched_buys = unknown_whale_buy_from_transaction(
+                transaction, candidate.mint, watched_wallets
+            )
+            matching_scope.add_metadata(projected_count=len(matched_buys))
+        with phase_memory(
+            "whale_confirmation_aggregation",
+            metadata={"workload": "momentum", "operation": "update"},
+        ) as aggregation_scope:
+            for buy in matched_buys:
+                incumbent = by_wallet.get(buy.wallet)
+                if incumbent is None or buy.paid_lamports > incumbent.paid_lamports:
+                    by_wallet[buy.wallet] = buy
+            aggregation_scope.add_metadata(
+                projected_count=len(matched_buys),
+                retained_count=len(by_wallet),
+            )
         if len(by_wallet) >= UNKNOWN_WHALE_MIN_COUNT:
             break
     add_current_phase_metadata(
         candidate_count=len(by_wallet),
         early_exit=len(by_wallet) >= UNKNOWN_WHALE_MIN_COUNT,
     )
-    return sorted(
-        by_wallet.values(), key=lambda buy: buy.paid_lamports, reverse=True
-    )
+    with phase_memory(
+        "whale_result_projection",
+        metadata={
+            "workload": "momentum",
+            "operation": "serialize",
+            # 마지막 raw transaction은 함수 frame 반환 시 자연 해제된다.
+            "retained_count": int(isinstance(transaction, dict)),
+        },
+    ) as result_scope:
+        result = sorted(
+            by_wallet.values(), key=lambda buy: buy.paid_lamports, reverse=True
+        )
+        result_scope.add_metadata(projected_count=len(result))
+        return result
 
 
 def momentum_observation_metrics(
@@ -3074,13 +3137,18 @@ async def run_service() -> None:
         approved_paper_mode,
         paper_entries_enabled,
     )
-    await asyncio.gather(
-        run_forever(settings),
-        performance_loop(),
-        run_market_momentum_route(settings),
-        monitor_maintenance_loop(),
-        observation_supervisor() if observation_mode else asyncio.Event().wait(),
-    )
+    memory_sampler = start_memory_attribution_sampler()
+    try:
+        await asyncio.gather(
+            run_forever(settings),
+            performance_loop(),
+            run_market_momentum_route(settings),
+            monitor_maintenance_loop(),
+            observation_supervisor() if observation_mode else asyncio.Event().wait(),
+        )
+    finally:
+        if memory_sampler is not None:
+            memory_sampler.stop()
 
 
 def main() -> None:

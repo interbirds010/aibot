@@ -15,7 +15,12 @@ from typing import Any, Mapping, Sequence
 
 import aiohttp
 
-from src.phase_memory_telemetry import add_current_phase_metadata
+from src.phase_memory_telemetry import (
+    add_current_phase_metadata,
+    add_ancestor_phase_metadata,
+    current_phase_context_contains,
+    phase_memory,
+)
 from dotenv import load_dotenv
 
 from src.helius_rpc import (
@@ -792,6 +797,16 @@ async def _provider_request_once(
                 missing_length_count=int(not content_length_known),
                 content_length_known=content_length_known,
             )
+            if current_phase_context_contains("whale_confirmation"):
+                add_ancestor_phase_metadata(
+                    "whale_confirmation",
+                    response_count=1,
+                    response_bytes=(
+                        int(content_length) if content_length_known else 0
+                    ),
+                    missing_length_count=int(not content_length_known),
+                    content_length_known=content_length_known,
+                )
             if status in RPC_RETRYABLE_HTTP_STATUSES:
                 raise _ProviderRequestError(
                     transient=True,
@@ -807,7 +822,26 @@ async def _provider_request_once(
                     status=status,
                     category="HTTP_TERMINAL",
                 )
-            payload = await response.json()
+            if (
+                method == "getTransaction"
+                and current_phase_context_contains("whale_confirmation")
+            ):
+                with phase_memory(
+                    "whale_transaction_parse",
+                    metadata={
+                        "workload": "transaction",
+                        "operation": "parse",
+                        "response_count": 1,
+                        "response_bytes": (
+                            int(content_length) if content_length_known else 0
+                        ),
+                        "missing_length_count": int(not content_length_known),
+                        "content_length_known": content_length_known,
+                    },
+                ):
+                    payload = await response.json()
+            else:
+                payload = await response.json()
     except _ProviderRequestError:
         raise
     except asyncio.TimeoutError as exc:

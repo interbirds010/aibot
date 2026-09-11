@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
+from src.phase_memory_telemetry import phase_memory
 from src.state_store import (
     atomic_write_json,
     exclusive_file_lock,
@@ -87,7 +88,11 @@ def _metric_update(
         if success_at:
             document["last_archive_success"] = success_at
 
-    update_json(metrics_path, empty_archive_metrics(), mutate)
+    with phase_memory(
+        "archive_metric_write",
+        metadata={"workload": "observation", "operation": "update"},
+    ):
+        update_json(metrics_path, empty_archive_metrics(), mutate)
 
 
 def _existing_archive_record(path: Path, observation_id: str) -> dict[str, Any] | None:
@@ -126,17 +131,47 @@ def archive_observation(
         if existing is not None:
             _metric_update(metrics_path=metric_file, duplicate_count=1)
             return False, str(existing.get("archived_at") or archived_at)
-        document = {
-            "archive_schema_version": ARCHIVE_SCHEMA_VERSION,
-            "observation_id": observation_id,
-            "tracking_profile": row.get("tracking_profile"),
-            "signal_type": row.get("signal_type"),
-            "signal_detected_at": row.get("signal_detected_at"),
-            "archived_at": archived_at,
-            "archive_source": str(source)[:80],
-            "observation": row,
-        }
-        atomic_write_json(record_path, document)
+        with phase_memory(
+            "archive_record_preparation",
+            metadata={
+                "workload": "observation",
+                "operation": "archive",
+                "row_count": 1,
+            },
+        ):
+            document = {
+                "archive_schema_version": ARCHIVE_SCHEMA_VERSION,
+                "observation_id": observation_id,
+                "tracking_profile": row.get("tracking_profile"),
+                "signal_type": row.get("signal_type"),
+                "signal_detected_at": row.get("signal_detected_at"),
+                "archived_at": archived_at,
+                "archive_source": str(source)[:80],
+                # Archive wrapper는 source row를 복사하지 않고 그대로 참조한다.
+                "observation": row,
+            }
+        with phase_memory(
+            "archive_serialization_write",
+            metadata={
+                "workload": "observation",
+                "operation": "serialize",
+                "row_count": 1,
+            },
+        ) as serialization_scope:
+            def observe_write(stage: str, size_bytes: int) -> None:
+                metadata: dict[str, Any] = {"stage": stage}
+                if size_bytes:
+                    metadata.update({
+                        "serialized_bytes": size_bytes,
+                        "file_bytes": size_bytes,
+                    })
+                serialization_scope.set_metadata(metadata)
+
+            atomic_write_json(
+                record_path,
+                document,
+                lifecycle_observer=observe_write,
+            )
     _metric_update(metrics_path=metric_file, success_at=archived_at)
     return True, archived_at
 

@@ -106,9 +106,23 @@ def exclusive_file_lock(
         handle.close()
 
 
-def atomic_write_json(path: Path, document: dict[str, Any]) -> None:
+def atomic_write_json(
+    path: Path,
+    document: dict[str, Any],
+    *,
+    lifecycle_observer: Callable[[str, int], None] | None = None,
+) -> None:
+    def observe(stage: str, size_bytes: int) -> None:
+        if lifecycle_observer is None:
+            return
+        try:
+            lifecycle_observer(stage, max(0, int(size_bytes)))
+        except Exception:
+            pass
+
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary: str | None = None
+    serialized_size = 0
     try:
         with tempfile.NamedTemporaryFile(
             "w", encoding="utf-8", dir=path.parent, delete=False
@@ -116,6 +130,7 @@ def atomic_write_json(path: Path, document: dict[str, Any]) -> None:
             temporary = file.name
             # Compact encoding shortens fsync and therefore the cross-process
             # lock hold time on the 1 GB production VPS.
+            observe("serialize", 0)
             json.dump(
                 document,
                 file,
@@ -123,9 +138,17 @@ def atomic_write_json(path: Path, document: dict[str, Any]) -> None:
                 separators=(",", ":"),
             )
             file.write("\n")
+            if lifecycle_observer is not None:
+                try:
+                    serialized_size = max(0, int(file.tell()))
+                except Exception:
+                    serialized_size = 0
+            observe("serialized", serialized_size)
             file.flush()
             os.fsync(file.fileno())
+            observe("flushed", serialized_size)
         os.replace(temporary, path)
+        observe("replaced", serialized_size)
     finally:
         if temporary and os.path.exists(temporary):
             os.unlink(temporary)

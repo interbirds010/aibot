@@ -436,24 +436,36 @@ def archive_and_retain_observations(rows: list[Any]) -> list[Any]:
             duplicate_count=archive_result["duplicate"],
             failure_count=archive_result["failed"],
         )
-    unarchived_ids = {
-        id(row) for row in rows
-        if isinstance(row, dict)
-        and str(row.get("status") or "").upper() in TERMINAL_OBSERVATION_STATUSES
-        and not (
-            row.get("archive_schema_version") == 1
-            and row.get("archived_at")
+    with phase_memory(
+        "archive_retention_projection",
+        metadata={
+            "workload": "observation",
+            "operation": "rebuild",
+            "row_count": len(rows),
+        },
+    ) as retention_scope:
+        unarchived_ids = {
+            id(row) for row in rows
+            if isinstance(row, dict)
+            and str(row.get("status") or "").upper() in TERMINAL_OBSERVATION_STATUSES
+            and not (
+                row.get("archive_schema_version") == 1
+                and row.get("archived_at")
+            )
+        }
+        retained = retained_observations(rows)
+        kept_ids = {id(row) for row in retained}
+        retention_scope.add_metadata(
+            retained_count=len(retained),
+            pending_count=len(unarchived_ids),
         )
-    }
-    retained = retained_observations(rows)
-    kept_ids = {id(row) for row in retained}
-    if unarchived_ids <= kept_ids:
-        return retained
-    # Archive 장애 중에는 손실보다 일시적인 operational cap 초과를 택한다.
-    return [
-        row for row in rows
-        if id(row) in kept_ids or id(row) in unarchived_ids
-    ]
+        if unarchived_ids <= kept_ids:
+            return retained
+        # Archive 장애 중에는 손실보다 일시적인 operational cap 초과를 택한다.
+        return [
+            row for row in rows
+            if id(row) in kept_ids or id(row) in unarchived_ids
+        ]
 
 
 def expire_observation_backlog(rows: list[Any]) -> None:

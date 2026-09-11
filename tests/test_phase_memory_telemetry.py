@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import re
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -37,7 +38,14 @@ class PhaseMemoryTelemetryTests(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory()
         self.path = Path(self.temporary.name) / "monitor_memory_phases.json"
         telemetry._active_phase_counts.clear()
+        telemetry._active_contexts.clear()
+        telemetry._active_context_overflow_count = 0
         telemetry._pending_batch = None
+        telemetry._sampler_last_hwm_bytes = None
+        telemetry._sampler_previous_contexts = []
+        telemetry._sampler_previous_active_phases = []
+        telemetry._sampler_thread = None
+        telemetry._sampler_stop_event = None
         telemetry._detail_flush_requested = False
         telemetry._detail_flush_running = False
         telemetry._last_detail_flush_monotonic = 0.0
@@ -53,7 +61,14 @@ class PhaseMemoryTelemetryTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         telemetry._active_phase_counts.clear()
+        telemetry._active_contexts.clear()
+        telemetry._active_context_overflow_count = 0
         telemetry._pending_batch = None
+        telemetry._sampler_last_hwm_bytes = None
+        telemetry._sampler_previous_contexts = []
+        telemetry._sampler_previous_active_phases = []
+        telemetry._sampler_thread = None
+        telemetry._sampler_stop_event = None
         telemetry._detail_flush_requested = False
         telemetry._detail_flush_running = False
         telemetry._last_detail_flush_monotonic = 0.0
@@ -72,11 +87,22 @@ class PhaseMemoryTelemetryTests(unittest.TestCase):
         self.assertEqual(telemetry.ALLOWED_PHASES, frozenset({
             "candidate_fetch",
             "whale_confirmation",
+            "whale_signature_retrieval",
+            "whale_signature_projection",
+            "whale_transaction_fetch",
+            "whale_transaction_parse",
+            "whale_transaction_matching",
+            "whale_confirmation_aggregation",
+            "whale_result_projection",
             "analyzer",
             "observation_due_scan",
             "coverage_telemetry_flush",
             "hourly_rollup",
             "archive_write",
+            "archive_record_preparation",
+            "archive_serialization_write",
+            "archive_metric_write",
+            "archive_retention_projection",
             "wallet_performance_refresh",
             "wallet_reload",
             "ws_refresh_reconnect",
@@ -110,6 +136,22 @@ class PhaseMemoryTelemetryTests(unittest.TestCase):
              {"phase": "coverage_telemetry_flush", "count": 1}],
         )
         self.assertEqual(inner_end, [{"phase": "analyzer", "count": 1}])
+        self.assertEqual(
+            events["coverage_telemetry_flush"]["context_stack_at_start"],
+            ["analyzer", "coverage_telemetry_flush"],
+        )
+        self.assertEqual(
+            events["coverage_telemetry_flush"]["context_stack_at_end"],
+            ["analyzer"],
+        )
+        self.assertEqual(
+            events["coverage_telemetry_flush"]["context_id"],
+            events["analyzer"]["context_id"],
+        )
+        self.assertNotEqual(
+            events["coverage_telemetry_flush"]["span_id"],
+            events["analyzer"]["span_id"],
+        )
         serialized = repr(document).lower()
         self.assertNotIn("token_id", serialized)
         self.assertNotIn("task_id", serialized)
@@ -384,12 +426,219 @@ class PhaseMemoryTelemetryTests(unittest.TestCase):
         self.assertEqual(metadata["response_count"], 3)
         self.assertEqual(metadata["response_bytes"], 300)
 
+    def test_concurrent_tasks_keep_distinct_context_stacks(self) -> None:
+        async def scenario() -> None:
+            first_ready = asyncio.Event()
+            second_ready = asyncio.Event()
+            release = asyncio.Event()
+
+            async def worker(name, ready) -> None:
+                with telemetry.phase_memory(
+                    name,
+                    memory_reader=SequenceMemory(
+                        (100 * MIB, 100 * MIB), (230 * MIB, 230 * MIB)
+                    ),
+                ):
+                    ready.set()
+                    await release.wait()
+
+            first = asyncio.create_task(worker("analyzer", first_ready))
+            second = asyncio.create_task(worker("candidate_fetch", second_ready))
+            await first_ready.wait()
+            await second_ready.wait()
+            release.set()
+            await asyncio.gather(first, second)
+
+        asyncio.run(scenario())
+        self.assertTrue(telemetry.flush_phase_memory_telemetry())
+        document = state_store.read_json(self.path, {})
+        events = {event["phase"]: event for event in document["events"]}
+        self.assertEqual(events["analyzer"]["context_stack_at_start"], ["analyzer"])
+        self.assertEqual(
+            events["candidate_fetch"]["context_stack_at_start"],
+            ["candidate_fetch"],
+        )
+        self.assertNotEqual(
+            events["analyzer"]["context_id"],
+            events["candidate_fetch"]["context_id"],
+        )
+
+    def test_sampler_retains_hwm_and_high_rss_with_active_context(self) -> None:
+        with telemetry.phase_memory(
+            "whale_transaction_fetch",
+            metadata={
+                "workload": "transaction",
+                "payload_bytes": 4096,
+                "retained_count": 1,
+            },
+            memory_reader=SequenceMemory(
+                (100 * MIB, 100 * MIB), (100 * MIB, 100 * MIB)
+            ),
+        ):
+            baseline = telemetry.record_memory_attribution_sample(
+                memory_reader=SequenceMemory((100 * MIB, 100 * MIB)),
+                epoch_clock=lambda: 1.0,
+            )
+            event = telemetry.record_memory_attribution_sample(
+                memory_reader=SequenceMemory((235 * MIB, 106 * MIB)),
+                epoch_clock=lambda: 2.0,
+            )
+
+        self.assertEqual(baseline["trigger_reasons"], [])
+        self.assertEqual(event["trigger_reasons"], ["RSS_HIGH", "HWM_INCREASE"])
+        self.assertEqual(
+            event["active_contexts"][0]["stack"],
+            ["whale_transaction_fetch"],
+        )
+        self.assertEqual(
+            event["active_contexts"][0]["metadata"]["payload_bytes"], 4096
+        )
+        self.assertIsInstance(event["active_contexts"][0]["span_id"], int)
+        self.assertTrue(telemetry.flush_phase_memory_telemetry())
+        document = state_store.read_json(self.path, {})
+        self.assertEqual(document["sampler_sample_count"], 2)
+        self.assertEqual(len(document["sampler_events"]), 1)
+        serialized = repr(document["sampler_events"]).lower()
+        self.assertNotIn("signature", serialized)
+        self.assertNotIn("mint", serialized)
+        self.assertNotIn("raw", serialized)
+
+    def test_sampler_ring_is_bounded_and_measurement_failure_is_open(self) -> None:
+        telemetry.record_memory_attribution_sample(
+            memory_reader=SequenceMemory((100 * MIB, 100 * MIB))
+        )
+        for index in range(telemetry.SAMPLER_EVENT_LIMIT + 5):
+            telemetry.record_memory_attribution_sample(
+                memory_reader=SequenceMemory((231 * MIB, 100 * MIB)),
+                epoch_clock=lambda index=index: float(index + 1),
+            )
+
+        def broken_reader():
+            raise OSError("proc unavailable")
+
+        result = telemetry.record_memory_attribution_sample(
+            memory_reader=broken_reader
+        )
+        self.assertEqual(result["trigger_reasons"], [])
+        self.assertTrue(telemetry.flush_phase_memory_telemetry())
+        document = state_store.read_json(self.path, {})
+        self.assertEqual(len(document["sampler_events"]), telemetry.SAMPLER_EVENT_LIMIT)
+        self.assertEqual(document["sampler_event_evicted_count"], 5)
+        self.assertEqual(document["sampler_measurement_failure_count"], 1)
+
+    def test_active_context_registry_is_bounded(self) -> None:
+        tokens = [
+            telemetry.start_phase(
+                "analyzer",
+                memory_reader=SequenceMemory(
+                    (100 * MIB, 100 * MIB), (100 * MIB, 100 * MIB)
+                ),
+            )
+            for _ in range(telemetry.ACTIVE_CONTEXT_REGISTRY_LIMIT + 1)
+        ]
+        self.assertEqual(
+            len(telemetry._active_contexts),
+            telemetry.ACTIVE_CONTEXT_REGISTRY_LIMIT,
+        )
+        self.assertEqual(telemetry._active_context_overflow_count, 1)
+        overflow_finished = tokens.pop()
+        telemetry.finish_phase(overflow_finished)
+        while len(tokens) > telemetry.SAMPLER_ACTIVE_CONTEXT_LIMIT:
+            telemetry.finish_phase(tokens.pop())
+        sample = telemetry.record_memory_attribution_sample(
+            memory_reader=SequenceMemory((100 * MIB, 100 * MIB))
+        )
+        self.assertFalse(sample["active_contexts_truncated"])
+        self.assertEqual(sample["active_context_overflow_count"], 1)
+        for token in tokens:
+            telemetry.finish_phase(token)
+        self.assertEqual(telemetry._active_phase_counts, {})
+        self.assertEqual(telemetry._active_contexts, {})
+
+    def test_sampler_start_is_singleton_and_interval_is_bounded(self) -> None:
+        with mock.patch.object(telemetry.threading, "Thread") as thread_type:
+            thread = thread_type.return_value
+            thread.is_alive.return_value = False
+            first = telemetry.start_memory_attribution_sampler(interval_seconds=2)
+            thread.is_alive.return_value = True
+            second = telemetry.start_memory_attribution_sampler(interval_seconds=2)
+
+        self.assertIsNotNone(first)
+        self.assertIsNotNone(second)
+        thread_type.assert_called_once()
+        thread.start.assert_called_once_with()
+        self.assertIs(first.thread, second.thread)
+        self.assertIsNone(
+            telemetry.start_memory_attribution_sampler(interval_seconds=0.5)
+        )
+        self.assertIsNone(
+            telemetry.start_memory_attribution_sampler(interval_seconds=6)
+        )
+
+    def test_sampler_concurrent_start_creates_only_one_thread(self) -> None:
+        real_thread_type = threading.Thread
+        entered_start = threading.Event()
+        release_start = threading.Event()
+        created: list[object] = []
+
+        class BlockingThread:
+            def __init__(self, **_options) -> None:
+                self.alive = False
+                created.append(self)
+
+            def start(self) -> None:
+                entered_start.set()
+                release_start.wait(timeout=2.0)
+                self.alive = True
+
+            def is_alive(self) -> bool:
+                return self.alive
+
+            def join(self, timeout=None) -> None:
+                del timeout
+                self.alive = False
+
+        handles: list[telemetry.MemoryAttributionSampler | None] = []
+
+        def start_sampler() -> None:
+            handles.append(telemetry.start_memory_attribution_sampler())
+
+        with mock.patch.object(telemetry.threading, "Thread", BlockingThread):
+            first_caller = real_thread_type(target=start_sampler)
+            first_caller.start()
+            self.assertTrue(entered_start.wait(timeout=1.0))
+            second_caller = real_thread_type(target=start_sampler)
+            second_caller.start()
+            release_start.set()
+            first_caller.join(timeout=2.0)
+            second_caller.join(timeout=2.0)
+
+        self.assertEqual(len(created), 1)
+        self.assertEqual(len(handles), 2)
+        self.assertIsNotNone(handles[0])
+        self.assertIsNotNone(handles[1])
+        self.assertIs(handles[0].thread, handles[1].thread)
+
+    def test_sampler_loop_continues_after_unexpected_sample_failure(self) -> None:
+        stop_event = mock.Mock()
+        stop_event.wait.side_effect = [False, True]
+        with mock.patch.object(
+            telemetry,
+            "record_memory_attribution_sample",
+            side_effect=[RuntimeError("telemetry"), None],
+        ) as sample:
+            telemetry._memory_attribution_sampler_loop(stop_event, 2.0)
+
+        self.assertEqual(sample.call_count, 2)
+
     def test_all_canonical_phases_are_wired_into_runtime_boundaries(self) -> None:
         source_paths = (
             PROJECT_ROOT / "src" / "monitor.py",
             PROJECT_ROOT / "src" / "analyzer.py",
             PROJECT_ROOT / "src" / "observation_tracker.py",
+            PROJECT_ROOT / "src" / "research_archive.py",
             PROJECT_ROOT / "src" / "research" / "coverage_telemetry.py",
+            PROJECT_ROOT / "src" / "solana_rpc.py",
             PROJECT_ROOT / "src" / "wallet_performance.py",
         )
         source = "\n".join(

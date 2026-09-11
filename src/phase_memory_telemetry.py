@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import gc
 import math
 import os
@@ -25,18 +26,57 @@ DETAIL_EVENT_LIMIT = 200
 DETAIL_RSS_DELTA_BYTES = 20 * 1024 * 1024
 DETAIL_RSS_BYTES = 200 * 1024 * 1024
 DETAIL_FLUSH_MIN_INTERVAL_SECONDS = 10.0
+SAMPLER_EVENT_LIMIT = 96
+SAMPLER_INTERVAL_SECONDS = 2.0
+SAMPLER_RSS_BYTES = 230 * 1024 * 1024
+SAMPLER_HWM_DELTA_BYTES = 5 * 1024 * 1024
+SAMPLER_ACTIVE_CONTEXT_LIMIT = 8
+ACTIVE_CONTEXT_REGISTRY_LIMIT = 64
+CONTEXT_STACK_LIMIT = 8
 MAX_SCALAR_COUNT = 10**15
+
+_SAMPLER_CONTEXT_METADATA_KEYS = (
+    "workload",
+    "operation",
+    "kind",
+    "stage",
+    "payload_bytes",
+    "response_bytes",
+    "file_bytes",
+    "serialized_bytes",
+    "row_count",
+    "signature_count",
+    "transaction_count",
+    "candidate_count",
+    "retained_count",
+    "projected_count",
+    "task_count",
+    "queue_depth",
+    "response_count",
+    "missing_length_count",
+)
 
 # Phase names are deliberately finite so a mint, signature, URL, or other
 # identifier cannot accidentally become a persisted dimension.
 ALLOWED_PHASES = frozenset({
     "candidate_fetch",
     "whale_confirmation",
+    "whale_signature_retrieval",
+    "whale_signature_projection",
+    "whale_transaction_fetch",
+    "whale_transaction_parse",
+    "whale_transaction_matching",
+    "whale_confirmation_aggregation",
+    "whale_result_projection",
     "analyzer",
     "observation_due_scan",
     "coverage_telemetry_flush",
     "hourly_rollup",
     "archive_write",
+    "archive_record_preparation",
+    "archive_serialization_write",
+    "archive_metric_write",
+    "archive_retention_projection",
     "wallet_performance_refresh",
     "wallet_reload",
     "ws_refresh_reconnect",
@@ -72,6 +112,12 @@ _ENUM_METADATA: dict[str, frozenset[str]] = {
     "result": frozenset({"success", "failure", "cancelled", "unknown"}),
     "mode": frozenset({"enhanced", "standard", "unknown"}),
     "kind": frozenset({"startup", "steady", "hour_boundary", "manual", "unknown"}),
+    "stage": frozenset({
+        "serialize",
+        "serialized",
+        "flushed",
+        "replaced",
+    }),
 }
 _INTEGER_METADATA = frozenset({
     "row_count",
@@ -106,6 +152,9 @@ _INTEGER_METADATA = frozenset({
     "cancelled_task_count",
     "active_series_count",
     "snapshot_count",
+    "projected_count",
+    "retained_count",
+    "serialized_bytes",
 })
 _BOOLEAN_METADATA = frozenset({
     "cold_start",
@@ -118,12 +167,21 @@ _BOOLEAN_METADATA = frozenset({
 
 _active_lock = threading.RLock()
 _active_phase_counts: dict[str, int] = {}
+_active_contexts: dict[int, dict[str, Any]] = {}
+_next_phase_instance_id = 0
+_next_context_id = 0
+_active_context_overflow_count = 0
 _pending_batch: dict[str, Any] | None = None
 _flush_lock = threading.Lock()
 _detail_flush_lock = threading.Lock()
 _detail_flush_requested = False
 _detail_flush_running = False
 _last_detail_flush_monotonic = 0.0
+_sampler_thread: threading.Thread | None = None
+_sampler_stop_event: threading.Event | None = None
+_sampler_last_hwm_bytes: int | None = None
+_sampler_previous_contexts: list[dict[str, Any]] = []
+_sampler_previous_active_phases: list[dict[str, int | str]] = []
 
 MemoryReader = Callable[[], Mapping[str, int | None]]
 Clock = Callable[[], float]
@@ -277,14 +335,91 @@ def _active_snapshot() -> list[dict[str, int | str]]:
     ]
 
 
-def _activate(phase: str) -> list[dict[str, int | str]]:
+def _next_identity(*, context: bool = False) -> int:
+    global _next_context_id
+    global _next_phase_instance_id
+    with _active_lock:
+        if context:
+            _next_context_id = (_next_context_id % MAX_SCALAR_COUNT) + 1
+            return _next_context_id
+        _next_phase_instance_id = (_next_phase_instance_id % MAX_SCALAR_COUNT) + 1
+        return _next_phase_instance_id
+
+
+def _task_kind() -> str:
+    try:
+        return "async_task" if asyncio.current_task() is not None else "sync_thread"
+    except RuntimeError:
+        return "sync_thread"
+
+
+def _active_context_snapshot() -> tuple[list[dict[str, Any]], bool, int]:
+    contexts = sorted(
+        _active_contexts.values(),
+        key=lambda item: (int(item["depth"]), int(item["span_id"])),
+        reverse=True,
+    )
+    truncated = (
+        len(contexts) > SAMPLER_ACTIVE_CONTEXT_LIMIT
+        or sum(_active_phase_counts.values()) > len(contexts)
+    )
+    return [
+        {
+            "span_id": int(item["span_id"]),
+            "context_id": int(item["context_id"]),
+            "task_kind": str(item["task_kind"]),
+            "stack": list(item["stack"]),
+            "stack_truncated": bool(item.get("stack_truncated", False)),
+            "metadata": {
+                key: item["metadata"][key]
+                for key in _SAMPLER_CONTEXT_METADATA_KEYS
+                if key in item["metadata"]
+            },
+        }
+        for item in contexts[:SAMPLER_ACTIVE_CONTEXT_LIMIT]
+    ], truncated, _active_context_overflow_count
+
+
+def _activate(
+    phase: str,
+    *,
+    instance_id: int,
+    context_id: int,
+    context_stack: tuple[str, ...],
+    task_kind: str,
+    metadata: Mapping[str, Any],
+) -> list[dict[str, int | str]]:
+    global _active_context_overflow_count
     with _active_lock:
         _active_phase_counts[phase] = _active_phase_counts.get(phase, 0) + 1
+        if len(_active_contexts) < ACTIVE_CONTEXT_REGISTRY_LIMIT:
+            _active_contexts[instance_id] = {
+                "span_id": instance_id,
+                "context_id": context_id,
+                "depth": len(context_stack),
+                "task_kind": task_kind,
+                "stack": context_stack[-CONTEXT_STACK_LIMIT:],
+                "stack_truncated": len(context_stack) > CONTEXT_STACK_LIMIT,
+                "metadata": dict(metadata),
+            }
+        else:
+            _active_context_overflow_count = _saturated_sum(
+                _active_context_overflow_count, 1
+            )
         return _active_snapshot()
 
 
-def _deactivate(phase: str) -> list[dict[str, int | str]]:
+def _update_active_context(instance_id: int, metadata: Mapping[str, Any]) -> None:
     with _active_lock:
+        active = _active_contexts.get(instance_id)
+        if active is not None:
+            active["metadata"] = dict(metadata)
+
+
+def _deactivate(phase: str, instance_id: int | None = None) -> list[dict[str, int | str]]:
+    with _active_lock:
+        if instance_id is not None:
+            _active_contexts.pop(instance_id, None)
         count = _active_phase_counts.get(phase, 0)
         if count <= 1:
             _active_phase_counts.pop(phase, None)
@@ -307,6 +442,15 @@ def _empty_document() -> dict[str, Any]:
         "maxima": {},
         "phases": {},
         "events": [],
+        "sampler_event_limit": SAMPLER_EVENT_LIMIT,
+        "sampler_interval_seconds": SAMPLER_INTERVAL_SECONDS,
+        "sampler_rss_bytes": SAMPLER_RSS_BYTES,
+        "sampler_hwm_delta_bytes": SAMPLER_HWM_DELTA_BYTES,
+        "sampler_sample_count": 0,
+        "sampler_event_retained_count": 0,
+        "sampler_event_evicted_count": 0,
+        "sampler_measurement_failure_count": 0,
+        "sampler_events": [],
         "last_process_id": None,
         "updated_at_epoch": None,
     }
@@ -322,6 +466,11 @@ def _empty_batch() -> dict[str, Any]:
         "maxima": {},
         "phases": {},
         "events": [],
+        "sampler_sample_count": 0,
+        "sampler_event_retained_count": 0,
+        "sampler_event_evicted_before_flush_count": 0,
+        "sampler_measurement_failure_count": 0,
+        "sampler_events": [],
         "last_process_id": None,
         "updated_at_epoch": None,
     }
@@ -360,6 +509,15 @@ def _update_peak(
         "metadata": dict(record.get("metadata", {})),
         "active_at_start": list(detail["active_at_start"]),
         "active_at_end": list(detail["active_at_end"]),
+        "context_id": detail.get("context_id"),
+        "span_id": detail.get("span_id"),
+        "task_kind": detail.get("task_kind"),
+        "context_stack_at_start": list(
+            detail.get("context_stack_at_start", [])
+        ),
+        "context_stack_at_end": list(
+            detail.get("context_stack_at_end", [])
+        ),
     }
 
 
@@ -491,6 +649,142 @@ def _add_pending_record(record: dict[str, Any]) -> None:
         batch["last_process_id"] = record["process_id"]
 
 
+def record_memory_attribution_sample(
+    *,
+    memory_reader: MemoryReader = process_memory_measurement,
+    epoch_clock: Clock = time.time,
+) -> dict[str, Any]:
+    """Sample process memory and retain only bounded high-water evidence."""
+    global _pending_batch
+    global _sampler_last_hwm_bytes
+    global _sampler_previous_active_phases
+    global _sampler_previous_contexts
+    memory = _safe_measure(memory_reader)
+    sampled_at = _safe_clock(epoch_clock, time.time())
+    rss_bytes = memory["rss_bytes"]
+    hwm_bytes = memory["hwm_bytes"]
+    with _active_lock:
+        previous_hwm = _sampler_last_hwm_bytes
+        if hwm_bytes is not None:
+            _sampler_last_hwm_bytes = hwm_bytes
+        contexts, contexts_truncated, context_overflow_count = (
+            _active_context_snapshot()
+        )
+        active_phases = _active_snapshot()
+        previous_contexts = list(_sampler_previous_contexts)
+        previous_active_phases = list(_sampler_previous_active_phases)
+        if _pending_batch is None:
+            _pending_batch = _empty_batch()
+        batch = _pending_batch
+        batch["sampler_sample_count"] = _saturated_sum(
+            batch["sampler_sample_count"], 1
+        )
+        measurement_failed = rss_bytes is None or hwm_bytes is None
+        if measurement_failed:
+            batch["sampler_measurement_failure_count"] = _saturated_sum(
+                batch["sampler_measurement_failure_count"], 1
+            )
+        hwm_delta = _delta(hwm_bytes, previous_hwm)
+        trigger_reasons: list[str] = []
+        if rss_bytes is not None and rss_bytes >= SAMPLER_RSS_BYTES:
+            trigger_reasons.append("RSS_HIGH")
+        if hwm_delta is not None and hwm_delta >= SAMPLER_HWM_DELTA_BYTES:
+            trigger_reasons.append("HWM_INCREASE")
+        event = {
+            "sampled_at_epoch": round(sampled_at, 3),
+            "process_id": os.getpid(),
+            "rss_bytes": rss_bytes,
+            "hwm_bytes": hwm_bytes,
+            "hwm_delta_bytes": hwm_delta,
+            "trigger_reasons": trigger_reasons,
+            "previous_active_phases": previous_active_phases,
+            "previous_active_contexts": previous_contexts,
+            "active_phases": active_phases,
+            "active_contexts": contexts,
+            "active_contexts_truncated": contexts_truncated,
+            "active_context_overflow_count": context_overflow_count,
+        }
+        _sampler_previous_contexts = contexts
+        _sampler_previous_active_phases = active_phases
+        if trigger_reasons:
+            events = batch["sampler_events"]
+            if len(events) >= SAMPLER_EVENT_LIMIT:
+                events.pop(0)
+                batch["sampler_event_evicted_before_flush_count"] = _saturated_sum(
+                    batch["sampler_event_evicted_before_flush_count"], 1
+                )
+            events.append(event)
+            batch["sampler_event_retained_count"] = _saturated_sum(
+                batch["sampler_event_retained_count"], 1
+            )
+        batch["updated_at_epoch"] = round(sampled_at, 3)
+        batch["last_process_id"] = os.getpid()
+    if trigger_reasons:
+        _request_background_flush()
+    return event
+
+
+def _memory_attribution_sampler_loop(
+    stop_event: threading.Event,
+    interval_seconds: float,
+) -> None:
+    while True:
+        try:
+            record_memory_attribution_sample()
+        except Exception:
+            pass
+        if stop_event.wait(interval_seconds):
+            return
+
+
+@dataclass
+class MemoryAttributionSampler:
+    """Handle for the process-wide bounded memory sampler."""
+
+    stop_event: threading.Event
+    thread: threading.Thread
+
+    def stop(self) -> None:
+        self.stop_event.set()
+        if self.thread is not threading.current_thread():
+            self.thread.join(timeout=SAMPLER_INTERVAL_SECONDS + 1.0)
+
+
+def start_memory_attribution_sampler(
+    *, interval_seconds: float = SAMPLER_INTERVAL_SECONDS,
+) -> MemoryAttributionSampler | None:
+    """Start one fail-open daemon sampler for this process."""
+    global _sampler_stop_event
+    global _sampler_thread
+    try:
+        interval = float(interval_seconds)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(interval) or interval < 1.0 or interval > 5.0:
+        return None
+    with _active_lock:
+        if _sampler_thread is not None and _sampler_thread.is_alive():
+            if _sampler_stop_event is None:
+                return None
+            return MemoryAttributionSampler(_sampler_stop_event, _sampler_thread)
+        stop_event = threading.Event()
+        thread = threading.Thread(
+            target=_memory_attribution_sampler_loop,
+            args=(stop_event, interval),
+            name="memory-attribution-sampler",
+            daemon=True,
+        )
+        _sampler_stop_event = stop_event
+        _sampler_thread = thread
+        try:
+            thread.start()
+        except Exception:
+            _sampler_stop_event = None
+            _sampler_thread = None
+            return None
+    return MemoryAttributionSampler(stop_event, thread)
+
+
 def _merge_batch_back(batch: dict[str, Any], *, persistence_failed: bool) -> None:
     global _pending_batch
     with _active_lock:
@@ -512,6 +806,16 @@ def _merge_batch_back(batch: dict[str, Any], *, persistence_failed: bool) -> Non
             current["persistence_failure_count"],
             _saturated_sum(batch["persistence_failure_count"], persistence_failed),
         )
+        for key in (
+            "sampler_sample_count",
+            "sampler_event_retained_count",
+            "sampler_measurement_failure_count",
+        ):
+            current[key] = _saturated_sum(current[key], batch[key])
+        current["sampler_event_evicted_before_flush_count"] = _saturated_sum(
+            current["sampler_event_evicted_before_flush_count"],
+            batch["sampler_event_evicted_before_flush_count"],
+        )
         _merge_aggregate_values(current["maxima"], batch["maxima"])
         for phase, source in batch["phases"].items():
             _merge_aggregate_values(current["phases"].setdefault(phase, {}), source)
@@ -522,6 +826,15 @@ def _merge_batch_back(batch: dict[str, Any], *, persistence_failed: bool) -> Non
                 len(combined_events) - DETAIL_EVENT_LIMIT,
             )
         current["events"] = combined_events[-DETAIL_EVENT_LIMIT:]
+        combined_samples = (
+            list(batch["sampler_events"]) + list(current["sampler_events"])
+        )
+        if len(combined_samples) > SAMPLER_EVENT_LIMIT:
+            current["sampler_event_evicted_before_flush_count"] = _saturated_sum(
+                current["sampler_event_evicted_before_flush_count"],
+                len(combined_samples) - SAMPLER_EVENT_LIMIT,
+            )
+        current["sampler_events"] = combined_samples[-SAMPLER_EVENT_LIMIT:]
         timestamps = [
             value for value in (
                 batch.get("updated_at_epoch"), current.get("updated_at_epoch")
@@ -548,6 +861,9 @@ def _persist_batch(batch: dict[str, Any], state_path: Path) -> bool:
             phases = {}
         if not isinstance(maxima, dict):
             maxima = {}
+        sampler_events = document.get("sampler_events")
+        if not isinstance(sampler_events, list):
+            sampler_events = []
 
         for phase, source in batch["phases"].items():
             aggregate = phases.setdefault(phase, {})
@@ -576,11 +892,39 @@ def _persist_batch(batch: dict[str, Any], state_path: Path) -> bool:
                 document["detail_evicted_count"], len(events) - DETAIL_EVENT_LIMIT
             )
         events = events[-DETAIL_EVENT_LIMIT:]
+        sampler_events.extend(batch["sampler_events"])
+        sampler_evicted = _saturated_sum(
+            document.get("sampler_event_evicted_count"),
+            batch["sampler_event_evicted_before_flush_count"],
+        )
+        if len(sampler_events) > SAMPLER_EVENT_LIMIT:
+            sampler_evicted = _saturated_sum(
+                sampler_evicted, len(sampler_events) - SAMPLER_EVENT_LIMIT
+            )
+        sampler_events = sampler_events[-SAMPLER_EVENT_LIMIT:]
         document.update({
             "schema_version": SCHEMA_VERSION,
             "detail_event_limit": DETAIL_EVENT_LIMIT,
             "detail_rss_delta_bytes": DETAIL_RSS_DELTA_BYTES,
             "detail_rss_bytes": DETAIL_RSS_BYTES,
+            "sampler_event_limit": SAMPLER_EVENT_LIMIT,
+            "sampler_interval_seconds": SAMPLER_INTERVAL_SECONDS,
+            "sampler_rss_bytes": SAMPLER_RSS_BYTES,
+            "sampler_hwm_delta_bytes": SAMPLER_HWM_DELTA_BYTES,
+            "sampler_sample_count": _saturated_sum(
+                document.get("sampler_sample_count"),
+                batch["sampler_sample_count"],
+            ),
+            "sampler_event_retained_count": _saturated_sum(
+                document.get("sampler_event_retained_count"),
+                batch["sampler_event_retained_count"],
+            ),
+            "sampler_event_evicted_count": sampler_evicted,
+            "sampler_measurement_failure_count": _saturated_sum(
+                document.get("sampler_measurement_failure_count"),
+                batch["sampler_measurement_failure_count"],
+            ),
+            "sampler_events": sampler_events,
             "persistence_failure_count": _saturated_sum(
                 document.get("persistence_failure_count"),
                 batch["persistence_failure_count"],
@@ -605,7 +949,10 @@ def flush_phase_memory_telemetry(*, state_path: Path | None = None) -> bool:
     target = Path(state_path) if state_path is not None else MEMORY_PHASE_PATH
     with _flush_lock:
         with _active_lock:
-            if _pending_batch is None or not _pending_batch["total_phase_count"]:
+            if _pending_batch is None or not (
+                _pending_batch["total_phase_count"]
+                or _pending_batch["sampler_sample_count"]
+            ):
                 return True
             batch = _pending_batch
             _pending_batch = None
@@ -668,7 +1015,7 @@ def _request_background_flush() -> bool:
 
 @dataclass
 class PhaseToken:
-    """Private phase state; no token identity is ever serialized."""
+    """Private phase state with identifier-free sequential correlation values."""
 
     phase: str
     metadata: dict[str, bool | int | str]
@@ -683,6 +1030,11 @@ class PhaseToken:
     start_runtime_counts: dict[str, Any]
     active_at_start: list[dict[str, int | str]]
     process_id: int
+    instance_id: int
+    context_id: int
+    context_stack: tuple[str, ...]
+    task_kind: str
+    parent: "PhaseToken | None" = field(default=None, repr=False)
     metadata_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
     active: bool = True
     finished: bool = False
@@ -695,6 +1047,7 @@ class PhaseToken:
             if self.finished:
                 return False
             self.metadata.update(normalized)
+            _update_active_context(self.instance_id, self.metadata)
         return True
 
     def add_metadata(self, **scalars: Any) -> bool:
@@ -711,6 +1064,7 @@ class PhaseToken:
                     )
                 else:
                     self.metadata[key] = value
+            _update_active_context(self.instance_id, self.metadata)
         return True
 
 
@@ -737,6 +1091,23 @@ def start_phase(
         include_gc_counts=include_gc_counts,
         include_object_count=include_object_count,
     )
+    parent = _current_phase.get()
+    if parent is not None and parent.finished:
+        parent = None
+    context_id = parent.context_id if parent is not None else _next_identity(context=True)
+    context_stack = (
+        parent.context_stack + (phase,) if parent is not None else (phase,)
+    )
+    instance_id = _next_identity()
+    task_kind = _task_kind()
+    active_at_start = _activate(
+        phase,
+        instance_id=instance_id,
+        context_id=context_id,
+        context_stack=context_stack,
+        task_kind=task_kind,
+        metadata=normalized_metadata,
+    )
     return PhaseToken(
         phase=phase,
         metadata=normalized_metadata,
@@ -749,8 +1120,13 @@ def start_phase(
         started_monotonic=started_monotonic,
         start_memory=start_memory,
         start_runtime_counts=start_runtime_counts,
-        active_at_start=_activate(phase),
+        active_at_start=active_at_start,
         process_id=os.getpid(),
+        instance_id=instance_id,
+        context_id=context_id,
+        context_stack=context_stack,
+        task_kind=task_kind,
+        parent=parent,
     )
 
 
@@ -772,7 +1148,7 @@ def finish_phase(token: PhaseToken, *, body_failed: bool = False) -> dict[str, A
         include_gc_counts=token.include_gc_counts,
         include_object_count=token.include_object_count,
     )
-    active_at_end = _deactivate(token.phase)
+    active_at_end = _deactivate(token.phase, token.instance_id)
     token.active = False
 
     rss_delta = _delta(end_memory["rss_bytes"], token.start_memory["rss_bytes"])
@@ -829,6 +1205,14 @@ def finish_phase(token: PhaseToken, *, body_failed: bool = False) -> dict[str, A
         "hwm_delta_bytes": hwm_delta,
         "active_at_start": token.active_at_start,
         "active_at_end": active_at_end,
+        "context_id": token.context_id,
+        "span_id": token.instance_id,
+        "task_kind": token.task_kind,
+        "context_stack_at_start": list(token.context_stack[-CONTEXT_STACK_LIMIT:]),
+        "context_stack_at_end": list(
+            token.context_stack[:-1][-CONTEXT_STACK_LIMIT:]
+        ),
+        "context_stack_truncated": len(token.context_stack) > CONTEXT_STACK_LIMIT,
         "metadata": detail_metadata,
         "body_failed": bool(body_failed),
         "trigger_reasons": trigger_reasons,
@@ -927,7 +1311,9 @@ class PhaseMemoryScope(AbstractContextManager["PhaseMemoryScope"]):
                 except Exception:
                     if self.token.active:
                         try:
-                            _deactivate(self.token.phase)
+                            _deactivate(
+                                self.token.phase, self.token.instance_id
+                            )
                         except Exception:
                             pass
                         self.token.active = False
@@ -960,3 +1346,32 @@ def add_current_phase_metadata(**scalars: Any) -> bool:
         return token.add_metadata(**scalars)
     except Exception:
         return False
+
+
+def current_phase_context_contains(name: str) -> bool:
+    """Return whether the current task-local phase stack contains a fixed phase."""
+    try:
+        phase = _normalize_phase(name)
+        token = _current_phase.get()
+        return bool(
+            token is not None
+            and not token.finished
+            and phase in token.context_stack
+        )
+    except Exception:
+        return False
+
+
+def add_ancestor_phase_metadata(name: str, **scalars: Any) -> bool:
+    """Add safe scalars to the nearest matching task-local parent."""
+    try:
+        phase = _normalize_phase(name)
+        current = _current_phase.get()
+        token = current.parent if current is not None else None
+        while token is not None:
+            if not token.finished and token.phase == phase:
+                return token.add_metadata(**scalars)
+            token = token.parent
+    except Exception:
+        return False
+    return False
