@@ -79,13 +79,24 @@ class SolanaRpcRouterTests(unittest.TestCase):
             Path(self.temporary.name) / "coverage-hourly.json"
         )
         coverage_telemetry.reset_pending_telemetry()
+        with solana_rpc._semantic_repetition_lock:
+            solana_rpc._semantic_repetition_seen.clear()
 
     def tearDown(self) -> None:
         solana_rpc.RPC_PROVIDER_STATE_DIR = self.original_state_dir
         coverage_telemetry.reset_pending_telemetry()
+        with solana_rpc._semantic_repetition_lock:
+            solana_rpc._semantic_repetition_seen.clear()
         coverage_telemetry.TELEMETRY_PATH = self.original_telemetry_path
         coverage_telemetry.HOURLY_TELEMETRY_PATH = self.original_hourly_path
         self.temporary.cleanup()
+
+    def _coverage_rpc_metrics(self) -> dict[str, dict[str, object]]:
+        coverage_telemetry.flush_coverage_telemetry()
+        document = json.loads(
+            coverage_telemetry.TELEMETRY_PATH.read_text("utf-8")
+        )
+        return document["buckets"][-1]["rpc_methods"]
 
     def test_primary_success_updates_provider_state(self) -> None:
         primary = provider("alchemy")
@@ -200,6 +211,273 @@ class SolanaRpcRouterTests(unittest.TestCase):
         )
         state = solana_rpc.provider_state("ankr", [target])
         self.assertEqual(state["circuit_open_count"], 1)
+
+    def test_reservation_skip_reasons_are_exact_and_bounded(self) -> None:
+        cases = (
+            (
+                "circuit_open_cooldown",
+                {
+                    "circuit_state": "OPEN",
+                    "cooldown_until_epoch": time.time() + 60,
+                    "last_circuit_open_method": "getTransaction",
+                },
+            ),
+            (
+                "half_open_lease",
+                {
+                    "circuit_state": "HALF_OPEN",
+                    "half_open_lease_until_epoch": time.time() + 60,
+                    "last_circuit_open_method": "getTransaction",
+                },
+            ),
+            (
+                "cooldown",
+                {
+                    "circuit_state": "CLOSED",
+                    "cooldown_until_epoch": time.time() + 60,
+                    "last_failure_method": "getTransaction",
+                },
+            ),
+        )
+        for reason, changes in cases:
+            with self.subTest(reason=reason):
+                coverage_telemetry.reset_pending_telemetry()
+                coverage_telemetry.TELEMETRY_PATH.unlink(missing_ok=True)
+                target = provider("solana_public")
+                state = solana_rpc._empty_provider_state(target.name)
+                state.update(changes)
+                atomic_write_json(solana_rpc._state_path(target.name), state)
+
+                self.assertIsNone(solana_rpc._reserve_provider_slot_sync(
+                    target,
+                    method="getSignaturesForAddress",
+                ))
+
+                metric = self._coverage_rpc_metrics()[
+                    "solana_public|getSignaturesForAddress"
+                ]
+                self.assertEqual(metric["reservation_skip_count"], 1)
+                self.assertEqual(metric[f"reservation_{reason}_count"], 1)
+                self.assertEqual(
+                    metric["reservation_skip_trigger_methods"],
+                    {"getTransaction": 1},
+                )
+
+    def test_get_transaction_rate_limit_explains_signature_zero_attempt(self) -> None:
+        target = provider("solana_public")
+        session = FakeSession({
+            target.url: [FakeResponse(429, {}, {"Retry-After": "120"})],
+        })
+
+        with self.assertRaises(solana_rpc.SolanaRpcRateLimitExhaustedError):
+            asyncio.run(solana_rpc.solana_rpc_call(
+                session,
+                "getTransaction",
+                ["signature"],
+                workload="transaction_history",
+                providers=[target],
+                provider_local_attempts=1,
+            ))
+        with self.assertRaises(solana_rpc.SolanaRpcExhaustedError) as caught:
+            asyncio.run(solana_rpc.solana_rpc_call(
+                session,
+                "getSignaturesForAddress",
+                ["address", {"limit": 12, "commitment": "confirmed"}],
+                workload="transaction_history",
+                providers=[target],
+                provider_local_attempts=1,
+            ))
+
+        self.assertEqual(caught.exception.attempts, 0)
+        self.assertIsNone(caught.exception.last_provider)
+        self.assertEqual(len(session.calls), 1)
+        state = solana_rpc.provider_state(target.name, [target])
+        self.assertEqual(state["last_failure_method"], "getTransaction")
+        self.assertEqual(state["last_rate_limit_method"], "getTransaction")
+        metrics = self._coverage_rpc_metrics()
+        skipped = metrics["solana_public|getSignaturesForAddress"]
+        self.assertEqual(skipped["reservation_cooldown_count"], 1)
+        self.assertEqual(
+            skipped["reservation_skip_trigger_methods"],
+            {"getTransaction": 1},
+        )
+        zero = metrics["router|getSignaturesForAddress"]
+        self.assertEqual(zero["zero_attempt_exhaustion_count"], 1)
+        self.assertEqual(zero["zero_attempt_provider_count_sum"], 1)
+        self.assertEqual(zero["zero_attempt_provider_counts"], {"1": 1})
+        self.assertEqual(zero["zero_attempt_cooldown_count"], 1)
+        self.assertEqual(
+            zero["zero_attempt_workloads"],
+            {"transaction_history": 1},
+        )
+
+    def test_all_skipped_providers_have_one_mixed_zero_attempt_summary(self) -> None:
+        helius = provider("helius")
+        public = provider("solana_public")
+        helius_state = solana_rpc._empty_provider_state(helius.name)
+        helius_state.update({
+            "circuit_state": "OPEN",
+            "cooldown_until_epoch": time.time() + 60,
+            "last_circuit_open_method": "getTransaction",
+        })
+        public_state = solana_rpc._empty_provider_state(public.name)
+        public_state.update({
+            "circuit_state": "CLOSED",
+            "cooldown_until_epoch": time.time() + 60,
+            "last_failure_method": "getTransaction",
+        })
+        atomic_write_json(solana_rpc._state_path(helius.name), helius_state)
+        atomic_write_json(solana_rpc._state_path(public.name), public_state)
+
+        with self.assertRaises(solana_rpc.SolanaRpcExhaustedError) as caught:
+            asyncio.run(solana_rpc.solana_rpc_call(
+                FakeSession({}),
+                "getSignaturesForAddress",
+                ["address"],
+                workload="transaction_history",
+                providers=[public, helius],
+            ))
+
+        self.assertEqual(caught.exception.attempts, 0)
+        zero = self._coverage_rpc_metrics()[
+            "router|getSignaturesForAddress"
+        ]
+        self.assertEqual(zero["zero_attempt_exhaustion_count"], 1)
+        self.assertEqual(zero["zero_attempt_provider_count_sum"], 2)
+        self.assertEqual(zero["zero_attempt_provider_counts"], {"2": 1})
+        self.assertEqual(zero["zero_attempt_circuit_open_cooldown_count"], 1)
+        self.assertEqual(zero["zero_attempt_cooldown_count"], 1)
+        self.assertEqual(zero["zero_attempt_mixed_unavailable_count"], 1)
+
+    def test_circuit_trigger_method_is_recorded_only_on_open_transition(self) -> None:
+        target = provider("solana_public")
+        reservation = solana_rpc.ProviderReservation(half_open_probe=False)
+        failure = solana_rpc.ProviderFailure(
+            provider=target.name,
+            transient=True,
+            rate_limited=True,
+            retry_delay_seconds=1.0,
+            retry_source="retry-after",
+            category="RATE_LIMIT",
+        )
+        for _ in range(solana_rpc.RPC_CIRCUIT_FAILURE_THRESHOLD):
+            solana_rpc._record_provider_failure_sync(
+                target,
+                reservation,
+                failure,
+                method="getTransaction",
+            )
+        solana_rpc._record_provider_failure_sync(
+            target,
+            reservation,
+            failure,
+            method="getSignaturesForAddress",
+        )
+
+        state = solana_rpc.provider_state(target.name, [target])
+        self.assertEqual(state["last_failure_method"], "getSignaturesForAddress")
+        self.assertEqual(state["last_rate_limit_method"], "getSignaturesForAddress")
+        self.assertEqual(state["last_circuit_open_method"], "getTransaction")
+
+    def test_semantic_repetition_windows_and_capacity_are_bounded(self) -> None:
+        params = ["private-address", {"commitment": "confirmed", "limit": 12}]
+        for now in (0.0, 30.0, 120.0, 600.0):
+            solana_rpc._record_semantic_repetition(
+                "getSignaturesForAddress",
+                params,
+                now_monotonic=now,
+            )
+        with patch.object(
+            solana_rpc,
+            "RPC_SEMANTIC_REPETITION_MAX_ENTRIES",
+            3,
+        ):
+            for index in range(4):
+                solana_rpc._record_semantic_repetition(
+                    "getSignaturesForAddress",
+                    [f"unique-{index}"],
+                    now_monotonic=700.0 + index,
+                )
+            solana_rpc._record_semantic_repetition(
+                "getSignaturesForAddress",
+                ["after-ttl"],
+                now_monotonic=2_000.0,
+            )
+
+        self.assertEqual(len(solana_rpc._semantic_repetition_seen), 1)
+        metric = self._coverage_rpc_metrics()[
+            "router|getSignaturesForAddress"
+        ]
+        self.assertEqual(metric["semantic_request_count"], 9)
+        self.assertEqual(metric["semantic_repeated_within_1m_count"], 1)
+        self.assertEqual(metric["semantic_repeated_within_5m_count"], 2)
+        self.assertEqual(metric["semantic_repeated_within_15m_count"], 3)
+        self.assertGreaterEqual(metric["semantic_tracker_eviction_count"], 5)
+
+    def test_semantic_digest_and_runtime_config_do_not_expose_secrets(self) -> None:
+        secret = "private-address-or-api-key"
+        digest = solana_rpc._semantic_request_digest(
+            "getSignaturesForAddress",
+            [secret, {"limit": 12}],
+        )
+        self.assertEqual(len(digest), 32)
+        self.assertNotIn(secret.encode("utf-8"), digest)
+        self.assertEqual(
+            digest,
+            solana_rpc._semantic_request_digest(
+                "getSignaturesForAddress",
+                [secret, {"limit": 12}],
+            ),
+        )
+        solana_rpc._record_semantic_repetition(
+            "getSignaturesForAddress",
+            [secret, {"limit": 12}],
+            now_monotonic=1.0,
+        )
+        self._coverage_rpc_metrics()
+        self.assertNotIn(
+            secret,
+            coverage_telemetry.TELEMETRY_PATH.read_text("utf-8"),
+        )
+        config = solana_rpc.safe_rpc_runtime_config({
+            "HELIUS_RPC_HTTP_URL": f"https://helius.invalid/?api-key={secret}",
+            "HELIUS_RPC_MAX_RPS": "7",
+            "SOLANA_RPC_PROVIDER_ATTEMPTS": "2",
+            "SOLANA_RPC_OVERALL_ATTEMPT_BUDGET": "6",
+        })
+        serialized = json.dumps(config, sort_keys=True)
+        self.assertNotIn(secret, serialized)
+        self.assertNotIn("https://", serialized)
+        helius = next(
+            item for item in config["providers"] if item["name"] == "helius"
+        )
+        self.assertTrue(helius["enabled"])
+        self.assertEqual(helius["max_rps"], 7.0)
+        self.assertEqual(config["provider_local_attempts"], 2)
+        self.assertEqual(config["overall_attempt_budget"], 6)
+
+    def test_telemetry_failure_does_not_change_rpc_result(self) -> None:
+        target = provider("alchemy")
+        session = FakeSession({
+            target.url: [FakeResponse(200, {"result": "unchanged"})],
+        })
+        with (
+            patch.object(
+                solana_rpc,
+                "record_rpc_method_metric",
+                side_effect=RuntimeError("telemetry-only"),
+            ),
+            patch.object(solana_rpc.logger, "exception"),
+        ):
+            result = asyncio.run(solana_rpc.solana_rpc_call(
+                session,
+                "getSignaturesForAddress",
+                ["address"],
+                providers=[target],
+            ))
+
+        self.assertEqual(result, "unchanged")
+        self.assertEqual(len(session.calls), 1)
 
     def test_cooldown_expiry_allows_one_probe_and_success_closes_circuit(self) -> None:
         target = provider("alchemy")

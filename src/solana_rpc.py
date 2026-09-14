@@ -3,12 +3,17 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import hmac
+import json
 import logging
 import math
 import os
+import secrets
 import threading
 import time
 import weakref
+from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -41,7 +46,7 @@ _reservation_locks: weakref.WeakKeyDictionary[
 RPC_PROVIDER_STATE_DIR = (
     Path(__file__).resolve().parents[1] / "data" / "solana_rpc_providers"
 )
-RPC_PROVIDER_STATE_SCHEMA_VERSION = 3
+RPC_PROVIDER_STATE_SCHEMA_VERSION = 4
 SOLANA_PUBLIC_DEFAULT_URL = "https://api.mainnet.solana.com"
 RPC_CIRCUIT_FAILURE_THRESHOLD = 3
 RPC_CIRCUIT_COOLDOWN_SECONDS = 60.0
@@ -135,6 +140,12 @@ RPC_METHOD_METRIC_NAMES = frozenset({
     "other",
 })
 RPC_LATENCY_BUCKET_LIMITS_MS = (250.0, 1_000.0, 5_000.0)
+RPC_SEMANTIC_REPETITION_TTL_SECONDS = 15 * 60.0
+RPC_SEMANTIC_REPETITION_MAX_ENTRIES = 256
+
+_semantic_repetition_lock = threading.Lock()
+_semantic_repetition_key = secrets.token_bytes(32)
+_semantic_repetition_seen: OrderedDict[bytes, float] = OrderedDict()
 
 
 @dataclass(frozen=True, slots=True)
@@ -351,6 +362,11 @@ def _empty_provider_state(provider_name: str) -> dict[str, Any]:
         "last_success_at_epoch": None,
         "last_failure_at_epoch": None,
         "last_failure_category": None,
+        "last_failure_method": None,
+        "last_rate_limit_at_epoch": None,
+        "last_rate_limit_method": None,
+        "last_circuit_open_at_epoch": None,
+        "last_circuit_open_method": None,
         "cooldown_until_epoch": 0.0,
         "circuit_state": "CLOSED",
         "circuit_open_count": 0,
@@ -472,6 +488,132 @@ def _record_coverage_rpc_metric(**values: Any) -> None:
         logger.exception("research RPC method telemetry record failed")
 
 
+def _semantic_request_digest(method: str, params: list[Any]) -> bytes:
+    """원문을 보존하지 않는 process-local semantic request key를 만든다."""
+    canonical = json.dumps(
+        [str(method), params],
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return hmac.new(
+        _semantic_repetition_key,
+        canonical,
+        hashlib.sha256,
+    ).digest()
+
+
+def _record_semantic_repetition(
+    method: str,
+    params: list[Any],
+    *,
+    now_monotonic: float | None = None,
+) -> None:
+    """getSignatures 반복을 bounded process-local history로만 집계한다."""
+    if str(method) != "getSignaturesForAddress":
+        return
+    try:
+        now = time.monotonic() if now_monotonic is None else float(now_monotonic)
+        digest = _semantic_request_digest(str(method), params)
+        expired_or_evicted = 0
+        repeated_1m = repeated_5m = repeated_15m = 0
+        with _semantic_repetition_lock:
+            cutoff = now - RPC_SEMANTIC_REPETITION_TTL_SECONDS
+            while _semantic_repetition_seen:
+                _, oldest = next(iter(_semantic_repetition_seen.items()))
+                if oldest >= cutoff:
+                    break
+                _semantic_repetition_seen.popitem(last=False)
+                expired_or_evicted += 1
+            previous = _semantic_repetition_seen.pop(digest, None)
+            if previous is not None and now >= previous:
+                age = now - previous
+                repeated_1m = int(age <= 60.0)
+                repeated_5m = int(age <= 5 * 60.0)
+                repeated_15m = int(age <= 15 * 60.0)
+            _semantic_repetition_seen[digest] = now
+            while (
+                len(_semantic_repetition_seen)
+                > RPC_SEMANTIC_REPETITION_MAX_ENTRIES
+            ):
+                _semantic_repetition_seen.popitem(last=False)
+                expired_or_evicted += 1
+        _record_coverage_rpc_metric(
+            provider="router",
+            method=str(method),
+            semantic_request_count=1,
+            semantic_repeated_within_1m_count=repeated_1m,
+            semantic_repeated_within_5m_count=repeated_5m,
+            semantic_repeated_within_15m_count=repeated_15m,
+            semantic_tracker_eviction_count=expired_or_evicted,
+        )
+    except Exception:
+        logger.exception("RPC semantic repetition telemetry failed")
+
+
+def safe_rpc_runtime_config(
+    environ: Mapping[str, str] | None = None,
+) -> dict[str, Any]:
+    """URL과 key 없이 effective RPC router 설정만 반환한다."""
+    source = os.environ if environ is None else environ
+    configured = provider_configs_from_env(environ)
+    indexed = {provider.name: provider for provider in configured}
+    local_attempts = _positive_int(
+        source.get("SOLANA_RPC_PROVIDER_ATTEMPTS", RPC_PROVIDER_LOCAL_ATTEMPTS),
+        setting="SOLANA_RPC_PROVIDER_ATTEMPTS",
+        maximum=3,
+    )
+    overall_attempts = _positive_int(
+        source.get("SOLANA_RPC_OVERALL_ATTEMPT_BUDGET", RPC_OVERALL_ATTEMPT_BUDGET),
+        setting="SOLANA_RPC_OVERALL_ATTEMPT_BUDGET",
+        maximum=20,
+    )
+    return {
+        "providers": [
+            {
+                "name": name,
+                "enabled": name in indexed,
+                "max_rps": indexed[name].max_rps if name in indexed else None,
+            }
+            for name in PROVIDER_ENVIRONMENTS
+        ],
+        "provider_local_attempts": local_attempts,
+        "overall_attempt_budget": overall_attempts,
+        "heavy_provider_order": [
+            provider.name for provider in ordered_providers(
+                configured,
+                "getSignaturesForAddress",
+                "transaction_history",
+            )
+        ],
+    }
+
+
+def _record_reservation_skip(
+    provider: RpcProvider,
+    method: str,
+    reason: str,
+    state: Mapping[str, Any],
+    skip_reasons: dict[str, int] | None,
+) -> None:
+    if skip_reasons is not None:
+        skip_reasons[reason] = int(skip_reasons.get(reason, 0) or 0) + 1
+    if reason in {"circuit_open_cooldown", "half_open_lease"}:
+        trigger = (
+            state.get("last_circuit_open_method")
+            or state.get("last_failure_method")
+        )
+    else:
+        trigger = state.get("last_failure_method")
+    _record_coverage_rpc_metric(
+        provider=provider.name,
+        method=method,
+        reservation_skip_count=1,
+        reservation_skip_reason=reason,
+        reservation_skip_trigger_method=str(trigger or "unknown"),
+    )
+
+
 def _reserve_provider_slot_sync(
     provider: RpcProvider,
     *,
@@ -479,6 +621,7 @@ def _reserve_provider_slot_sync(
     retry: bool = False,
     failover: bool = False,
     now_epoch: float | None = None,
+    skip_reasons: dict[str, int] | None = None,
 ) -> ProviderReservation | None:
     """provider별 전역 slot을 확보하고 OPEN/HALF_OPEN을 원자적으로 처리한다."""
     path = _state_path(provider.name)
@@ -494,6 +637,9 @@ def _reserve_provider_slot_sync(
         half_open_probe = False
         if circuit == "OPEN":
             if cooldown_until > now:
+                _record_reservation_skip(
+                    provider, method, "circuit_open_cooldown", state, skip_reasons
+                )
                 return None
             state["circuit_state"] = "HALF_OPEN"
             state["half_open_lease_until_epoch"] = (
@@ -502,12 +648,18 @@ def _reserve_provider_slot_sync(
             half_open_probe = True
         elif circuit == "HALF_OPEN":
             if lease_until > now:
+                _record_reservation_skip(
+                    provider, method, "half_open_lease", state, skip_reasons
+                )
                 return None
             state["half_open_lease_until_epoch"] = (
                 now + RPC_HALF_OPEN_LEASE_SECONDS
             )
             half_open_probe = True
         elif cooldown_until > now:
+            _record_reservation_skip(
+                provider, method, "cooldown", state, skip_reasons
+            )
             return None
 
         last_request = _safe_epoch(state.get("last_request_at_epoch"))
@@ -557,6 +709,7 @@ async def _reserve_provider_slot(
     method: str = "other",
     retry: bool = False,
     failover: bool = False,
+    skip_reasons: dict[str, int] | None = None,
 ) -> ProviderReservation | None:
     async with _process_reservation_lock(provider.name):
         return await asyncio.to_thread(
@@ -565,6 +718,7 @@ async def _reserve_provider_slot(
             method=method,
             retry=retry,
             failover=failover,
+            skip_reasons=skip_reasons,
         )
 
 
@@ -623,6 +777,7 @@ def _record_provider_failure_sync(
         _record_latency(metric, latency_ms)
         state["last_failure_at_epoch"] = now
         state["last_failure_category"] = failure.category
+        state["last_failure_method"] = _metric_method(method)
         if failure.rate_limited:
             state["rate_limit_count"] = (
                 int(state.get("rate_limit_count", 0) or 0) + 1
@@ -630,6 +785,8 @@ def _record_provider_failure_sync(
             metric["rate_limit_count"] = (
                 int(metric.get("rate_limit_count", 0) or 0) + 1
             )
+            state["last_rate_limit_at_epoch"] = now
+            state["last_rate_limit_method"] = _metric_method(method)
         if failure.transient:
             consecutive = int(state.get("consecutive_failures", 0) or 0) + 1
             state["consecutive_failures"] = consecutive
@@ -647,6 +804,8 @@ def _record_provider_failure_sync(
                     state["circuit_open_count"] = (
                         int(state.get("circuit_open_count", 0) or 0) + 1
                     )
+                    state["last_circuit_open_at_epoch"] = now
+                    state["last_circuit_open_method"] = _metric_method(method)
                 state["cooldown_until_epoch"] = max(
                     state["cooldown_until_epoch"],
                     now + RPC_CIRCUIT_COOLDOWN_SECONDS,
@@ -928,6 +1087,7 @@ async def solana_rpc_call(
     provider_local_attempts: int | None = None,
 ) -> Any:
     """활성 provider를 순서대로 시도하고 모두 실패하면 fail-closed한다."""
+    _record_semantic_repetition(str(method), params)
     configured = tuple(providers) if providers is not None else provider_configs_from_env()
     ordered = ordered_providers(configured, str(method), str(workload))
     if not ordered:
@@ -947,6 +1107,7 @@ async def solana_rpc_call(
         maximum=3,
     )
     failures: list[ProviderFailure] = []
+    skip_reasons: dict[str, int] = {}
     attempts_used = 0
     last_attempted_provider: RpcProvider | None = None
     for provider_index, provider in enumerate(ordered):
@@ -958,6 +1119,7 @@ async def solana_rpc_call(
                 method=str(method),
                 retry=local_attempt > 0,
                 failover=provider_index > 0,
+                skip_reasons=skip_reasons,
             )
             if reservation is None:
                 break
@@ -1019,6 +1181,15 @@ async def solana_rpc_call(
             _record_provider_exhaustion_sync,
             last_attempted_provider,
             method=str(method),
+        )
+    if attempts_used == 0:
+        _record_coverage_rpc_metric(
+            provider="router",
+            method=str(method),
+            zero_attempt_exhaustion_count=1,
+            zero_attempt_provider_count=len(ordered),
+            zero_attempt_skip_reasons=skip_reasons,
+            zero_attempt_workload=str(workload),
         )
     last_provider_name = (
         last_attempted_provider.name

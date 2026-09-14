@@ -213,6 +213,15 @@ class ResearchCoverageTelemetryTests(unittest.TestCase):
                 request_count=1,
                 failure_count=1,
                 rate_limit_count=1,
+                reservation_skip_count=1,
+                reservation_skip_reason="cooldown",
+                reservation_skip_trigger_method="getTransaction",
+                zero_attempt_exhaustion_count=1,
+                zero_attempt_provider_count=2,
+                zero_attempt_skip_reasons={"cooldown": 2},
+                zero_attempt_workload="transaction_history",
+                semantic_request_count=1,
+                semantic_repeated_within_5m_count=1,
                 latency_ms=100 + index,
                 timestamp=timestamp,
             )
@@ -243,6 +252,22 @@ class ResearchCoverageTelemetryTests(unittest.TestCase):
         self.assertEqual(rpc["latency_sum_ms"], 406.0)
         self.assertEqual(rpc["latency_max_ms"], 103.0)
         self.assertEqual(rpc["latency_buckets"]["le_250_ms"], 4)
+        self.assertEqual(rpc["reservation_skip_count"], 4)
+        self.assertEqual(rpc["reservation_cooldown_count"], 4)
+        self.assertEqual(
+            rpc["reservation_skip_trigger_methods"],
+            {"getTransaction": 4},
+        )
+        self.assertEqual(rpc["zero_attempt_exhaustion_count"], 4)
+        self.assertEqual(rpc["zero_attempt_provider_count_sum"], 8)
+        self.assertEqual(rpc["zero_attempt_provider_counts"], {"2": 4})
+        self.assertEqual(rpc["zero_attempt_cooldown_count"], 8)
+        self.assertEqual(
+            rpc["zero_attempt_workloads"],
+            {"transaction_history": 4},
+        )
+        self.assertEqual(rpc["semantic_request_count"], 4)
+        self.assertEqual(rpc["semantic_repeated_within_5m_count"], 4)
         raw_report = coverage_telemetry.coverage_report(
             now_epoch=coverage_telemetry.HOUR_SECONDS
         )

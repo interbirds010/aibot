@@ -8,7 +8,7 @@ import threading
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 from src import state_store
 from src.phase_memory_telemetry import (
@@ -92,6 +92,22 @@ RPC_PROVIDERS = frozenset({
     "router",
     "unknown",
 })
+RPC_RESERVATION_SKIP_REASONS = frozenset({
+    "circuit_open_cooldown",
+    "half_open_lease",
+    "cooldown",
+})
+RPC_ATTRIBUTION_WORKLOADS = frozenset({
+    "default",
+    "analyzer",
+    "executor_read",
+    "transaction_history",
+    "wallet_feeder",
+    "research",
+    "deployment_smoke",
+    "unknown",
+})
+RPC_ZERO_ATTEMPT_PROVIDER_COUNTS = frozenset({"0", "1", "2", "3", "4", "5"})
 
 _pending_lock = threading.Lock()
 _pending_buckets: dict[int, dict[str, Any]] = {}
@@ -333,6 +349,24 @@ def _rpc_method_metric() -> dict[str, Any]:
         "latency_sum_ms": 0.0,
         "latency_max_ms": 0.0,
         "latency_buckets": {key: 0 for key in LATENCY_BUCKET_KEYS},
+        "reservation_skip_count": 0,
+        "reservation_circuit_open_cooldown_count": 0,
+        "reservation_half_open_lease_count": 0,
+        "reservation_cooldown_count": 0,
+        "reservation_skip_trigger_methods": {},
+        "zero_attempt_exhaustion_count": 0,
+        "zero_attempt_provider_count_sum": 0,
+        "zero_attempt_provider_counts": {},
+        "zero_attempt_circuit_open_cooldown_count": 0,
+        "zero_attempt_half_open_lease_count": 0,
+        "zero_attempt_cooldown_count": 0,
+        "zero_attempt_mixed_unavailable_count": 0,
+        "zero_attempt_workloads": {},
+        "semantic_request_count": 0,
+        "semantic_repeated_within_1m_count": 0,
+        "semantic_repeated_within_5m_count": 0,
+        "semantic_repeated_within_15m_count": 0,
+        "semantic_tracker_eviction_count": 0,
     }
 
 
@@ -347,6 +381,18 @@ def record_rpc_method_metric(
     exhaustion_count: int = 0,
     retry_count: int = 0,
     failover_count: int = 0,
+    reservation_skip_count: int = 0,
+    reservation_skip_reason: str | None = None,
+    reservation_skip_trigger_method: str | None = None,
+    zero_attempt_exhaustion_count: int = 0,
+    zero_attempt_provider_count: int = 0,
+    zero_attempt_skip_reasons: Mapping[str, int] | None = None,
+    zero_attempt_workload: str | None = None,
+    semantic_request_count: int = 0,
+    semantic_repeated_within_1m_count: int = 0,
+    semantic_repeated_within_5m_count: int = 0,
+    semantic_repeated_within_15m_count: int = 0,
+    semantic_tracker_eviction_count: int = 0,
     latency_ms: float | None = None,
     timestamp: float | None = None,
 ) -> None:
@@ -365,6 +411,24 @@ def record_rpc_method_metric(
         "exhaustion_count": exhaustion_count,
         "retry_count": retry_count,
         "failover_count": failover_count,
+        "reservation_skip_count": reservation_skip_count,
+        "zero_attempt_exhaustion_count": zero_attempt_exhaustion_count,
+        "zero_attempt_provider_count_sum": (
+            zero_attempt_provider_count
+            if int(zero_attempt_exhaustion_count or 0) > 0
+            else 0
+        ),
+        "semantic_request_count": semantic_request_count,
+        "semantic_repeated_within_1m_count": (
+            semantic_repeated_within_1m_count
+        ),
+        "semantic_repeated_within_5m_count": (
+            semantic_repeated_within_5m_count
+        ),
+        "semantic_repeated_within_15m_count": (
+            semantic_repeated_within_15m_count
+        ),
+        "semantic_tracker_eviction_count": semantic_tracker_eviction_count,
     }
     normalized: dict[str, int] = {}
     for key, value in increments.items():
@@ -403,6 +467,62 @@ def record_rpc_method_metric(
             dimensions[key] = metric
         for name, value in normalized.items():
             metric[name] = int(metric.get(name, 0) or 0) + value
+        skip_count = normalized["reservation_skip_count"]
+        normalized_skip_reason = str(reservation_skip_reason or "")
+        if (
+            skip_count
+            and normalized_skip_reason in RPC_RESERVATION_SKIP_REASONS
+        ):
+            reason_key = f"reservation_{normalized_skip_reason}_count"
+            metric[reason_key] = int(metric.get(reason_key, 0) or 0) + skip_count
+            trigger_method = (
+                str(reservation_skip_trigger_method)
+                if str(reservation_skip_trigger_method) in RPC_METHODS
+                else "unknown"
+            )
+            trigger_counts = metric.setdefault(
+                "reservation_skip_trigger_methods", {}
+            )
+            trigger_counts[trigger_method] = int(
+                trigger_counts.get(trigger_method, 0) or 0
+            ) + skip_count
+        zero_attempt_count = normalized["zero_attempt_exhaustion_count"]
+        if zero_attempt_count:
+            reason_counts = (
+                zero_attempt_skip_reasons
+                if isinstance(zero_attempt_skip_reasons, Mapping)
+                else {}
+            )
+            active_reasons = 0
+            for reason in RPC_RESERVATION_SKIP_REASONS:
+                count = max(0, int(reason_counts.get(reason, 0) or 0))
+                if count:
+                    active_reasons += 1
+                    name = f"zero_attempt_{reason}_count"
+                    metric[name] = int(metric.get(name, 0) or 0) + count
+            if active_reasons > 1:
+                metric["zero_attempt_mixed_unavailable_count"] = (
+                    int(metric.get("zero_attempt_mixed_unavailable_count", 0) or 0)
+                    + zero_attempt_count
+                )
+            provider_count = min(
+                5,
+                normalized["zero_attempt_provider_count_sum"],
+            )
+            provider_counts = metric.setdefault(
+                "zero_attempt_provider_counts", {}
+            )
+            provider_key = str(provider_count)
+            provider_counts[provider_key] = int(
+                provider_counts.get(provider_key, 0) or 0
+            ) + zero_attempt_count
+            workload = str(zero_attempt_workload or "unknown")
+            if workload not in RPC_ATTRIBUTION_WORKLOADS:
+                workload = "unknown"
+            workload_counts = metric.setdefault("zero_attempt_workloads", {})
+            workload_counts[workload] = int(
+                workload_counts.get(workload, 0) or 0
+            ) + zero_attempt_count
         if latency is not None:
             metric["latency_count"] = int(
                 metric.get("latency_count", 0) or 0
@@ -451,6 +571,21 @@ def _merge_rpc_method_metric(
         "retry_count",
         "failover_count",
         "latency_count",
+        "reservation_skip_count",
+        "reservation_circuit_open_cooldown_count",
+        "reservation_half_open_lease_count",
+        "reservation_cooldown_count",
+        "zero_attempt_exhaustion_count",
+        "zero_attempt_provider_count_sum",
+        "zero_attempt_circuit_open_cooldown_count",
+        "zero_attempt_half_open_lease_count",
+        "zero_attempt_cooldown_count",
+        "zero_attempt_mixed_unavailable_count",
+        "semantic_request_count",
+        "semantic_repeated_within_1m_count",
+        "semantic_repeated_within_5m_count",
+        "semantic_repeated_within_15m_count",
+        "semantic_tracker_eviction_count",
     ):
         target[name] = (
             int(target.get(name, 0) or 0)
@@ -473,6 +608,18 @@ def _merge_rpc_method_metric(
             int(target_buckets.get(name, 0) or 0)
             + int(source_buckets.get(name, 0) or 0)
         )
+    for field, allowed in (
+        ("reservation_skip_trigger_methods", RPC_METHODS),
+        ("zero_attempt_workloads", RPC_ATTRIBUTION_WORKLOADS),
+        ("zero_attempt_provider_counts", RPC_ZERO_ATTEMPT_PROVIDER_COUNTS),
+    ):
+        target_counts = target.setdefault(field, {})
+        source_counts = source.get(field, {})
+        source_counts = source_counts if isinstance(source_counts, dict) else {}
+        for name in allowed:
+            count = int(source_counts.get(name, 0) or 0)
+            if count:
+                target_counts[name] = int(target_counts.get(name, 0) or 0) + count
 
 
 def _merge_bucket(target: dict[str, Any], source: dict[str, Any]) -> None:
