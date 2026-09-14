@@ -263,10 +263,13 @@ class SolanaRpcRouterTests(unittest.TestCase):
                     {"getTransaction": 1},
                 )
 
-    def test_get_transaction_rate_limit_explains_signature_zero_attempt(self) -> None:
+    def test_get_transaction_rate_limit_does_not_block_signatures(self) -> None:
         target = provider("solana_public")
         session = FakeSession({
-            target.url: [FakeResponse(429, {}, {"Retry-After": "120"})],
+            target.url: [
+                FakeResponse(429, {}, {"Retry-After": "120"}),
+                FakeResponse(200, {"result": ["healthy"]}),
+            ],
         })
 
         with self.assertRaises(solana_rpc.SolanaRpcRateLimitExhaustedError):
@@ -278,38 +281,83 @@ class SolanaRpcRouterTests(unittest.TestCase):
                 providers=[target],
                 provider_local_attempts=1,
             ))
-        with self.assertRaises(solana_rpc.SolanaRpcExhaustedError) as caught:
+        result = asyncio.run(solana_rpc.solana_rpc_call(
+            session,
+            "getSignaturesForAddress",
+            ["address", {"limit": 12, "commitment": "confirmed"}],
+            workload="transaction_history",
+            providers=[target],
+            provider_local_attempts=1,
+        ))
+
+        self.assertEqual(result, ["healthy"])
+        self.assertEqual(
+            [call[1] for call in session.calls],
+            ["getTransaction", "getSignaturesForAddress"],
+        )
+        state = solana_rpc.provider_state(target.name, [target])
+        transaction = state["method_availability"]["getTransaction"]
+        signatures = state["method_availability"][
+            "getSignaturesForAddress"
+        ]
+        self.assertEqual(transaction["last_failure_method"], "getTransaction")
+        self.assertEqual(
+            transaction["last_rate_limit_method"], "getTransaction"
+        )
+        self.assertGreater(transaction["cooldown_until_epoch"], time.time())
+        self.assertEqual(signatures["circuit_state"], "CLOSED")
+        self.assertEqual(state["circuit_state"], "CLOSED")
+        metrics = self._coverage_rpc_metrics()
+        signatures_metric = metrics[
+            "solana_public|getSignaturesForAddress"
+        ]
+        self.assertEqual(signatures_metric["request_count"], 1)
+        self.assertEqual(signatures_metric["success_count"], 1)
+        self.assertEqual(signatures_metric["reservation_skip_count"], 0)
+        self.assertEqual(
+            metrics["router|getSignaturesForAddress"][
+                "zero_attempt_exhaustion_count"
+            ],
+            0,
+        )
+
+    def test_signature_rate_limit_does_not_block_transaction(self) -> None:
+        target = provider("solana_public")
+        session = FakeSession({
+            target.url: [
+                FakeResponse(429, {}, {"Retry-After": "120"}),
+                FakeResponse(200, {"result": {"slot": 7}}),
+            ],
+        })
+
+        with self.assertRaises(solana_rpc.SolanaRpcRateLimitExhaustedError):
             asyncio.run(solana_rpc.solana_rpc_call(
                 session,
                 "getSignaturesForAddress",
-                ["address", {"limit": 12, "commitment": "confirmed"}],
-                workload="transaction_history",
+                ["address"],
                 providers=[target],
                 provider_local_attempts=1,
             ))
+        result = asyncio.run(solana_rpc.solana_rpc_call(
+            session,
+            "getTransaction",
+            ["signature"],
+            providers=[target],
+            provider_local_attempts=1,
+        ))
 
-        self.assertEqual(caught.exception.attempts, 0)
-        self.assertIsNone(caught.exception.last_provider)
-        self.assertEqual(len(session.calls), 1)
+        self.assertEqual(result, {"slot": 7})
+        self.assertEqual(
+            [call[1] for call in session.calls],
+            ["getSignaturesForAddress", "getTransaction"],
+        )
         state = solana_rpc.provider_state(target.name, [target])
-        self.assertEqual(state["last_failure_method"], "getTransaction")
-        self.assertEqual(state["last_rate_limit_method"], "getTransaction")
-        metrics = self._coverage_rpc_metrics()
-        skipped = metrics["solana_public|getSignaturesForAddress"]
-        self.assertEqual(skipped["reservation_cooldown_count"], 1)
-        self.assertEqual(
-            skipped["reservation_skip_trigger_methods"],
-            {"getTransaction": 1},
-        )
-        zero = metrics["router|getSignaturesForAddress"]
-        self.assertEqual(zero["zero_attempt_exhaustion_count"], 1)
-        self.assertEqual(zero["zero_attempt_provider_count_sum"], 1)
-        self.assertEqual(zero["zero_attempt_provider_counts"], {"1": 1})
-        self.assertEqual(zero["zero_attempt_cooldown_count"], 1)
-        self.assertEqual(
-            zero["zero_attempt_workloads"],
-            {"transaction_history": 1},
-        )
+        signatures = state["method_availability"][
+            "getSignaturesForAddress"
+        ]
+        transaction = state["method_availability"]["getTransaction"]
+        self.assertGreater(signatures["cooldown_until_epoch"], time.time())
+        self.assertEqual(transaction["circuit_state"], "CLOSED")
 
     def test_all_skipped_providers_have_one_mixed_zero_attempt_summary(self) -> None:
         helius = provider("helius")
@@ -375,9 +423,181 @@ class SolanaRpcRouterTests(unittest.TestCase):
         )
 
         state = solana_rpc.provider_state(target.name, [target])
+        transaction = state["method_availability"]["getTransaction"]
+        signatures = state["method_availability"][
+            "getSignaturesForAddress"
+        ]
+        self.assertEqual(transaction["last_failure_method"], "getTransaction")
+        self.assertEqual(transaction["last_circuit_open_method"], "getTransaction")
+        self.assertEqual(
+            signatures["last_failure_method"], "getSignaturesForAddress"
+        )
+        self.assertEqual(
+            signatures["last_rate_limit_method"],
+            "getSignaturesForAddress",
+        )
         self.assertEqual(state["last_failure_method"], "getSignaturesForAddress")
-        self.assertEqual(state["last_rate_limit_method"], "getSignaturesForAddress")
+        self.assertEqual(
+            state["last_rate_limit_method"], "getSignaturesForAddress"
+        )
         self.assertEqual(state["last_circuit_open_method"], "getTransaction")
+
+    def test_method_circuit_and_half_open_lease_are_isolated(self) -> None:
+        target = provider("solana_public")
+        reservation = solana_rpc.ProviderReservation(half_open_probe=False)
+        failure = solana_rpc.ProviderFailure(
+            provider=target.name,
+            transient=True,
+            rate_limited=True,
+            retry_delay_seconds=1.0,
+            retry_source="retry-after",
+            category="RATE_LIMIT",
+        )
+        for _ in range(solana_rpc.RPC_CIRCUIT_FAILURE_THRESHOLD):
+            solana_rpc._record_provider_failure_sync(
+                target,
+                reservation,
+                failure,
+                method="getTransaction",
+            )
+
+        state = solana_rpc.provider_state(target.name, [target])
+        transaction = state["method_availability"]["getTransaction"]
+        self.assertEqual(transaction["circuit_state"], "OPEN")
+        self.assertIsNone(solana_rpc._reserve_provider_slot_sync(
+            target,
+            method="getTransaction",
+        ))
+        self.assertIsNotNone(solana_rpc._reserve_provider_slot_sync(
+            target,
+            method="getSignaturesForAddress",
+        ))
+
+        transaction["cooldown_until_epoch"] = 99.0
+        transaction["half_open_lease_until_epoch"] = 0.0
+        atomic_write_json(solana_rpc._state_path(target.name), state)
+        probe = solana_rpc._reserve_provider_slot_sync(
+            target,
+            method="getTransaction",
+            now_epoch=100.0,
+        )
+        self.assertIsNotNone(probe)
+        self.assertTrue(probe.method_half_open_probe)
+        self.assertIsNone(solana_rpc._reserve_provider_slot_sync(
+            target,
+            method="getTransaction",
+            now_epoch=100.1,
+        ))
+        self.assertIsNotNone(solana_rpc._reserve_provider_slot_sync(
+            target,
+            method="getSignaturesForAddress",
+            now_epoch=100.1,
+        ))
+
+    def test_method_success_does_not_close_other_method_circuit(self) -> None:
+        target = provider("solana_public")
+        state = solana_rpc._empty_provider_state(target.name)
+        transaction = state["method_availability"]["getTransaction"]
+        transaction.update({
+            "circuit_state": "OPEN",
+            "cooldown_until_epoch": time.time() + 60,
+            "consecutive_failures": 3,
+            "last_circuit_open_method": "getTransaction",
+        })
+        atomic_write_json(solana_rpc._state_path(target.name), state)
+
+        solana_rpc._record_provider_success_sync(
+            target,
+            solana_rpc.ProviderReservation(half_open_probe=False),
+            method="getSignaturesForAddress",
+        )
+
+        final_state = solana_rpc.provider_state(target.name, [target])
+        self.assertEqual(
+            final_state["method_availability"]["getTransaction"][
+                "circuit_state"
+            ],
+            "OPEN",
+        )
+
+    def test_provider_wide_failure_still_blocks_all_methods(self) -> None:
+        target = provider("solana_public")
+        session = FakeSession({target.url: [FakeResponse(500, {})]})
+        provider_failure = solana_rpc.ProviderFailure(
+            provider=target.name,
+            transient=True,
+            rate_limited=False,
+            retry_delay_seconds=120.0,
+            retry_source="exponential-fallback",
+            category="HTTP_TRANSIENT",
+        )
+        with (
+            patch.object(
+                solana_rpc,
+                "_failure_from_error",
+                return_value=provider_failure,
+            ),
+            self.assertRaises(solana_rpc.SolanaRpcExhaustedError),
+        ):
+            asyncio.run(solana_rpc.solana_rpc_call(
+                session,
+                "getTransaction",
+                ["signature"],
+                providers=[target],
+                provider_local_attempts=1,
+            ))
+        with self.assertRaises(solana_rpc.SolanaRpcExhaustedError) as caught:
+            asyncio.run(solana_rpc.solana_rpc_call(
+                session,
+                "getSignaturesForAddress",
+                ["address"],
+                providers=[target],
+                provider_local_attempts=1,
+            ))
+
+        self.assertEqual(caught.exception.attempts, 0)
+        self.assertEqual(len(session.calls), 1)
+        state = solana_rpc.provider_state(target.name, [target])
+        self.assertGreater(state["cooldown_until_epoch"], time.time())
+        self.assertEqual(state["last_failure_method"], "getTransaction")
+        telemetry = self._coverage_rpc_metrics()
+        skipped = telemetry["solana_public|getSignaturesForAddress"]
+        self.assertEqual(skipped["reservation_cooldown_count"], 1)
+        self.assertEqual(
+            skipped["reservation_skip_trigger_methods"],
+            {"getTransaction": 1},
+        )
+
+    def test_failure_scope_classification_is_narrow(self) -> None:
+        def failure(category: str, *, rate_limited: bool = False):
+            return solana_rpc.ProviderFailure(
+                provider="solana_public",
+                transient=True,
+                rate_limited=rate_limited,
+                retry_delay_seconds=1.0,
+                retry_source="test",
+                category=category,
+            )
+
+        self.assertTrue(solana_rpc._failure_uses_method_availability(
+            "getTransaction", failure("RATE_LIMIT", rate_limited=True)
+        ))
+        self.assertTrue(solana_rpc._failure_uses_method_availability(
+            "getSignaturesForAddress", failure("RPC_TRANSIENT")
+        ))
+        for category in (
+            "HTTP_TRANSIENT", "TIMEOUT", "CONNECTION", "TRANSPORT",
+            "MALFORMED_RESPONSE",
+        ):
+            with self.subTest(category=category):
+                self.assertFalse(
+                    solana_rpc._failure_uses_method_availability(
+                        "getTransaction", failure(category)
+                    )
+                )
+        self.assertFalse(solana_rpc._failure_uses_method_availability(
+            "getBalance", failure("RATE_LIMIT", rate_limited=True)
+        ))
 
     def test_semantic_repetition_windows_and_capacity_are_bounded(self) -> None:
         params = ["private-address", {"commitment": "confirmed", "limit": 12}]
@@ -524,6 +744,95 @@ class SolanaRpcRouterTests(unittest.TestCase):
         )
         self.assertEqual(state["circuit_open_count"], 0)
         self.assertEqual(state["success_rate_percent"], 75.0)
+
+    def test_v4_heavy_availability_migrates_without_resetting_history(self) -> None:
+        target = provider("solana_public")
+        atomic_write_json(solana_rpc._state_path(target.name), {
+            "schema_version": 4,
+            "version": 19,
+            "provider": target.name,
+            "request_count": 11,
+            "success_count": 7,
+            "failure_count": 4,
+            "rate_limit_count": 4,
+            "consecutive_failures": 3,
+            "cooldown_until_epoch": time.time() + 60,
+            "circuit_state": "OPEN",
+            "circuit_open_count": 2,
+            "half_open_lease_until_epoch": 0.0,
+            "last_failure_method": "getTransaction",
+            "last_failure_category": "RATE_LIMIT",
+            "last_rate_limit_method": "getTransaction",
+            "last_circuit_open_method": "getTransaction",
+            "method_metrics": {
+                "getTransaction": {"failure_count": 4},
+            },
+            "method_availability": {
+                "getSignaturesForAddress": {"unexpected": 1},
+                "unboundedMethod": {"x": 1},
+            },
+        })
+
+        state = solana_rpc.provider_state(target.name, [target])
+
+        self.assertEqual(state["schema_version"], 5)
+        self.assertEqual(state["request_count"], 11)
+        self.assertEqual(state["failure_count"], 4)
+        self.assertEqual(state["rate_limit_count"], 4)
+        self.assertEqual(state["circuit_open_count"], 2)
+        self.assertEqual(state["circuit_state"], "CLOSED")
+        self.assertEqual(state["cooldown_until_epoch"], 0.0)
+        self.assertEqual(
+            set(state["method_availability"]),
+            solana_rpc.METHOD_SCOPED_AVAILABILITY_METHODS,
+        )
+        self.assertNotIn(
+            "unexpected",
+            state["method_availability"]["getSignaturesForAddress"],
+        )
+        transaction = state["method_availability"]["getTransaction"]
+        self.assertEqual(transaction["circuit_state"], "OPEN")
+        self.assertEqual(transaction["consecutive_failures"], 3)
+        self.assertEqual(transaction["circuit_open_count"], 2)
+        self.assertIsNotNone(solana_rpc._reserve_provider_slot_sync(
+            target,
+            method="getSignaturesForAddress",
+        ))
+        self.assertIsNone(solana_rpc._reserve_provider_slot_sync(
+            target,
+            method="getTransaction",
+        ))
+
+    def test_v4_provider_wide_failure_remains_global_after_migration(self) -> None:
+        target = provider("solana_public")
+        cooldown = time.time() + 60
+        atomic_write_json(solana_rpc._state_path(target.name), {
+            "schema_version": 4,
+            "provider": target.name,
+            "consecutive_failures": 1,
+            "cooldown_until_epoch": cooldown,
+            "circuit_state": "CLOSED",
+            "last_failure_method": "getTransaction",
+            "last_failure_category": "HTTP_TRANSIENT",
+        })
+
+        state = solana_rpc.provider_state(target.name, [target])
+
+        self.assertEqual(state["cooldown_until_epoch"], cooldown)
+        self.assertEqual(
+            state["method_availability"]["getTransaction"][
+                "cooldown_until_epoch"
+            ],
+            0.0,
+        )
+        self.assertIsNone(solana_rpc._reserve_provider_slot_sync(
+            target,
+            method="getTransaction",
+        ))
+        self.assertIsNone(solana_rpc._reserve_provider_slot_sync(
+            target,
+            method="getSignaturesForAddress",
+        ))
 
     def test_all_providers_fail_closed(self) -> None:
         primary, secondary = provider("alchemy"), provider("ankr")

@@ -46,7 +46,7 @@ _reservation_locks: weakref.WeakKeyDictionary[
 RPC_PROVIDER_STATE_DIR = (
     Path(__file__).resolve().parents[1] / "data" / "solana_rpc_providers"
 )
-RPC_PROVIDER_STATE_SCHEMA_VERSION = 4
+RPC_PROVIDER_STATE_SCHEMA_VERSION = 5
 SOLANA_PUBLIC_DEFAULT_URL = "https://api.mainnet.solana.com"
 RPC_CIRCUIT_FAILURE_THRESHOLD = 3
 RPC_CIRCUIT_COOLDOWN_SECONDS = 60.0
@@ -77,6 +77,7 @@ RPC_TRANSIENT_ERROR_CODES = frozenset({
     -32076,
 })
 HEAVY_RPC_METHODS = frozenset({"getTransaction", "getSignaturesForAddress"})
+METHOD_SCOPED_AVAILABILITY_METHODS = HEAVY_RPC_METHODS
 HEAVY_WORKLOADS = frozenset({"transaction_history", "wallet_feeder"})
 LIGHT_PROVIDER_ORDER = (
     "alchemy",
@@ -163,6 +164,7 @@ class RpcProvider:
 @dataclass(frozen=True, slots=True)
 class ProviderReservation:
     half_open_probe: bool
+    method_half_open_probe: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -347,18 +349,9 @@ def _state_path(provider_name: str) -> Path:
     return RPC_PROVIDER_STATE_DIR / f"{provider_name}.json"
 
 
-def _empty_provider_state(provider_name: str) -> dict[str, Any]:
+def _empty_availability_state() -> dict[str, Any]:
     return {
-        "schema_version": RPC_PROVIDER_STATE_SCHEMA_VERSION,
-        "version": 0,
-        "provider": provider_name,
-        "enabled": True,
-        "request_count": 0,
-        "success_count": 0,
-        "failure_count": 0,
-        "rate_limit_count": 0,
         "consecutive_failures": 0,
-        "last_request_at_epoch": 0.0,
         "last_success_at_epoch": None,
         "last_failure_at_epoch": None,
         "last_failure_category": None,
@@ -371,6 +364,25 @@ def _empty_provider_state(provider_name: str) -> dict[str, Any]:
         "circuit_state": "CLOSED",
         "circuit_open_count": 0,
         "half_open_lease_until_epoch": 0.0,
+    }
+
+
+def _empty_provider_state(provider_name: str) -> dict[str, Any]:
+    return {
+        "schema_version": RPC_PROVIDER_STATE_SCHEMA_VERSION,
+        "version": 0,
+        "provider": provider_name,
+        "enabled": True,
+        "request_count": 0,
+        "success_count": 0,
+        "failure_count": 0,
+        "rate_limit_count": 0,
+        "last_request_at_epoch": 0.0,
+        **_empty_availability_state(),
+        "method_availability": {
+            method: _empty_availability_state()
+            for method in sorted(METHOD_SCOPED_AVAILABILITY_METHODS)
+        },
         "method_metrics": {},
     }
 
@@ -451,11 +463,52 @@ def _migrate_provider_state(
     state: dict[str, Any],
 ) -> dict[str, Any]:
     """기존 provider state에 새 bounded metric 기본값을 보완한다."""
+    previous_schema = int(state.get("schema_version", 0) or 0)
     defaults = _empty_provider_state(provider_name)
     for key, value in defaults.items():
         state.setdefault(key, value)
-    state["schema_version"] = RPC_PROVIDER_STATE_SCHEMA_VERSION
     state["provider"] = provider_name
+    raw_availability = state.get("method_availability")
+    if not isinstance(raw_availability, dict):
+        raw_availability = {}
+    bounded_availability: dict[str, dict[str, Any]] = {}
+    for method in sorted(METHOD_SCOPED_AVAILABILITY_METHODS):
+        raw = raw_availability.get(method)
+        source = raw if isinstance(raw, dict) else {}
+        scoped = {
+            key: source.get(key, value)
+            for key, value in _empty_availability_state().items()
+        }
+        bounded_availability[method] = scoped
+    state["method_availability"] = bounded_availability
+
+    if previous_schema < 5:
+        circuit = str(state.get("circuit_state") or "CLOSED").upper()
+        trigger = (
+            state.get("last_circuit_open_method")
+            if circuit in {"OPEN", "HALF_OPEN"}
+            else state.get("last_failure_method")
+        )
+        if (
+            trigger in METHOD_SCOPED_AVAILABILITY_METHODS
+            and state.get("last_failure_category") in {
+                "RATE_LIMIT",
+                "RPC_TRANSIENT",
+            }
+            and (
+                circuit in {"OPEN", "HALF_OPEN"}
+                or _safe_epoch(state.get("cooldown_until_epoch")) > 0
+            )
+        ):
+            scoped = bounded_availability[str(trigger)]
+            for key in _empty_availability_state():
+                scoped[key] = state.get(key, scoped[key])
+            state["consecutive_failures"] = 0
+            state["cooldown_until_epoch"] = 0.0
+            state["circuit_state"] = "CLOSED"
+            state["half_open_lease_until_epoch"] = 0.0
+
+    state["schema_version"] = RPC_PROVIDER_STATE_SCHEMA_VERSION
     metrics = state.get("method_metrics")
     if not isinstance(metrics, dict):
         state["method_metrics"] = {}
@@ -466,6 +519,25 @@ def _migrate_provider_state(
                 continue
             _state_method_metric(state, method)
     return state
+
+
+def _method_availability_state(
+    state: dict[str, Any], method: str,
+) -> dict[str, Any] | None:
+    if method not in METHOD_SCOPED_AVAILABILITY_METHODS:
+        return None
+    availability = state["method_availability"]
+    return availability[method]
+
+
+def _failure_uses_method_availability(
+    method: str,
+    failure: ProviderFailure,
+) -> bool:
+    return (
+        method in METHOD_SCOPED_AVAILABILITY_METHODS
+        and (failure.rate_limited or failure.category == "RPC_TRANSIENT")
+    )
 
 
 def _safe_epoch(value: Any) -> float:
@@ -614,6 +686,36 @@ def _record_reservation_skip(
     )
 
 
+def _availability_block_reason(
+    availability: Mapping[str, Any], now: float,
+) -> str | None:
+    circuit = str(availability.get("circuit_state") or "CLOSED").upper()
+    cooldown_until = _safe_epoch(availability.get("cooldown_until_epoch"))
+    lease_until = _safe_epoch(
+        availability.get("half_open_lease_until_epoch")
+    )
+    if circuit == "OPEN" and cooldown_until > now:
+        return "circuit_open_cooldown"
+    if circuit == "HALF_OPEN" and lease_until > now:
+        return "half_open_lease"
+    if circuit == "CLOSED" and cooldown_until > now:
+        return "cooldown"
+    return None
+
+
+def _activate_half_open_probe(
+    availability: dict[str, Any], now: float,
+) -> bool:
+    circuit = str(availability.get("circuit_state") or "CLOSED").upper()
+    if circuit not in {"OPEN", "HALF_OPEN"}:
+        return False
+    availability["circuit_state"] = "HALF_OPEN"
+    availability["half_open_lease_until_epoch"] = (
+        now + RPC_HALF_OPEN_LEASE_SECONDS
+    )
+    return True
+
+
 def _reserve_provider_slot_sync(
     provider: RpcProvider,
     *,
@@ -623,7 +725,7 @@ def _reserve_provider_slot_sync(
     now_epoch: float | None = None,
     skip_reasons: dict[str, int] | None = None,
 ) -> ProviderReservation | None:
-    """provider별 전역 slot을 확보하고 OPEN/HALF_OPEN을 원자적으로 처리한다."""
+    """전역 pacing과 provider/method availability를 원자적으로 예약한다."""
     path = _state_path(provider.name)
     with exclusive_file_lock(path, timeout_seconds=180.0):
         state = _migrate_provider_state(
@@ -631,36 +733,26 @@ def _reserve_provider_slot_sync(
             read_json(path, _empty_provider_state(provider.name)),
         )
         now = time.time() if now_epoch is None else float(now_epoch)
-        circuit = str(state.get("circuit_state") or "CLOSED").upper()
-        cooldown_until = _safe_epoch(state.get("cooldown_until_epoch"))
-        lease_until = _safe_epoch(state.get("half_open_lease_until_epoch"))
-        half_open_probe = False
-        if circuit == "OPEN":
-            if cooldown_until > now:
-                _record_reservation_skip(
-                    provider, method, "circuit_open_cooldown", state, skip_reasons
-                )
-                return None
-            state["circuit_state"] = "HALF_OPEN"
-            state["half_open_lease_until_epoch"] = (
-                now + RPC_HALF_OPEN_LEASE_SECONDS
-            )
-            half_open_probe = True
-        elif circuit == "HALF_OPEN":
-            if lease_until > now:
-                _record_reservation_skip(
-                    provider, method, "half_open_lease", state, skip_reasons
-                )
-                return None
-            state["half_open_lease_until_epoch"] = (
-                now + RPC_HALF_OPEN_LEASE_SECONDS
-            )
-            half_open_probe = True
-        elif cooldown_until > now:
+        global_block = _availability_block_reason(state, now)
+        if global_block is not None:
             _record_reservation_skip(
-                provider, method, "cooldown", state, skip_reasons
+                provider, method, global_block, state, skip_reasons
             )
             return None
+        method_state = _method_availability_state(state, method)
+        if method_state is not None:
+            method_block = _availability_block_reason(method_state, now)
+            if method_block is not None:
+                _record_reservation_skip(
+                    provider, method, method_block, method_state, skip_reasons
+                )
+                return None
+
+        half_open_probe = _activate_half_open_probe(state, now)
+        method_half_open_probe = (
+            _activate_half_open_probe(method_state, now)
+            if method_state is not None else False
+        )
 
         last_request = _safe_epoch(state.get("last_request_at_epoch"))
         target = max(now, last_request + provider.minimum_interval_seconds)
@@ -692,7 +784,10 @@ def _reserve_provider_slot_sync(
             failover_count=int(failover),
             timestamp=now,
         )
-        return ProviderReservation(half_open_probe=half_open_probe)
+        return ProviderReservation(
+            half_open_probe=half_open_probe,
+            method_half_open_probe=method_half_open_probe,
+        )
 
 
 def _process_reservation_lock(provider_name: str) -> asyncio.Lock:
@@ -739,12 +834,21 @@ def _record_provider_success_sync(
         metric = _state_method_metric(state, method)
         metric["success_count"] = int(metric.get("success_count", 0) or 0) + 1
         _record_latency(metric, latency_ms)
+        now = time.time()
         state["consecutive_failures"] = 0
-        state["last_success_at_epoch"] = time.time()
+        state["last_success_at_epoch"] = now
         state["last_failure_category"] = None
         state["cooldown_until_epoch"] = 0.0
         state["circuit_state"] = "CLOSED"
         state["half_open_lease_until_epoch"] = 0.0
+        method_state = _method_availability_state(state, method)
+        if method_state is not None:
+            method_state["consecutive_failures"] = 0
+            method_state["last_success_at_epoch"] = now
+            method_state["last_failure_category"] = None
+            method_state["cooldown_until_epoch"] = 0.0
+            method_state["circuit_state"] = "CLOSED"
+            method_state["half_open_lease_until_epoch"] = 0.0
         _increment_state_version(state)
         atomic_write_json(path, state)
         _record_coverage_rpc_metric(
@@ -770,7 +874,6 @@ def _record_provider_failure_sync(
             read_json(path, _empty_provider_state(provider.name)),
         )
         now = time.time()
-        prior_circuit = str(state.get("circuit_state") or "CLOSED").upper()
         state["failure_count"] = int(state.get("failure_count", 0) or 0) + 1
         metric = _state_method_metric(state, method)
         metric["failure_count"] = int(metric.get("failure_count", 0) or 0) + 1
@@ -787,36 +890,76 @@ def _record_provider_failure_sync(
             )
             state["last_rate_limit_at_epoch"] = now
             state["last_rate_limit_method"] = _metric_method(method)
+        method_scoped = _failure_uses_method_availability(method, failure)
+        availability = (
+            _method_availability_state(state, method)
+            if method_scoped else state
+        )
+        if availability is None:
+            raise RuntimeError("missing method availability state")
+        prior_circuit = str(
+            availability.get("circuit_state") or "CLOSED"
+        ).upper()
+        availability["last_failure_at_epoch"] = now
+        availability["last_failure_category"] = failure.category
+        availability["last_failure_method"] = _metric_method(method)
+        if failure.rate_limited:
+            availability["last_rate_limit_at_epoch"] = now
+            availability["last_rate_limit_method"] = _metric_method(method)
         if failure.transient:
-            consecutive = int(state.get("consecutive_failures", 0) or 0) + 1
-            state["consecutive_failures"] = consecutive
+            consecutive = int(
+                availability.get("consecutive_failures", 0) or 0
+            ) + 1
+            availability["consecutive_failures"] = consecutive
             retry_at = now + max(0.0, failure.retry_delay_seconds)
-            state["cooldown_until_epoch"] = max(
-                _safe_epoch(state.get("cooldown_until_epoch")),
+            availability["cooldown_until_epoch"] = max(
+                _safe_epoch(availability.get("cooldown_until_epoch")),
                 retry_at,
             )
             if (
-                reservation.half_open_probe
+                (
+                    reservation.method_half_open_probe
+                    if method_scoped else reservation.half_open_probe
+                )
                 or consecutive >= RPC_CIRCUIT_FAILURE_THRESHOLD
             ):
-                state["circuit_state"] = "OPEN"
+                availability["circuit_state"] = "OPEN"
                 if prior_circuit != "OPEN":
-                    state["circuit_open_count"] = (
-                        int(state.get("circuit_open_count", 0) or 0) + 1
+                    availability["circuit_open_count"] = (
+                        int(availability.get("circuit_open_count", 0) or 0) + 1
                     )
-                    state["last_circuit_open_at_epoch"] = now
-                    state["last_circuit_open_method"] = _metric_method(method)
-                state["cooldown_until_epoch"] = max(
-                    state["cooldown_until_epoch"],
+                    availability["last_circuit_open_at_epoch"] = now
+                    availability["last_circuit_open_method"] = (
+                        _metric_method(method)
+                    )
+                    if method_scoped:
+                        state["circuit_open_count"] = (
+                            int(state.get("circuit_open_count", 0) or 0) + 1
+                        )
+                        state["last_circuit_open_at_epoch"] = now
+                        state["last_circuit_open_method"] = (
+                            _metric_method(method)
+                        )
+                availability["cooldown_until_epoch"] = max(
+                    availability["cooldown_until_epoch"],
                     now + RPC_CIRCUIT_COOLDOWN_SECONDS,
                 )
             else:
-                state["circuit_state"] = "CLOSED"
+                availability["circuit_state"] = "CLOSED"
         else:
+            availability["consecutive_failures"] = 0
+            availability["circuit_state"] = "CLOSED"
+            availability["cooldown_until_epoch"] = 0.0
+        availability["half_open_lease_until_epoch"] = 0.0
+        if method_scoped:
             state["consecutive_failures"] = 0
-            state["circuit_state"] = "CLOSED"
             state["cooldown_until_epoch"] = 0.0
-        state["half_open_lease_until_epoch"] = 0.0
+            state["circuit_state"] = "CLOSED"
+            state["half_open_lease_until_epoch"] = 0.0
+        elif reservation.method_half_open_probe:
+            method_state = _method_availability_state(state, method)
+            if method_state is not None:
+                method_state["half_open_lease_until_epoch"] = 0.0
         _increment_state_version(state)
         atomic_write_json(path, state)
         _record_coverage_rpc_metric(
