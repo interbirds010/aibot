@@ -148,8 +148,19 @@ class ShadowTradeLedgerTests(unittest.TestCase):
                 saved = json.loads(path.read_text(encoding="utf-8"))
                 self.assertEqual(len(saved["trades"]), 2)
 
+    def test_empty_backfill_keeps_existing_no_read_semantics(self) -> None:
+        with patch.object(
+            shadow_trade_ledger, "ensure_shadow_trades_migrated"
+        ) as ensure:
+            self.assertEqual(
+                shadow_trade_ledger.backfill_completed_shadow_trades([]), 0
+            )
+        ensure.assert_not_called()
+
     def test_backfill_releases_prefilter_document_before_locked_update(self) -> None:
         released = []
+        projected = []
+        original_project = shadow_trade_ledger.completed_shadow_trade
 
         class TrackedDocument(dict):
             def __del__(self) -> None:
@@ -167,6 +178,11 @@ class ShadowTradeLedgerTests(unittest.TestCase):
             document = shadow_trade_ledger.empty_shadow_trades()
             return mutator(document), document
 
+        def project(row):
+            self.assertEqual(released, [True])
+            projected.append(row["observation_id"])
+            return original_project(row)
+
         with (
             patch.object(
                 shadow_trade_ledger,
@@ -178,12 +194,44 @@ class ShadowTradeLedgerTests(unittest.TestCase):
                 "update_json",
                 side_effect=locked_update,
             ),
+            patch.object(
+                shadow_trade_ledger,
+                "completed_shadow_trade",
+                side_effect=project,
+            ),
+        ):
+            existing_ids = shadow_trade_ledger.current_shadow_trade_ids()
+            self.assertEqual(
+                shadow_trade_ledger.backfill_completed_shadow_trades(
+                    [completed_row("EXISTING"), completed_row("OBS-NEW")],
+                    existing_ids=existing_ids,
+                ),
+                1,
+            )
+        self.assertEqual(projected, ["OBS-NEW"])
+
+    def test_backfill_keeps_final_locked_dedupe_after_prefilter_race(self) -> None:
+        candidate = completed_row("OBS-RACE")
+        existing = shadow_trade_ledger.completed_shadow_trade(candidate)
+        self.assertIsNotNone(existing)
+
+        def locked_update(path, fallback, mutator):
+            document = shadow_trade_ledger.empty_shadow_trades()
+            document["trades"] = [existing]
+            return mutator(document), document
+
+        with (
+            patch.object(
+                shadow_trade_ledger,
+                "update_json",
+                side_effect=locked_update,
+            ),
         ):
             self.assertEqual(
                 shadow_trade_ledger.backfill_completed_shadow_trades(
-                    [completed_row("OBS-NEW")]
+                    [candidate], existing_ids=set()
                 ),
-                1,
+                0,
             )
 
     def test_only_sixty_minute_sample_completes_and_archives_trade(self) -> None:

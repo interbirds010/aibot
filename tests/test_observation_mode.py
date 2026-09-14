@@ -7,7 +7,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 from src import analyzer, executor, monitor, observation_tracker, risk_manager
 
@@ -1454,6 +1454,104 @@ class ObservationEntryGateTests(unittest.TestCase):
 
 
 class ObservationRuntimeHealthTests(unittest.TestCase):
+    def test_observation_startup_validates_shadow_before_archive(self) -> None:
+        archive = Mock()
+
+        async def run() -> None:
+            with (
+                patch.object(
+                    observation_tracker,
+                    "ensure_observations_migrated",
+                    return_value={"observations": []},
+                ),
+                patch.object(
+                    observation_tracker,
+                    "reconcile_interrupted_discoveries",
+                    return_value=0,
+                ),
+                patch(
+                    "src.shadow_trade_ledger.current_shadow_trade_ids",
+                    side_effect=RuntimeError("shadow ledger malformed"),
+                ),
+                patch(
+                    "src.research_archive.backfill_research_archive",
+                    new=archive,
+                ),
+                patch.object(
+                    observation_tracker,
+                    "_publish_observer_metrics",
+                    new=AsyncMock(),
+                ),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "shadow ledger malformed"):
+                    await observation_tracker.observation_loop(interval_seconds=0)
+
+        asyncio.run(run())
+        archive.assert_not_called()
+
+    def test_observation_startup_releases_documents_before_running(self) -> None:
+        released = []
+
+        class StartupComplete(RuntimeError):
+            pass
+
+        class TrackedRows(list):
+            def __del__(self) -> None:
+                released.append("rows")
+
+        class TrackedDocument(dict):
+            def __del__(self) -> None:
+                released.append("document")
+
+        def load_observations() -> dict:
+            return TrackedDocument({"observations": TrackedRows()})
+
+        shadow_ids = Mock(return_value=set())
+
+        async def publish(metrics) -> None:
+            if metrics.get("observer_state") == "RUNNING":
+                self.assertCountEqual(released, ["rows", "document"])
+                raise StartupComplete
+
+        async def run() -> None:
+            with (
+                patch.object(
+                    observation_tracker,
+                    "ensure_observations_migrated",
+                    new=load_observations,
+                ),
+                patch.object(
+                    observation_tracker,
+                    "reconcile_interrupted_discoveries",
+                    new=lambda: 0,
+                ),
+                patch(
+                    "src.shadow_trade_ledger.current_shadow_trade_ids",
+                    new=shadow_ids,
+                ),
+                patch(
+                    "src.shadow_trade_ledger.backfill_completed_shadow_trades",
+                    new=lambda rows, **options: 0,
+                ),
+                patch(
+                    "src.research_archive.backfill_research_archive",
+                    new=lambda rows, **options: {},
+                ),
+                patch(
+                    "src.research_archive.archive_integrity_metrics",
+                    new=lambda **options: {},
+                ),
+                patch.object(observation_tracker, "_publish_observer_metrics", new=publish),
+                patch.object(observation_tracker, "load_dotenv"),
+                patch.object(observation_tracker.os, "getenv", return_value="KEY"),
+            ):
+                with self.assertRaises(StartupComplete):
+                    await observation_tracker.observation_loop(interval_seconds=0)
+
+        asyncio.run(run())
+        self.assertCountEqual(released, ["rows", "document"])
+        shadow_ids.assert_called_once_with()
+
     def test_runtime_metrics_report_pending_success_and_missed_samples(self) -> None:
         metrics = observation_tracker.observation_runtime_metrics({
             "observations": [

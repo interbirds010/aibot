@@ -242,31 +242,51 @@ def record_completed_shadow_trade(row: dict[str, Any]) -> bool:
     return bool(recorded)
 
 
-def backfill_completed_shadow_trades(rows: list[Any]) -> int:
-    """현재 관찰 원장의 완료 표본을 한 번의 잠금으로 shadow 원장에 백필한다."""
-    candidates = [
-        trade
-        for row in rows
-        if isinstance(row, dict)
-        if (trade := completed_shadow_trade(row)) is not None
-    ]
-    if not candidates:
-        return 0
+def current_shadow_trade_ids() -> set[str]:
+    """현재 shadow 원장을 검증하고 작은 identity 집합만 반환한다."""
     current = ensure_shadow_trades_migrated()
-    current_ids = {
+    identities = {
         str(item.get("shadow_trade_id", ""))
         for item in current.get("trades", [])
         if isinstance(item, dict)
     }
-    candidates = [
-        trade for trade in candidates
-        if trade["shadow_trade_id"] not in current_ids
-    ]
+    del current
+    return identities
+
+
+def backfill_completed_shadow_trades(
+    rows: list[Any], *, existing_ids: set[str] | None = None,
+) -> int:
+    """현재 관찰 원장의 완료 표본을 한 번의 잠금으로 shadow 원장에 백필한다."""
+    if existing_ids is None:
+        candidates = [
+            trade
+            for row in rows
+            if isinstance(row, dict)
+            if (trade := completed_shadow_trade(row)) is not None
+        ]
+        if not candidates:
+            return 0
+        current_ids = current_shadow_trade_ids()
+        candidates = [
+            trade for trade in candidates
+            if trade["shadow_trade_id"] not in current_ids
+        ]
+    else:
+        current_ids = set(existing_ids)
+        # startup은 전체 shadow 문서를 해제한 뒤 누락된 관찰만 projection한다.
+        candidates = [
+            trade
+            for row in rows
+            if isinstance(row, dict)
+            if str(row.get("observation_id", "")).strip() not in current_ids
+            if (trade := completed_shadow_trade(row)) is not None
+        ]
     if not candidates:
         return 0
 
-    # 잠금 안의 최종 중복 검증 전에 큰 사전 조회 문서를 해제한다.
-    del current, current_ids
+    # 잠금 안의 최종 중복 검증 전에 사전 ID 집합도 해제한다.
+    del current_ids
 
     def mutate(document: dict[str, Any]) -> int:
         migrate_shadow_trade_document(document)

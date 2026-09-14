@@ -1267,7 +1267,7 @@ async def observation_loop(interval_seconds: float = 15.0) -> None:
     })
     from src.shadow_trade_ledger import (
         backfill_completed_shadow_trades,
-        ensure_shadow_trades_migrated,
+        current_shadow_trade_ids,
     )
     from src.research_archive import (
         archive_integrity_metrics,
@@ -1275,6 +1275,7 @@ async def observation_loop(interval_seconds: float = 15.0) -> None:
     )
 
     observation_rows = observation_document.get("observations", [])
+    shadow_trade_ids = await asyncio.to_thread(current_shadow_trade_ids)
     with phase_memory(
         "archive_write",
         metadata={
@@ -1288,7 +1289,6 @@ async def observation_loop(interval_seconds: float = 15.0) -> None:
         include_gc_counts=True,
         include_object_count=True,
     ) as archive_scope:
-        await asyncio.to_thread(ensure_shadow_trades_migrated)
         archive_backfill = await asyncio.to_thread(
             backfill_research_archive,
             observation_rows,
@@ -1305,6 +1305,7 @@ async def observation_loop(interval_seconds: float = 15.0) -> None:
         backfilled = await asyncio.to_thread(
             backfill_completed_shadow_trades,
             observation_rows,
+            existing_ids=shadow_trade_ids,
         )
         archive_scope.add_metadata(
             archive_count=sum(
@@ -1324,6 +1325,8 @@ async def observation_loop(interval_seconds: float = 15.0) -> None:
             ),
             success_count=int(backfilled),
         )
+    startup_runtime_metrics = observation_runtime_metrics(observation_document)
+    del shadow_trade_ids, observation_rows, observation_document
     if backfilled:
         logger.info("completed shadow trades backfilled: count=%s", backfilled)
 
@@ -1347,10 +1350,10 @@ async def observation_loop(interval_seconds: float = 15.0) -> None:
         "observer_heartbeat_at": now,
         "observer_state_changed_at": now,
         **{f"research_{key}": value for key, value in archive_metrics.items()},
-        **observation_runtime_metrics(observation_document),
+        **startup_runtime_metrics,
     })
     # 시작 계측에만 필요한 원장 snapshot을 장기 실행 coroutine에서 해제한다.
-    del observation_document, archive_metrics
+    del archive_metrics, startup_runtime_metrics
     last_health_refresh = time.monotonic()
 
     timeout = aiohttp.ClientTimeout(total=15)
