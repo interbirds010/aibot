@@ -108,6 +108,25 @@ RPC_ATTRIBUTION_WORKLOADS = frozenset({
     "unknown",
 })
 RPC_ZERO_ATTEMPT_PROVIDER_COUNTS = frozenset({"0", "1", "2", "3", "4", "5"})
+RPC_PACING_INTERVAL_BUCKETS = (
+    "no_previous",
+    "lt_100_ms",
+    "100_249_ms",
+    "250_499_ms",
+    "500_999_ms",
+    "1_2_s",
+    "gt_2_s",
+)
+RPC_PACING_BURST_WINDOWS = ("1s", "5s", "10s")
+RPC_PACING_BURST_BUCKETS = (
+    "1",
+    "2",
+    "3_4",
+    "5_8",
+    "9_16",
+    "gt_16",
+)
+RPC_PACING_OUTCOMES = frozenset({"success", "rate_limit", "failure"})
 
 _pending_lock = threading.Lock()
 _pending_buckets: dict[int, dict[str, Any]] = {}
@@ -393,6 +412,9 @@ def record_rpc_method_metric(
     semantic_repeated_within_5m_count: int = 0,
     semantic_repeated_within_15m_count: int = 0,
     semantic_tracker_eviction_count: int = 0,
+    pacing_interval_bucket: str | None = None,
+    pacing_burst_buckets: Mapping[str, str] | None = None,
+    pacing_outcome: str | None = None,
     latency_ms: float | None = None,
     timestamp: float | None = None,
 ) -> None:
@@ -446,7 +468,13 @@ def record_rpc_method_metric(
         if parsed_latency is not None and math.isfinite(parsed_latency)
         else None
     )
-    if not any(normalized.values()) and latency is None:
+    interval_bucket = str(pacing_interval_bucket or "")
+    outcome = str(pacing_outcome or "")
+    pacing_valid = (
+        interval_bucket in RPC_PACING_INTERVAL_BUCKETS
+        and outcome in RPC_PACING_OUTCOMES
+    )
+    if not any(normalized.values()) and latency is None and not pacing_valid:
         return
     start = _bucket_start(timestamp)
     key = "|".join((normalized_provider, normalized_method))
@@ -523,6 +551,40 @@ def record_rpc_method_metric(
             workload_counts[workload] = int(
                 workload_counts.get(workload, 0) or 0
             ) + zero_attempt_count
+        if pacing_valid:
+            interval_requests = metric.setdefault(
+                "pacing_interval_request_counts", {}
+            )
+            interval_requests[interval_bucket] = int(
+                interval_requests.get(interval_bucket, 0) or 0
+            ) + 1
+            outcome_counts = metric.setdefault(
+                f"pacing_interval_{outcome}_counts", {}
+            )
+            outcome_counts[interval_bucket] = int(
+                outcome_counts.get(interval_bucket, 0) or 0
+            ) + 1
+            burst_buckets = (
+                pacing_burst_buckets
+                if isinstance(pacing_burst_buckets, Mapping)
+                else {}
+            )
+            for window in RPC_PACING_BURST_WINDOWS:
+                burst_bucket = str(burst_buckets.get(window) or "")
+                if burst_bucket not in RPC_PACING_BURST_BUCKETS:
+                    continue
+                request_field = metric.setdefault(
+                    "pacing_burst_request_counts", {}
+                ).setdefault(window, {})
+                request_field[burst_bucket] = int(
+                    request_field.get(burst_bucket, 0) or 0
+                ) + 1
+                outcome_field = metric.setdefault(
+                    f"pacing_burst_{outcome}_counts", {}
+                ).setdefault(window, {})
+                outcome_field[burst_bucket] = int(
+                    outcome_field.get(burst_bucket, 0) or 0
+                ) + 1
         if latency is not None:
             metric["latency_count"] = int(
                 metric.get("latency_count", 0) or 0
@@ -620,6 +682,42 @@ def _merge_rpc_method_metric(
             count = int(source_counts.get(name, 0) or 0)
             if count:
                 target_counts[name] = int(target_counts.get(name, 0) or 0) + count
+    for outcome in ("request", "success", "rate_limit", "failure"):
+        field = f"pacing_interval_{outcome}_counts"
+        target_counts = target.setdefault(field, {})
+        source_counts = source.get(field, {})
+        source_counts = source_counts if isinstance(source_counts, dict) else {}
+        for bucket in RPC_PACING_INTERVAL_BUCKETS:
+            count = int(source_counts.get(bucket, 0) or 0)
+            if count:
+                target_counts[bucket] = int(
+                    target_counts.get(bucket, 0) or 0
+                ) + count
+        if not target_counts:
+            target.pop(field, None)
+    for outcome in ("request", "success", "rate_limit", "failure"):
+        field = f"pacing_burst_{outcome}_counts"
+        source_windows = source.get(field, {})
+        source_windows = (
+            source_windows if isinstance(source_windows, dict) else {}
+        )
+        target_windows = target.setdefault(field, {})
+        for window in RPC_PACING_BURST_WINDOWS:
+            source_counts = source_windows.get(window, {})
+            source_counts = (
+                source_counts if isinstance(source_counts, dict) else {}
+            )
+            target_counts = target_windows.setdefault(window, {})
+            for bucket in RPC_PACING_BURST_BUCKETS:
+                count = int(source_counts.get(bucket, 0) or 0)
+                if count:
+                    target_counts[bucket] = int(
+                        target_counts.get(bucket, 0) or 0
+                    ) + count
+            if not target_counts:
+                target_windows.pop(window, None)
+        if not target_windows:
+            target.pop(field, None)
 
 
 def _merge_bucket(target: dict[str, Any], source: dict[str, Any]) -> None:
@@ -1270,6 +1368,11 @@ def _review_summary(hours: list[dict[str, Any]]) -> dict[str, Any]:
             name: metric.get(name, 0)
             for name in _rpc_method_metric()
         })
+        for outcome in ("request", "success", "rate_limit", "failure"):
+            for prefix in ("pacing_interval", "pacing_burst"):
+                field = f"{prefix}_{outcome}_counts"
+                if isinstance(metric.get(field), dict):
+                    item[field] = metric[field]
         latency_count = int(metric.get("latency_count", 0) or 0)
         item["latency_average_ms"] = (
             round(float(metric.get("latency_sum_ms", 0.0) or 0.0)

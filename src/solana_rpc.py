@@ -13,7 +13,7 @@ import secrets
 import threading
 import time
 import weakref
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -33,7 +33,11 @@ from src.helius_rpc import (
     helius_backoff_seconds,
     jittered_backoff_seconds,
 )
-from src.research.coverage_telemetry import record_rpc_method_metric
+from src.research.coverage_telemetry import (
+    RPC_PACING_BURST_BUCKETS,
+    RPC_PACING_INTERVAL_BUCKETS,
+    record_rpc_method_metric,
+)
 from src.state_store import atomic_write_json, exclusive_file_lock, read_json
 
 logger = logging.getLogger("solana-rpc")
@@ -143,10 +147,16 @@ RPC_METHOD_METRIC_NAMES = frozenset({
 RPC_LATENCY_BUCKET_LIMITS_MS = (250.0, 1_000.0, 5_000.0)
 RPC_SEMANTIC_REPETITION_TTL_SECONDS = 15 * 60.0
 RPC_SEMANTIC_REPETITION_MAX_ENTRIES = 256
+RPC_PACING_TARGET_PROVIDER = "solana_public"
+RPC_PACING_TARGET_METHOD = "getTransaction"
+RPC_PACING_HISTORY_SECONDS = 10.0
+RPC_PACING_HISTORY_LIMIT = 256
 
 _semantic_repetition_lock = threading.Lock()
 _semantic_repetition_key = secrets.token_bytes(32)
 _semantic_repetition_seen: OrderedDict[bytes, float] = OrderedDict()
+_pacing_attribution_lock = threading.Lock()
+_pacing_request_times: deque[float] = deque(maxlen=RPC_PACING_HISTORY_LIMIT)
 
 
 @dataclass(frozen=True, slots=True)
@@ -165,6 +175,9 @@ class RpcProvider:
 class ProviderReservation:
     half_open_probe: bool
     method_half_open_probe: bool = False
+    pacing_request_epoch: float | None = None
+    pacing_interval_bucket: str | None = None
+    pacing_burst_buckets: tuple[tuple[str, str], ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -716,6 +729,83 @@ def _activate_half_open_probe(
     return True
 
 
+def _pacing_interval_bucket(interval_seconds: float | None) -> str:
+    if interval_seconds is None or interval_seconds < 0:
+        return "no_previous"
+    interval_ms = interval_seconds * 1_000.0
+    if interval_ms < 100:
+        return "lt_100_ms"
+    if interval_ms < 250:
+        return "100_249_ms"
+    if interval_ms < 500:
+        return "250_499_ms"
+    if interval_ms < 1_000:
+        return "500_999_ms"
+    if interval_ms <= 2_000:
+        return "1_2_s"
+    return "gt_2_s"
+
+
+def _pacing_burst_bucket(request_count: int) -> str:
+    count = max(1, int(request_count))
+    if count == 1:
+        return "1"
+    if count == 2:
+        return "2"
+    if count <= 4:
+        return "3_4"
+    if count <= 8:
+        return "5_8"
+    if count <= 16:
+        return "9_16"
+    return "gt_16"
+
+
+def _physical_pacing_attribution(
+    provider: RpcProvider,
+    method: str,
+    *,
+    now_epoch: float,
+) -> tuple[str | None, tuple[tuple[str, str], ...]]:
+    """Public getTransaction 요청 밀도를 bounded process-local 상태로 계산한다."""
+    if (
+        provider.name != RPC_PACING_TARGET_PROVIDER
+        or str(method) != RPC_PACING_TARGET_METHOD
+    ):
+        return None, ()
+    now = float(now_epoch)
+    with _pacing_attribution_lock:
+        if _pacing_request_times and now < _pacing_request_times[-1]:
+            _pacing_request_times.clear()
+        previous = _pacing_request_times[-1] if _pacing_request_times else None
+        cutoff = now - RPC_PACING_HISTORY_SECONDS
+        while _pacing_request_times and _pacing_request_times[0] < cutoff:
+            _pacing_request_times.popleft()
+        _pacing_request_times.append(now)
+        burst_buckets = tuple(
+            (
+                f"{int(window)}s",
+                _pacing_burst_bucket(sum(
+                    1 for timestamp in _pacing_request_times
+                    if timestamp >= now - window
+                )),
+            )
+            for window in (1.0, 5.0, 10.0)
+        )
+    interval = None if previous is None else now - previous
+    interval_bucket = _pacing_interval_bucket(interval)
+    if interval_bucket not in RPC_PACING_INTERVAL_BUCKETS:
+        return None, ()
+    if any(bucket not in RPC_PACING_BURST_BUCKETS for _, bucket in burst_buckets):
+        return None, ()
+    return interval_bucket, burst_buckets
+
+
+def _reset_pacing_attribution() -> None:
+    with _pacing_attribution_lock:
+        _pacing_request_times.clear()
+
+
 def _reserve_provider_slot_sync(
     provider: RpcProvider,
     *,
@@ -761,6 +851,9 @@ def _reserve_provider_slot_sync(
             now = time.time()
         else:
             now = target
+        pacing_interval_bucket, pacing_burst_buckets = (
+            _physical_pacing_attribution(provider, method, now_epoch=now)
+        )
         state["schema_version"] = RPC_PROVIDER_STATE_SCHEMA_VERSION
         state["provider"] = provider.name
         state["enabled"] = True
@@ -787,6 +880,9 @@ def _reserve_provider_slot_sync(
         return ProviderReservation(
             half_open_probe=half_open_probe,
             method_half_open_probe=method_half_open_probe,
+            pacing_request_epoch=now if pacing_interval_bucket is not None else None,
+            pacing_interval_bucket=pacing_interval_bucket,
+            pacing_burst_buckets=pacing_burst_buckets,
         )
 
 
@@ -815,6 +911,27 @@ async def _reserve_provider_slot(
             failover=failover,
             skip_reasons=skip_reasons,
         )
+
+
+def _record_pacing_outcome(
+    provider: RpcProvider,
+    method: str,
+    reservation: ProviderReservation,
+    outcome: str,
+) -> None:
+    if (
+        reservation.pacing_request_epoch is None
+        or reservation.pacing_interval_bucket is None
+    ):
+        return
+    _record_coverage_rpc_metric(
+        provider=provider.name,
+        method=method,
+        pacing_interval_bucket=reservation.pacing_interval_bucket,
+        pacing_burst_buckets=dict(reservation.pacing_burst_buckets),
+        pacing_outcome=outcome,
+        timestamp=reservation.pacing_request_epoch,
+    )
 
 
 def _record_provider_success_sync(
@@ -857,6 +974,7 @@ def _record_provider_success_sync(
             success_count=1,
             latency_ms=latency_ms,
         )
+        _record_pacing_outcome(provider, method, reservation, "success")
 
 
 def _record_provider_failure_sync(
@@ -969,6 +1087,12 @@ def _record_provider_failure_sync(
             rate_limit_count=int(failure.rate_limited),
             latency_ms=latency_ms,
             timestamp=now,
+        )
+        _record_pacing_outcome(
+            provider,
+            method,
+            reservation,
+            "rate_limit" if failure.rate_limited else "failure",
         )
 
 

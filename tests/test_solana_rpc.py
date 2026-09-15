@@ -81,12 +81,14 @@ class SolanaRpcRouterTests(unittest.TestCase):
         coverage_telemetry.reset_pending_telemetry()
         with solana_rpc._semantic_repetition_lock:
             solana_rpc._semantic_repetition_seen.clear()
+        solana_rpc._reset_pacing_attribution()
 
     def tearDown(self) -> None:
         solana_rpc.RPC_PROVIDER_STATE_DIR = self.original_state_dir
         coverage_telemetry.reset_pending_telemetry()
         with solana_rpc._semantic_repetition_lock:
             solana_rpc._semantic_repetition_seen.clear()
+        solana_rpc._reset_pacing_attribution()
         coverage_telemetry.TELEMETRY_PATH = self.original_telemetry_path
         coverage_telemetry.HOURLY_TELEMETRY_PATH = self.original_hourly_path
         self.temporary.cleanup()
@@ -633,6 +635,83 @@ class SolanaRpcRouterTests(unittest.TestCase):
         self.assertEqual(metric["semantic_repeated_within_5m_count"], 2)
         self.assertEqual(metric["semantic_repeated_within_15m_count"], 3)
         self.assertGreaterEqual(metric["semantic_tracker_eviction_count"], 5)
+
+    def test_public_transaction_pacing_attribution_is_bounded_and_outcome_linked(
+        self,
+    ) -> None:
+        target = provider("solana_public")
+        base = time.time()
+        samples = (
+            (base, "success"),
+            (base + 0.05, "rate_limit"),
+            (base + 0.30, "success"),
+            (base + 0.80, "rate_limit"),
+            (base + 2.0, "success"),
+            (base + 4.5, "rate_limit"),
+        )
+        expected_intervals = (
+            "no_previous",
+            "lt_100_ms",
+            "250_499_ms",
+            "500_999_ms",
+            "1_2_s",
+            "gt_2_s",
+        )
+
+        for (timestamp, outcome), expected_interval in zip(
+            samples, expected_intervals, strict=True
+        ):
+            interval, bursts = solana_rpc._physical_pacing_attribution(
+                target,
+                "getTransaction",
+                now_epoch=timestamp,
+            )
+            self.assertEqual(interval, expected_interval)
+            reservation = solana_rpc.ProviderReservation(
+                half_open_probe=False,
+                pacing_request_epoch=timestamp,
+                pacing_interval_bucket=interval,
+                pacing_burst_buckets=bursts,
+            )
+            solana_rpc._record_pacing_outcome(
+                target, "getTransaction", reservation, outcome
+            )
+
+        metric = self._coverage_rpc_metrics()[
+            "solana_public|getTransaction"
+        ]
+        self.assertEqual(
+            sum(metric["pacing_interval_request_counts"].values()), 6
+        )
+        self.assertEqual(
+            sum(metric["pacing_interval_success_counts"].values()), 3
+        )
+        self.assertEqual(
+            sum(metric["pacing_interval_rate_limit_counts"].values()), 3
+        )
+        for window in ("1s", "5s", "10s"):
+            self.assertEqual(
+                sum(metric["pacing_burst_request_counts"][window].values()),
+                6,
+            )
+        self.assertNotIn("pacing_request_epoch", json.dumps(metric))
+
+        for index in range(solana_rpc.RPC_PACING_HISTORY_LIMIT + 20):
+            solana_rpc._physical_pacing_attribution(
+                target,
+                "getTransaction",
+                now_epoch=base + 20.0 + index / 1_000.0,
+            )
+        self.assertLessEqual(
+            len(solana_rpc._pacing_request_times),
+            solana_rpc.RPC_PACING_HISTORY_LIMIT,
+        )
+        ignored = solana_rpc._physical_pacing_attribution(
+            provider("helius"),
+            "getTransaction",
+            now_epoch=base + 30.0,
+        )
+        self.assertEqual(ignored, (None, ()))
 
     def test_semantic_digest_and_runtime_config_do_not_expose_secrets(self) -> None:
         secret = "private-address-or-api-key"

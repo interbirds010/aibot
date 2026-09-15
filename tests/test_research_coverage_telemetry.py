@@ -222,6 +222,13 @@ class ResearchCoverageTelemetryTests(unittest.TestCase):
                 zero_attempt_workload="transaction_history",
                 semantic_request_count=1,
                 semantic_repeated_within_5m_count=1,
+                pacing_interval_bucket="500_999_ms",
+                pacing_burst_buckets={
+                    "1s": "2",
+                    "5s": "3_4",
+                    "10s": "5_8",
+                },
+                pacing_outcome="rate_limit",
                 latency_ms=100 + index,
                 timestamp=timestamp,
             )
@@ -268,6 +275,20 @@ class ResearchCoverageTelemetryTests(unittest.TestCase):
         )
         self.assertEqual(rpc["semantic_request_count"], 4)
         self.assertEqual(rpc["semantic_repeated_within_5m_count"], 4)
+        self.assertEqual(
+            rpc["pacing_interval_request_counts"], {"500_999_ms": 4}
+        )
+        self.assertEqual(
+            rpc["pacing_interval_rate_limit_counts"], {"500_999_ms": 4}
+        )
+        self.assertEqual(
+            rpc["pacing_burst_request_counts"],
+            {
+                "1s": {"2": 4},
+                "5s": {"3_4": 4},
+                "10s": {"5_8": 4},
+            },
+        )
         raw_report = coverage_telemetry.coverage_report(
             now_epoch=coverage_telemetry.HOUR_SECONDS
         )
@@ -275,6 +296,42 @@ class ResearchCoverageTelemetryTests(unittest.TestCase):
         self.assertEqual(raw_rpc["provider"], "solana_public")
         self.assertEqual(raw_rpc["request_count"], 4)
         self.assertEqual(raw_rpc["latency_average_ms"], 101.5)
+        self.assertEqual(
+            raw_rpc["pacing_interval_rate_limit_counts"],
+            {"500_999_ms": 4},
+        )
+
+    def test_pacing_dimensions_reject_unbounded_values(self) -> None:
+        secret = "private-signature-or-address"
+        coverage_telemetry.record_rpc_method_metric(
+            provider="solana_public",
+            method="getTransaction",
+            pacing_interval_bucket=secret,
+            pacing_burst_buckets={"1s": secret, secret: "gt_16"},
+            pacing_outcome="success",
+            timestamp=1.0,
+        )
+        coverage_telemetry.record_rpc_method_metric(
+            provider="solana_public",
+            method="getTransaction",
+            pacing_interval_bucket="lt_100_ms",
+            pacing_burst_buckets={"1s": "gt_16"},
+            pacing_outcome="success",
+            timestamp=1.0,
+        )
+        coverage_telemetry.flush_coverage_telemetry(now_epoch=1.0)
+
+        persisted = coverage_telemetry.TELEMETRY_PATH.read_text("utf-8")
+        self.assertNotIn(secret, persisted)
+        metric = json.loads(persisted)["buckets"][0]["rpc_methods"][
+            "solana_public|getTransaction"
+        ]
+        self.assertEqual(
+            metric["pacing_interval_request_counts"], {"lt_100_ms": 1}
+        )
+        self.assertEqual(
+            metric["pacing_burst_success_counts"], {"1s": {"gt_16": 1}}
+        )
 
     def test_partial_missing_and_current_hour_are_explicit(self) -> None:
         for index in range(3):
