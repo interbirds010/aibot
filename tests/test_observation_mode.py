@@ -4,12 +4,21 @@ import asyncio
 import concurrent.futures
 import json
 import tempfile
+import time
 import unittest
+from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
-from src import analyzer, executor, monitor, observation_tracker, risk_manager
+from src import (
+    analyzer,
+    executor,
+    monitor,
+    observation_tracker,
+    risk_manager,
+    state_store,
+)
 
 
 class ObservationLedgerTests(unittest.TestCase):
@@ -564,6 +573,296 @@ class ObservationLedgerTests(unittest.TestCase):
 
         self.assertEqual(maximum_active, 4)
         self.assertEqual(results, [False, True, True, True, True, True, True, True])
+
+    def test_sample_batch_applies_same_observation_once_and_emits_after_write(
+        self,
+    ) -> None:
+        with patch.object(observation_tracker.time, "time", return_value=1_000):
+            self.record()
+        observation_id = observation_tracker.read_json(
+            observation_tracker.OBSERVATION_PATH,
+            observation_tracker.empty_observations(),
+        )["observations"][0]["observation_id"]
+        proceeds = (900, 1_200, 1_050, 800, 1_100, 1_150)
+        results = [
+            observation_tracker.SampleResult(
+                observation_id=observation_id,
+                interval=interval,
+                proceeds_lamports=value,
+                sampled_at_epoch=1_000 + delay + index,
+                quote_latency_ms=100 + index,
+            )
+            for index, ((interval, delay), value) in enumerate(
+                zip(observation_tracker.OBSERVATION_INTERVALS, proceeds)
+            )
+        ]
+        original_update = observation_tracker.update_json
+        write_active = False
+
+        def tracked_update(*args, **kwargs):
+            nonlocal write_active
+            write_active = True
+            try:
+                return original_update(*args, **kwargs)
+            finally:
+                write_active = False
+
+        def funnel_side_effect(*args, **kwargs) -> None:
+            self.assertFalse(write_active)
+
+        def shadow_side_effect(*args, **kwargs) -> bool:
+            self.assertFalse(write_active)
+            return True
+
+        with (
+            patch.object(
+                observation_tracker,
+                "update_json",
+                side_effect=tracked_update,
+            ) as update,
+            patch.object(
+                observation_tracker,
+                "archive_and_retain_observations",
+                wraps=observation_tracker.archive_and_retain_observations,
+            ) as archive,
+            patch.object(
+                observation_tracker,
+                "record_funnel_stage",
+                side_effect=funnel_side_effect,
+            ) as funnel,
+            patch(
+                "src.shadow_trade_ledger.record_completed_shadow_trade",
+                side_effect=shadow_side_effect,
+            ) as shadow,
+        ):
+            self.assertEqual(
+                observation_tracker.record_sample_batch(results),
+                len(results),
+            )
+
+        update.assert_called_once()
+        archive.assert_called_once()
+        funnel.assert_called_once_with(
+            "horizon_60m_successful",
+            mint="MINT",
+            family="MOMENTUM",
+        )
+        shadow.assert_called_once()
+        row = observation_tracker.read_json(
+            observation_tracker.OBSERVATION_PATH,
+            observation_tracker.empty_observations(),
+        )["observations"][0]
+        self.assertEqual(
+            [sample["interval"] for sample in row["samples"]],
+            [interval for interval, _ in observation_tracker.OBSERVATION_INTERVALS],
+        )
+        self.assertEqual(row["status"], "COMPLETE")
+        self.assertEqual(row["mfe_percent"], 20.0)
+        self.assertEqual(row["mae_percent"], -20.0)
+        self.assertEqual(row["max_return_percent"], 20.0)
+        self.assertEqual(row["min_return_percent"], -20.0)
+        self.assertTrue(row["candidate_v2_early_failure"])
+        self.assertEqual(row["samples"][0]["sample_lag_seconds"], 0.0)
+        self.assertEqual(row["samples"][0]["quote_latency_ms"], 100)
+
+    def test_sample_batch_uses_fresh_document_and_skips_stale_results(self) -> None:
+        self.record(mint="FIRST", signature="FIRST")
+        self.record(mint="SECOND", signature="SECOND")
+        rows = observation_tracker.read_json(
+            observation_tracker.OBSERVATION_PATH,
+            observation_tracker.empty_observations(),
+        )["observations"]
+        identities = {row["mint"]: row["observation_id"] for row in rows}
+        self.assertTrue(observation_tracker.record_sample(
+            identities["FIRST"], "1m", proceeds_lamports=1_100
+        ))
+
+        def concurrent_update(document: dict) -> None:
+            document["observations"][0]["concurrent_writer_value"] = "PRESERVED"
+
+        observation_tracker.update_json(
+            observation_tracker.OBSERVATION_PATH,
+            observation_tracker.empty_observations(),
+            concurrent_update,
+        )
+        before_version = observation_tracker.read_json(
+            observation_tracker.OBSERVATION_PATH,
+            observation_tracker.empty_observations(),
+        )["version"]
+        results = [
+            observation_tracker.SampleResult(
+                identities["FIRST"], "1m", 900
+            ),
+            observation_tracker.SampleResult(
+                identities["FIRST"], "3m", 900
+            ),
+            observation_tracker.SampleResult(
+                identities["SECOND"], "1m", 1_200
+            ),
+            observation_tracker.SampleResult("MISSING", "1m", 1_000),
+        ]
+
+        self.assertEqual(observation_tracker.record_sample_batch(results), 2)
+        document = observation_tracker.read_json(
+            observation_tracker.OBSERVATION_PATH,
+            observation_tracker.empty_observations(),
+        )
+        by_mint = {row["mint"]: row for row in document["observations"]}
+        self.assertEqual(
+            by_mint["FIRST"]["concurrent_writer_value"],
+            "PRESERVED",
+        )
+        self.assertEqual(
+            [sample["interval"] for sample in by_mint["FIRST"]["samples"]],
+            ["1m", "3m"],
+        )
+        self.assertEqual(
+            [sample["interval"] for sample in by_mint["SECOND"]["samples"]],
+            ["1m"],
+        )
+        self.assertEqual(document["version"], before_version + 1)
+
+    def test_sample_batch_preserves_all_sixty_minute_funnel_outcomes(self) -> None:
+        for suffix in ("SUCCESS", "MISSED", "UNAVAILABLE"):
+            self.record(mint=suffix, signature=suffix)
+        rows = observation_tracker.read_json(
+            observation_tracker.OBSERVATION_PATH,
+            observation_tracker.empty_observations(),
+        )["observations"]
+        identities = {row["mint"]: row["observation_id"] for row in rows}
+        results = [
+            observation_tracker.SampleResult(
+                identities["SUCCESS"], "60m", 1_100
+            ),
+            observation_tracker.SampleResult(
+                identities["MISSED"], "60m", None, error="HORIZON_MISSED"
+            ),
+            observation_tracker.SampleResult(
+                identities["UNAVAILABLE"], "60m", None, error="EXIT_NO_ROUTE"
+            ),
+        ]
+        with patch.object(observation_tracker, "record_funnel_stage") as metric:
+            self.assertEqual(observation_tracker.record_sample_batch(results), 3)
+        self.assertEqual(
+            [call.args[0] for call in metric.call_args_list],
+            [
+                "horizon_60m_successful",
+                "horizon_60m_missed",
+                "horizon_60m_unavailable",
+            ],
+        )
+
+    def test_large_twenty_sample_batch_reduces_whole_document_writes(
+        self,
+    ) -> None:
+        for index in range(observation_tracker.OBSERVATION_SAMPLE_BATCH_SIZE):
+            self.record(mint=f"MINT-{index}", signature=f"SIGNATURE-{index}")
+        document = observation_tracker.read_json(
+            observation_tracker.OBSERVATION_PATH,
+            observation_tracker.empty_observations(),
+        )
+        template = document["observations"][0]
+        for index in range(980):
+            archived = json.loads(json.dumps(template))
+            archived.update({
+                "observation_id": f"ARCHIVED-{index}",
+                "mint": f"ARCHIVED-MINT-{index}",
+                "status": "COMPLETE",
+                "archive_schema_version": 1,
+                "archived_at": "2026-09-15T00:00:00+00:00",
+                "discovery_metadata": {"padding": "x" * 3_500},
+            })
+            document["observations"].append(archived)
+        state_store.atomic_write_json(
+            observation_tracker.OBSERVATION_PATH,
+            document,
+        )
+        fixture = observation_tracker.OBSERVATION_PATH.read_bytes()
+        identities = [
+            row["observation_id"] for row in document["observations"][:20]
+        ]
+        results = [
+            observation_tracker.SampleResult(identity, "1m", 1_100)
+            for identity in identities
+        ]
+
+        def measured(operation) -> tuple[int, int, float, float, float]:
+            lock_durations: list[float] = []
+            original_lock = state_store.exclusive_file_lock
+
+            @contextmanager
+            def tracked_lock(*args, **kwargs):
+                started = time.perf_counter()
+                with original_lock(*args, **kwargs):
+                    yield
+                lock_durations.append(time.perf_counter() - started)
+
+            with (
+                patch.object(
+                    state_store,
+                    "exclusive_file_lock",
+                    new=tracked_lock,
+                ),
+                patch.object(
+                    state_store,
+                    "atomic_write_json",
+                    wraps=state_store.atomic_write_json,
+                ) as writes,
+                patch.object(
+                    observation_tracker,
+                    "archive_and_retain_observations",
+                    wraps=observation_tracker.archive_and_retain_observations,
+                ) as archive,
+            ):
+                started = time.perf_counter()
+                operation()
+                elapsed = time.perf_counter() - started
+            return (
+                writes.call_count,
+                archive.call_count,
+                sum(lock_durations),
+                max(lock_durations, default=0.0),
+                elapsed,
+            )
+
+        before = measured(lambda: [
+            observation_tracker.record_sample(
+                result.observation_id,
+                result.interval,
+                proceeds_lamports=result.proceeds_lamports,
+            )
+            for result in results
+        ])
+        state_store.atomic_write_json(
+            observation_tracker.OBSERVATION_PATH,
+            json.loads(fixture),
+        )
+        after = measured(
+            lambda: observation_tracker.record_sample_batch(results)
+        )
+
+        self.assertGreaterEqual(len(fixture), 3_000_000)
+        self.assertEqual(before[:2], (20, 20))
+        self.assertEqual(after[:2], (1, 1))
+        self.assertLess(after[2], before[2])
+        self.assertLess(after[4], before[4])
+        self.assertEqual(
+            observation_tracker.OBSERVATION_SAMPLE_BATCH_SIZE,
+            20,
+        )
+        self.assertEqual(observation_tracker.OBSERVATION_SAMPLE_CONCURRENCY, 4)
+
+    def test_sample_batch_rejects_unbounded_input_before_write(self) -> None:
+        results = [
+            observation_tracker.SampleResult(str(index), "1m", 1)
+            for index in range(observation_tracker.OBSERVATION_SAMPLE_BATCH_SIZE + 1)
+        ]
+        with (
+            patch.object(observation_tracker, "update_json") as update,
+            self.assertRaisesRegex(ValueError, "exceeds bounded size"),
+        ):
+            observation_tracker.record_sample_batch(results)
+        update.assert_not_called()
 
     def test_runtime_metrics_include_due_backlog_depth_and_oldest_lag(self) -> None:
         metrics = observation_tracker.observation_runtime_metrics({
@@ -1454,6 +1753,117 @@ class ObservationEntryGateTests(unittest.TestCase):
 
 
 class ObservationRuntimeHealthTests(unittest.TestCase):
+    def test_observation_loop_commits_finalized_quote_results_once(self) -> None:
+        class BatchCommitted(RuntimeError):
+            pass
+
+        committed: list[observation_tracker.SampleResult] = []
+
+        async def quote(_session, _key, mint, *_args, **_kwargs):
+            if mint == "SUCCESS":
+                return {"outAmount": "1100"}
+            if mint == "NO_ROUTE":
+                raise executor.JupiterNoRouteError("no route")
+            raise RuntimeError("retry later")
+
+        def commit(results: list[observation_tracker.SampleResult]) -> int:
+            committed.extend(results)
+            raise BatchCommitted
+
+        attempts = Mock(side_effect=lambda observation_id, *_args, **_kwargs: (
+            3 if observation_id == "FINAL-RETRY-ID" else 1
+        ))
+        batch = Mock(side_effect=commit)
+        quote_mock = AsyncMock(side_effect=quote)
+
+        due = [
+            ("SUCCESS-ID", "1m", "SUCCESS", 1, 950.0),
+            ("NO-ROUTE-ID", "3m", "NO_ROUTE", 1, 950.0),
+            ("MISSED-ID", "5m", "MISSED", 1, 900.0),
+            ("RETRY-ID", "15m", "RETRY", 1, 950.0),
+            ("FINAL-RETRY-ID", "30m", "FINAL_RETRY", 1, 950.0),
+        ]
+
+        async def run() -> None:
+            with (
+                patch.object(
+                    observation_tracker,
+                    "ensure_observations_migrated",
+                    return_value={"observations": []},
+                ),
+                patch.object(
+                    observation_tracker,
+                    "reconcile_interrupted_discoveries",
+                    return_value=0,
+                ),
+                patch(
+                    "src.shadow_trade_ledger.current_shadow_trade_ids",
+                    return_value=set(),
+                ),
+                patch(
+                    "src.shadow_trade_ledger.backfill_completed_shadow_trades",
+                    return_value=0,
+                ),
+                patch(
+                    "src.research_archive.backfill_research_archive",
+                    return_value={},
+                ),
+                patch(
+                    "src.research_archive.archive_integrity_metrics",
+                    return_value={},
+                ),
+                patch.object(
+                    observation_tracker,
+                    "_publish_observer_metrics",
+                    new=AsyncMock(),
+                ),
+                patch.object(observation_tracker, "load_dotenv"),
+                patch.object(observation_tracker.os, "getenv", return_value="KEY"),
+                patch.object(observation_tracker.time, "time", return_value=1_000.0),
+                patch.object(
+                    observation_tracker,
+                    "due_observation_samples",
+                    return_value=due,
+                ),
+                patch.object(observation_tracker, "record_memory_phase"),
+                patch.object(
+                    observation_tracker,
+                    "record_sample_attempt",
+                    new=attempts,
+                ),
+                patch.object(
+                    observation_tracker,
+                    "record_sample_batch",
+                    new=batch,
+                ),
+                patch.object(executor, "jupiter_quote", new=quote_mock),
+            ):
+                with self.assertRaises(BatchCommitted):
+                    await observation_tracker.observation_loop(interval_seconds=0)
+
+        asyncio.run(run())
+        batch.assert_called_once()
+        self.assertEqual(
+            [call.args[:2] for call in attempts.call_args_list],
+            [("RETRY-ID", "15m"), ("FINAL-RETRY-ID", "30m")],
+        )
+        self.assertEqual(quote_mock.await_count, 4)
+        self.assertEqual(
+            [(result.observation_id, result.interval) for result in committed],
+            [
+                ("SUCCESS-ID", "1m"),
+                ("NO-ROUTE-ID", "3m"),
+                ("MISSED-ID", "5m"),
+                ("FINAL-RETRY-ID", "30m"),
+            ],
+        )
+        self.assertEqual(committed[0].proceeds_lamports, 1_100)
+        self.assertEqual(committed[1].error, "no route")
+        self.assertEqual(committed[2].error, "HORIZON_MISSED")
+        self.assertEqual(committed[3].error, "retry later")
+        self.assertEqual(observation_tracker.OBSERVATION_SAMPLE_BATCH_SIZE, 20)
+        self.assertEqual(observation_tracker.OBSERVATION_SAMPLE_CONCURRENCY, 4)
+
     def test_observation_startup_validates_shadow_before_archive(self) -> None:
         archive = Mock()
 
