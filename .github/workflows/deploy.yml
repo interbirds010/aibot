@@ -419,6 +419,11 @@ jobs:
             import sys
             from pathlib import Path
 
+            from scripts.observer_health_gate import (
+                ObserverHealthGateError,
+                wait_for_observer_health,
+            )
+
             deploy_sha = sys.argv[1]
             backup_root = Path("/home/deploy/aibot-backups")
             marker = backup_root / f"latest-{deploy_sha}.txt"
@@ -484,17 +489,17 @@ jobs:
             if len(rows) < previous_count:
                 raise SystemExit("signal observation count decreased during deploy")
 
-            metrics_document = json.loads(
-                (data / "global_metrics.json").read_text(encoding="utf-8")
-            )
-            metrics = metrics_document.get("metrics", {})
-            heartbeat = metrics.get("observer_heartbeat_at")
-            if metrics.get("observer_state") != "RUNNING":
-                raise SystemExit(
-                    f"observer is not running: {metrics.get('observer_state')}"
+            def read_observer_metrics():
+                metrics_document = json.loads(
+                    (data / "global_metrics.json").read_text(encoding="utf-8")
                 )
-            if not isinstance(heartbeat, (int, float)) or time.time() - heartbeat > 90:
-                raise SystemExit("observer heartbeat is missing or stale")
+                return metrics_document.get("metrics", {})
+
+            try:
+                metrics = wait_for_observer_health(read_observer_metrics)
+            except ObserverHealthGateError as exc:
+                raise SystemExit(str(exc)) from exc
+            heartbeat = metrics["observer_heartbeat_at"]
 
             latest_identity = ""
             if rows and isinstance(rows[-1], dict):
