@@ -36,7 +36,7 @@ jobs:
           password: ${{ secrets.SSH_PASSWORD }}
           port: 22
           timeout: 30s
-          command_timeout: 2m
+          command_timeout: 3m
           envs: SUDO_PASSWORD,DEPLOY_SHA
           script: |
             set -Eeuo pipefail
@@ -50,7 +50,21 @@ jobs:
             fi
 
             sudo mkdir -p /var/www/aibot
-            sudo chown -R deploy:deploy /var/www/aibot
+            sudo chown deploy:deploy /var/www/aibot
+            for static_path in src scripts venv; do
+              if sudo test -e "/var/www/aibot/$static_path"; then
+                sudo chown -R deploy:deploy "/var/www/aibot/$static_path"
+              fi
+            done
+            for static_file in requirements.txt ecosystem.config.js .env; do
+              if sudo test -e "/var/www/aibot/$static_file"; then
+                sudo chown deploy:deploy "/var/www/aibot/$static_file"
+              fi
+            done
+            for runtime_dir in data logs; do
+              sudo mkdir -p "/var/www/aibot/$runtime_dir"
+              sudo chown deploy:deploy "/var/www/aibot/$runtime_dir"
+            done
             test -w /var/www/aibot
 
             backup_root="/home/deploy/aibot-backups"
@@ -266,7 +280,21 @@ jobs:
             set -Eeuo pipefail
 
             printf '%s\n' "$SUDO_PASSWORD" | sudo -S -p '' true
-            sudo chown -R deploy:deploy /var/www/aibot
+            sudo chown deploy:deploy /var/www/aibot
+            for static_path in src scripts venv; do
+              if sudo test -e "/var/www/aibot/$static_path"; then
+                sudo chown -R deploy:deploy "/var/www/aibot/$static_path"
+              fi
+            done
+            for static_file in requirements.txt ecosystem.config.js .env; do
+              if sudo test -e "/var/www/aibot/$static_file"; then
+                sudo chown deploy:deploy "/var/www/aibot/$static_file"
+              fi
+            done
+            for runtime_dir in data logs; do
+              sudo mkdir -p "/var/www/aibot/$runtime_dir"
+              sudo chown deploy:deploy "/var/www/aibot/$runtime_dir"
+            done
 
             cd /var/www/aibot
 
@@ -301,12 +329,26 @@ jobs:
             pm2 describe aibot-dashboard >/dev/null
             pm2 describe wallet_feeder >/dev/null
 
-            ownership_mismatch="$(find /var/www/aibot -xdev \
+            ownership_mismatch="$(find src scripts venv -xdev \
+              -path '*/__pycache__' -prune -o \
               \( ! -user deploy -o ! -group deploy \) -print -quit)"
             if [[ -n "$ownership_mismatch" ]]; then
-              echo "ERROR: ownership mismatch remains at $ownership_mismatch" >&2
+              echo "ERROR: static ownership mismatch remains at $ownership_mismatch" >&2
               exit 1
             fi
+            for owned_path in \
+              /var/www/aibot \
+              /var/www/aibot/requirements.txt \
+              /var/www/aibot/ecosystem.config.js \
+              /var/www/aibot/.env \
+              /var/www/aibot/data \
+              /var/www/aibot/logs; do
+              ownership="$(stat -c '%U:%G' -- "$owned_path")"
+              if [[ "$ownership" != "deploy:deploy" ]]; then
+                echo "ERROR: ownership mismatch remains at $owned_path ($ownership)" >&2
+                exit 1
+              fi
+            done
 
             sleep 20
             ./venv/bin/python - /tmp/aibot-pm2-before.json <<'PY'

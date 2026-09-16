@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import unittest
 from pathlib import Path
 
@@ -39,6 +40,82 @@ class DeployWorkflowTests(unittest.TestCase):
         marker = 'printf \'%s\\n\' "$DEPLOY_SHA" > .deployed-sha.tmp'
         self.assertIn(gate, workflow)
         self.assertLess(workflow.index(gate), workflow.index(marker))
+
+    def test_deploy_ownership_avoids_live_tree_recursion(self) -> None:
+        workflow = (ROOT / ".github" / "workflows" / "deploy.yml").read_text(
+            encoding="utf-8"
+        )
+        self.assertNotRegex(
+            workflow,
+            re.compile(
+                r"^\s*sudo chown -R deploy:deploy /var/www/aibot\s*$",
+                re.MULTILINE,
+            ),
+        )
+        self.assertNotIn("find /var/www/aibot -xdev", workflow)
+        self.assertEqual(
+            workflow.count("for static_path in src scripts venv; do"), 2
+        )
+        self.assertEqual(
+            workflow.count(
+                "for static_file in requirements.txt ecosystem.config.js .env; do",
+            ),
+            2,
+        )
+        self.assertEqual(workflow.count("for runtime_dir in data logs; do"), 2)
+        self.assertEqual(
+            workflow.count(
+                'sudo chown deploy:deploy "/var/www/aibot/$runtime_dir"'
+            ),
+            2,
+        )
+        self.assertNotIn(
+            "sudo chown -R deploy:deploy \"/var/www/aibot/$runtime_dir\"",
+            workflow,
+        )
+
+    def test_static_and_runtime_root_ownership_verification_remains(self) -> None:
+        workflow = (ROOT / ".github" / "workflows" / "deploy.yml").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("find src scripts venv -xdev", workflow)
+        self.assertIn("-path '*/__pycache__' -prune", workflow)
+        for path in (
+            "/var/www/aibot/requirements.txt",
+            "/var/www/aibot/ecosystem.config.js",
+            "/var/www/aibot/.env",
+            "/var/www/aibot/data",
+            "/var/www/aibot/logs",
+        ):
+            self.assertIn(path, workflow)
+        self.assertIn("stat -c '%U:%G'", workflow)
+
+    def test_backup_timeout_is_bounded_without_changing_job_timeout(self) -> None:
+        workflow = (ROOT / ".github" / "workflows" / "deploy.yml").read_text(
+            encoding="utf-8"
+        )
+        backup = workflow.split(
+            "- name: Back up ledgers and prepare deploy ownership", 1
+        )[1].split("- name: Upload application source", 1)[0]
+        self.assertIn("command_timeout: 3m", backup)
+        self.assertIn("timeout-minutes: 15", workflow)
+
+    def test_backup_integrity_semantics_remain(self) -> None:
+        workflow = (ROOT / ".github" / "workflows" / "deploy.yml").read_text(
+            encoding="utf-8"
+        )
+        backup = workflow.split(
+            "- name: Back up ledgers and prepare deploy ownership", 1
+        )[1].split("- name: Upload application source", 1)[0]
+        for invariant in (
+            'fcntl.flock(lock.fileno(), fcntl.LOCK_EX)',
+            'output.flush()',
+            'os.fsync(output.fileno())',
+            'archive_files = sorted(archive_source.glob("*/*.json"))',
+            'manifest["rpc_provider_states"] = {}',
+            'os.replace(temporary, manifest_path)',
+        ):
+            self.assertIn(invariant, backup)
 
     def test_extended_observation_is_manual_and_bounded(self) -> None:
         workflow = (
