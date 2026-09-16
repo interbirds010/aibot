@@ -50,7 +50,7 @@ _reservation_locks: weakref.WeakKeyDictionary[
 RPC_PROVIDER_STATE_DIR = (
     Path(__file__).resolve().parents[1] / "data" / "solana_rpc_providers"
 )
-RPC_PROVIDER_STATE_SCHEMA_VERSION = 5
+RPC_PROVIDER_STATE_SCHEMA_VERSION = 6
 SOLANA_PUBLIC_DEFAULT_URL = "https://api.mainnet.solana.com"
 RPC_CIRCUIT_FAILURE_THRESHOLD = 3
 RPC_CIRCUIT_COOLDOWN_SECONDS = 60.0
@@ -151,6 +151,9 @@ RPC_PACING_TARGET_PROVIDER = "solana_public"
 RPC_PACING_TARGET_METHOD = "getTransaction"
 RPC_PACING_HISTORY_SECONDS = 10.0
 RPC_PACING_HISTORY_LIMIT = 256
+RPC_METHOD_PACING_INTERVAL_SECONDS = {
+    ("solana_public", "getTransaction"): 2.0,
+}
 
 _semantic_repetition_lock = threading.Lock()
 _semantic_repetition_key = secrets.token_bytes(32)
@@ -381,6 +384,11 @@ def _empty_availability_state() -> dict[str, Any]:
 
 
 def _empty_provider_state(provider_name: str) -> dict[str, Any]:
+    method_last_request_at_epoch = {
+        method: 0.0
+        for target_provider, method in RPC_METHOD_PACING_INTERVAL_SECONDS
+        if target_provider == provider_name
+    }
     return {
         "schema_version": RPC_PROVIDER_STATE_SCHEMA_VERSION,
         "version": 0,
@@ -391,6 +399,7 @@ def _empty_provider_state(provider_name: str) -> dict[str, Any]:
         "failure_count": 0,
         "rate_limit_count": 0,
         "last_request_at_epoch": 0.0,
+        "method_last_request_at_epoch": method_last_request_at_epoch,
         **_empty_availability_state(),
         "method_availability": {
             method: _empty_availability_state()
@@ -477,8 +486,6 @@ def _migrate_provider_state(
 ) -> dict[str, Any]:
     """기존 provider state에 새 bounded metric 기본값을 보완한다."""
     previous_schema = int(state.get("schema_version", 0) or 0)
-    # schema v6의 미검증 method pacing state만 제거하고 provider 이력은 보존한다.
-    state.pop("method_last_request_at_epoch", None)
     defaults = _empty_provider_state(provider_name)
     for key, value in defaults.items():
         state.setdefault(key, value)
@@ -496,6 +503,16 @@ def _migrate_provider_state(
         }
         bounded_availability[method] = scoped
     state["method_availability"] = bounded_availability
+
+    raw_method_pacing = state.get("method_last_request_at_epoch")
+    raw_method_pacing = (
+        raw_method_pacing if isinstance(raw_method_pacing, dict) else {}
+    )
+    state["method_last_request_at_epoch"] = {
+        method: _safe_epoch(raw_method_pacing.get(method))
+        for target_provider, method in RPC_METHOD_PACING_INTERVAL_SECONDS
+        if target_provider == provider_name
+    }
 
     if previous_schema < 5:
         circuit = str(state.get("circuit_state") or "CLOSED").upper()
@@ -808,7 +825,19 @@ def _reset_pacing_attribution() -> None:
         _pacing_request_times.clear()
 
 
-def _reserve_provider_slot_sync(
+def _method_pacing_interval_seconds(
+    provider: RpcProvider, method: str,
+) -> float | None:
+    return RPC_METHOD_PACING_INTERVAL_SECONDS.get((provider.name, str(method)))
+
+
+def _method_pacing_lock_path(provider: RpcProvider, method: str) -> Path:
+    if _method_pacing_interval_seconds(provider, method) is None:
+        raise ValueError("unsupported method pacing target")
+    return RPC_PROVIDER_STATE_DIR / f"{provider.name}.{method}.pacing"
+
+
+def _reserve_provider_slot_core_sync(
     provider: RpcProvider,
     *,
     method: str = "other",
@@ -869,6 +898,9 @@ def _reserve_provider_slot_sync(
                 int(metric.get("failover_count", 0) or 0) + 1
             )
         state["last_request_at_epoch"] = now
+        method_interval = _method_pacing_interval_seconds(provider, method)
+        if method_interval is not None:
+            state["method_last_request_at_epoch"][str(method)] = now
         _increment_state_version(state)
         atomic_write_json(path, state)
         _record_coverage_rpc_metric(
@@ -888,6 +920,100 @@ def _reserve_provider_slot_sync(
         )
 
 
+def _reserve_method_paced_provider_slot_sync(
+    provider: RpcProvider,
+    *,
+    method: str,
+    retry: bool = False,
+    failover: bool = False,
+    now_epoch: float | None = None,
+    skip_reasons: dict[str, int] | None = None,
+) -> ProviderReservation | None:
+    """대상 method만 직렬화하고 긴 pacing 대기는 provider lock 밖에서 수행한다."""
+    interval = _method_pacing_interval_seconds(provider, method)
+    if interval is None:
+        return _reserve_provider_slot_core_sync(
+            provider,
+            method=method,
+            retry=retry,
+            failover=failover,
+            now_epoch=now_epoch,
+            skip_reasons=skip_reasons,
+        )
+    with exclusive_file_lock(
+        _method_pacing_lock_path(provider, method), timeout_seconds=180.0
+    ):
+        state_path = _state_path(provider.name)
+        with exclusive_file_lock(state_path, timeout_seconds=180.0):
+            state = _migrate_provider_state(
+                provider.name,
+                read_json(state_path, _empty_provider_state(provider.name)),
+            )
+            now = time.time() if now_epoch is None else float(now_epoch)
+            global_block = _availability_block_reason(state, now)
+            if global_block is not None:
+                _record_reservation_skip(
+                    provider, method, global_block, state, skip_reasons
+                )
+                return None
+            method_state = _method_availability_state(state, method)
+            if method_state is not None:
+                method_block = _availability_block_reason(method_state, now)
+                if method_block is not None:
+                    _record_reservation_skip(
+                        provider, method, method_block, method_state, skip_reasons
+                    )
+                    return None
+            last_method_request = _safe_epoch(
+                state["method_last_request_at_epoch"].get(method)
+            )
+            method_target = max(now, last_method_request + interval)
+
+        if now_epoch is None:
+            delay = method_target - time.time()
+            if delay > 0:
+                time.sleep(delay)
+            reservation_now = None
+        else:
+            reservation_now = method_target
+        return _reserve_provider_slot_core_sync(
+            provider,
+            method=method,
+            retry=retry,
+            failover=failover,
+            now_epoch=reservation_now,
+            skip_reasons=skip_reasons,
+        )
+
+
+def _reserve_provider_slot_sync(
+    provider: RpcProvider,
+    *,
+    method: str = "other",
+    retry: bool = False,
+    failover: bool = False,
+    now_epoch: float | None = None,
+    skip_reasons: dict[str, int] | None = None,
+) -> ProviderReservation | None:
+    if _method_pacing_interval_seconds(provider, method) is not None:
+        return _reserve_method_paced_provider_slot_sync(
+            provider,
+            method=method,
+            retry=retry,
+            failover=failover,
+            now_epoch=now_epoch,
+            skip_reasons=skip_reasons,
+        )
+    return _reserve_provider_slot_core_sync(
+        provider,
+        method=method,
+        retry=retry,
+        failover=failover,
+        now_epoch=now_epoch,
+        skip_reasons=skip_reasons,
+    )
+
+
 def _process_reservation_lock(provider_name: str) -> asyncio.Lock:
     """같은 event loop의 provider 예약 순서를 결정적으로 직렬화한다."""
     loop = asyncio.get_running_loop()
@@ -904,6 +1030,15 @@ async def _reserve_provider_slot(
     failover: bool = False,
     skip_reasons: dict[str, int] | None = None,
 ) -> ProviderReservation | None:
+    if _method_pacing_interval_seconds(provider, method) is not None:
+        return await asyncio.to_thread(
+            _reserve_provider_slot_sync,
+            provider,
+            method=method,
+            retry=retry,
+            failover=failover,
+            skip_reasons=skip_reasons,
+        )
     async with _process_reservation_lock(provider.name):
         return await asyncio.to_thread(
             _reserve_provider_slot_sync,
