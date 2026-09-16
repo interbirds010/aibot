@@ -2,12 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import json
-import multiprocessing
 import tempfile
 import time
 import unittest
 from collections import deque
-from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
@@ -65,24 +63,6 @@ def provider(name: str, *, max_rps: float = 1_000.0) -> solana_rpc.RpcProvider:
         max_rps=max_rps,
         public_fallback=name == "solana_public",
     )
-
-
-def paced_reservation_worker(
-    state_dir: str,
-    start: object,
-    results: object,
-) -> None:
-    """spawn worker에서 동일한 persisted method pacing state를 예약한다."""
-    solana_rpc.RPC_PROVIDER_STATE_DIR = Path(state_dir)
-    solana_rpc.RPC_METHOD_PACING_INTERVAL_SECONDS = {
-        ("solana_public", "getTransaction"): 0.2,
-    }
-    target = provider("solana_public", max_rps=1_000.0)
-    start.wait(timeout=10)
-    reservation = solana_rpc._reserve_provider_slot_sync(
-        target, method="getTransaction"
-    )
-    results.put(reservation.pacing_request_epoch)
 
 
 class SolanaRpcRouterTests(unittest.TestCase):
@@ -874,10 +854,7 @@ class SolanaRpcRouterTests(unittest.TestCase):
 
         state = solana_rpc.provider_state(target.name, [target])
 
-        self.assertEqual(
-            state["schema_version"],
-            solana_rpc.RPC_PROVIDER_STATE_SCHEMA_VERSION,
-        )
+        self.assertEqual(state["schema_version"], 5)
         self.assertEqual(state["request_count"], 11)
         self.assertEqual(state["failure_count"], 4)
         self.assertEqual(state["rate_limit_count"], 4)
@@ -1054,272 +1031,31 @@ class SolanaRpcRouterTests(unittest.TestCase):
         self.assertEqual(state["last_request_at_epoch"], 100.5)
         self.assertEqual(state["request_count"], 2)
 
-    def test_public_get_transaction_uses_two_second_persisted_spacing(
-        self,
-    ) -> None:
+    def test_v6_method_pacing_state_is_removed_at_global_rate_only(self) -> None:
         target = provider("solana_public", max_rps=2.0)
-
-        first = solana_rpc._reserve_provider_slot_sync(
-            target, method="getTransaction", now_epoch=100.0
-        )
-        second = solana_rpc._reserve_provider_slot_sync(
-            target, method="getTransaction", now_epoch=100.0
-        )
-
-        self.assertEqual(first.pacing_request_epoch, 100.0)
-        self.assertEqual(second.pacing_request_epoch, 102.0)
-        state = solana_rpc.provider_state(target.name, [target])
-        self.assertEqual(state["last_request_at_epoch"], 102.0)
-        self.assertEqual(
-            state["method_last_request_at_epoch"],
-            {"getTransaction": 102.0},
-        )
-        self.assertEqual(state["request_count"], 2)
-
-    def test_public_signatures_ignore_transaction_only_pacing_state(self) -> None:
-        target = provider("solana_public", max_rps=2.0)
-        solana_rpc._reserve_provider_slot_sync(
-            target, method="getTransaction", now_epoch=100.0
-        )
-
-        signature = solana_rpc._reserve_provider_slot_sync(
-            target, method="getSignaturesForAddress", now_epoch=100.0
-        )
-
-        self.assertIsNotNone(signature)
-        state = solana_rpc.provider_state(target.name, [target])
-        self.assertEqual(state["last_request_at_epoch"], 100.5)
-        self.assertEqual(
-            state["method_last_request_at_epoch"]["getTransaction"], 100.0
-        )
-
-    def test_waiting_transaction_does_not_starve_public_signatures(self) -> None:
-        target = provider("solana_public", max_rps=1_000.0)
-
-        async def exercise() -> tuple[object, object]:
-            state = solana_rpc._empty_provider_state(target.name)
-            state["method_last_request_at_epoch"]["getTransaction"] = time.time()
-            atomic_write_json(solana_rpc._state_path(target.name), state)
-            transaction_task = asyncio.create_task(
-                solana_rpc._reserve_provider_slot(
-                    target, method="getTransaction"
-                )
-            )
-            await asyncio.sleep(0.01)
-            signature = await asyncio.wait_for(
-                solana_rpc._reserve_provider_slot(
-                    target, method="getSignaturesForAddress"
-                ),
-                timeout=0.1,
-            )
-            return await transaction_task, signature
-
-        with patch.dict(
-            solana_rpc.RPC_METHOD_PACING_INTERVAL_SECONDS,
-            {("solana_public", "getTransaction"): 0.2},
-            clear=True,
-        ):
-            transaction, signature = asyncio.run(exercise())
-
-        self.assertIsNotNone(transaction)
-        self.assertIsNotNone(signature)
-
-    def test_helius_methods_keep_provider_global_pacing_only(self) -> None:
-        target = provider("helius", max_rps=2.0)
-
-        first = solana_rpc._reserve_provider_slot_sync(
-            target, method="getTransaction", now_epoch=100.0
-        )
-        second = solana_rpc._reserve_provider_slot_sync(
-            target, method="getSignaturesForAddress", now_epoch=100.0
-        )
-
-        self.assertIsNotNone(first)
-        self.assertIsNotNone(second)
-        state = solana_rpc.provider_state(target.name, [target])
-        self.assertEqual(state["last_request_at_epoch"], 100.5)
-        self.assertEqual(state["method_last_request_at_epoch"], {})
-
-    def test_method_pacing_sleep_does_not_hold_provider_state_lock(self) -> None:
-        target = provider("solana_public", max_rps=2.0)
-        state_path = solana_rpc._state_path(target.name)
-        state = solana_rpc._empty_provider_state(target.name)
-        state["method_last_request_at_epoch"]["getTransaction"] = 99.0
-        atomic_write_json(state_path, state)
-        original_lock = solana_rpc.exclusive_file_lock
-        active_paths: set[Path] = set()
-        clock = [100.0]
-        waits: list[float] = []
-
-        @contextmanager
-        def observed_lock(path: Path, **options: object):
-            with original_lock(path, **options):
-                active_paths.add(path)
-                try:
-                    yield
-                finally:
-                    active_paths.remove(path)
-
-        def fake_sleep(delay: float) -> None:
-            self.assertNotIn(state_path, active_paths)
-            waits.append(delay)
-            clock[0] += delay
-
-        with (
-            patch.object(solana_rpc, "exclusive_file_lock", observed_lock),
-            patch.object(solana_rpc.time, "time", side_effect=lambda: clock[0]),
-            patch.object(solana_rpc.time, "sleep", side_effect=fake_sleep),
-        ):
-            reservation = solana_rpc._reserve_provider_slot_sync(
-                target, method="getTransaction"
-            )
-
-        self.assertIsNotNone(reservation)
-        self.assertEqual(waits, [1.0])
-        self.assertEqual(reservation.pacing_request_epoch, 101.0)
-
-    def test_method_pacing_reconciles_interleaved_global_reservation(self) -> None:
-        target = provider("solana_public", max_rps=2.0)
-        state = solana_rpc._empty_provider_state(target.name)
-        state["method_last_request_at_epoch"]["getTransaction"] = 99.0
-        atomic_write_json(solana_rpc._state_path(target.name), state)
-        clock = [100.0]
-        waits: list[float] = []
-
-        def fake_sleep(delay: float) -> None:
-            waits.append(delay)
-            if len(waits) == 1:
-                signature = solana_rpc._reserve_provider_slot_core_sync(
-                    target,
-                    method="getSignaturesForAddress",
-                    now_epoch=101.2,
-                )
-                self.assertEqual(signature.pacing_request_epoch, None)
-            clock[0] += delay
-
-        with (
-            patch.object(solana_rpc.time, "time", side_effect=lambda: clock[0]),
-            patch.object(solana_rpc.time, "sleep", side_effect=fake_sleep),
-        ):
-            reservation = solana_rpc._reserve_provider_slot_sync(
-                target, method="getTransaction"
-            )
-
-        self.assertEqual(len(waits), 2)
-        self.assertAlmostEqual(waits[0], 1.0)
-        self.assertAlmostEqual(waits[1], 0.7)
-        self.assertAlmostEqual(reservation.pacing_request_epoch, 101.7)
-        final_state = solana_rpc.provider_state(target.name, [target])
-        self.assertAlmostEqual(final_state["last_request_at_epoch"], 101.7)
-        self.assertAlmostEqual(
-            final_state["method_last_request_at_epoch"]["getTransaction"],
-            101.7,
-        )
-
-    def test_v5_method_pacing_migration_is_bounded(self) -> None:
-        target = provider("solana_public")
         atomic_write_json(solana_rpc._state_path(target.name), {
-            "schema_version": 5,
+            "schema_version": 6,
+            "version": 9,
             "provider": target.name,
             "request_count": 7,
-            "method_last_request_at_epoch": {
-                "getTransaction": 123.0,
-                "unboundedMethod": 999.0,
-            },
+            "success_count": 5,
+            "failure_count": 2,
+            "last_request_at_epoch": 100.0,
+            "method_last_request_at_epoch": {"getTransaction": 100.0},
         })
 
-        state = solana_rpc.provider_state(target.name, [target])
-
-        self.assertEqual(
-            state["schema_version"],
-            solana_rpc.RPC_PROVIDER_STATE_SCHEMA_VERSION,
-        )
-        self.assertEqual(state["request_count"], 7)
-        self.assertEqual(
-            state["method_last_request_at_epoch"],
-            {"getTransaction": 123.0},
-        )
-
-    def test_method_paced_retry_and_failover_metrics_are_preserved(self) -> None:
-        target = provider("solana_public", max_rps=2.0)
-
         reservation = solana_rpc._reserve_provider_slot_sync(
-            target,
-            method="getTransaction",
-            retry=True,
-            failover=True,
-            now_epoch=100.0,
+            target, method="getTransaction", now_epoch=100.0
         )
 
         self.assertIsNotNone(reservation)
-        metric = solana_rpc.provider_state(target.name, [target])[
-            "method_metrics"
-        ]["getTransaction"]
-        self.assertEqual(metric["request_count"], 1)
-        self.assertEqual(metric["retry_count"], 1)
-        self.assertEqual(metric["failover_count"], 1)
-
-    def test_public_get_transaction_spacing_is_cross_process(self) -> None:
-        context = multiprocessing.get_context("spawn")
-        start = context.Event()
-        results = context.Queue()
-        processes = [
-            context.Process(
-                target=paced_reservation_worker,
-                args=(self.temporary.name, start, results),
-            )
-            for _ in range(2)
-        ]
-        for process in processes:
-            process.start()
-        start.set()
-        for process in processes:
-            process.join(timeout=15)
-            self.assertEqual(process.exitcode, 0)
-        epochs = sorted(results.get(timeout=2) for _ in processes)
-
-        self.assertGreaterEqual(epochs[1] - epochs[0], 0.18)
-        state = solana_rpc.provider_state("solana_public", [
-            provider("solana_public", max_rps=1_000.0),
-        ])
-        self.assertEqual(state["request_count"], 2)
-        self.assertAlmostEqual(
-            state["method_last_request_at_epoch"]["getTransaction"],
-            epochs[1],
-            places=3,
-        )
-
-    def test_evidence_fixture_reduces_burst_without_skips(self) -> None:
-        logical_requests = 12
-
-        def simulate(interval_seconds: float) -> dict[str, int]:
-            starts = [index * interval_seconds for index in range(logical_requests)]
-            rate_limits = sum(
-                sum(
-                    prior >= started - 10.0
-                    for prior in starts[:index + 1]
-                ) >= 9
-                for index, started in enumerate(starts)
-            )
-            return {
-                "logical_requests": logical_requests,
-                "physical_requests": len(starts),
-                "pacing_waits": logical_requests - 1,
-                "reservation_skips": 0,
-                "rate_limits": rate_limits,
-                "successes": logical_requests - rate_limits,
-            }
-
-        before = simulate(0.5)
-        after = simulate(2.0)
-
-        self.assertEqual(before["rate_limits"], 4)
-        self.assertEqual(before["successes"], 8)
-        self.assertEqual(after["rate_limits"], 0)
-        self.assertEqual(after["successes"], 12)
-        self.assertEqual(before["physical_requests"], logical_requests)
-        self.assertEqual(after["physical_requests"], logical_requests)
-        self.assertEqual(after["reservation_skips"], 0)
+        self.assertEqual(reservation.pacing_request_epoch, 100.5)
+        state = solana_rpc.provider_state(target.name, [target])
+        self.assertEqual(state["schema_version"], 5)
+        self.assertEqual(state["request_count"], 8)
+        self.assertEqual(state["success_count"], 5)
+        self.assertEqual(state["failure_count"], 2)
+        self.assertNotIn("method_last_request_at_epoch", state)
 
     def test_retry_after_controls_shared_provider_cooldown(self) -> None:
         primary, secondary = provider("alchemy"), provider("ankr")
