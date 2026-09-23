@@ -114,8 +114,12 @@ class DeployWorkflowTests(unittest.TestCase):
             'archive_files = sorted(archive_source.glob("*/*.json"))',
             'manifest["rpc_provider_states"] = {}',
             'os.replace(temporary, manifest_path)',
+            '"hypothesis_registry.json"',
+            '"future_validation.json"',
+            '"future_validation_manifest.json"',
         ):
             self.assertIn(invariant, backup)
+        self.assertIn('RESEARCH_STATE_RESTORED name={name}', workflow)
 
     def test_extended_observation_is_manual_and_bounded(self) -> None:
         workflow = (
@@ -134,6 +138,7 @@ class DeployWorkflowTests(unittest.TestCase):
         self.assertIn("src.research.memory_workload_diagnostic", workflow)
         self.assertIn("src.research.alpha_review", workflow)
         self.assertIn("src.research.future_validation", workflow)
+        self.assertIn("--registry-mode prospective-five", workflow)
         self.assertIn("python -m src.observation_analysis", workflow)
         self.assertNotIn('sleep "$OBSERVATION_SECONDS"', workflow)
         self.assertIn("src.research.restart_forensics", workflow)
@@ -166,14 +171,22 @@ class FakeClock:
 
 class ObserverHealthGateTests(unittest.TestCase):
     @staticmethod
-    def metrics(state: str, *, heartbeat: float = 1_000.0) -> dict:
-        return {
+    def metrics(
+        state: str,
+        *,
+        heartbeat: float = 1_000.0,
+        health_state: str | None = None,
+    ) -> dict:
+        metrics = {
             "observer_state": state,
             "observer_heartbeat_at": heartbeat,
             "observer_started_at": 990.0,
             "observer_last_error_type": "StateLockTimeout",
             "observer_last_error_at": 980.0,
         }
+        if health_state is not None:
+            metrics["observer_health_state"] = health_state
+        return metrics
 
     def run_gate(self, states: list[dict], clock: FakeClock, **kwargs):
         remaining = list(states)
@@ -249,10 +262,30 @@ class ObserverHealthGateTests(unittest.TestCase):
     def test_running_with_fresh_heartbeat_passes_immediately(self) -> None:
         clock = FakeClock()
         result = self.run_gate([
-            self.metrics("RUNNING", heartbeat=clock.now())
+            self.metrics(
+                "RUNNING",
+                heartbeat=clock.now(),
+                health_state="RUNNING_HEALTHY",
+            )
         ], clock)
 
         self.assertEqual(result["observer_state"], "RUNNING")
+        self.assertEqual(clock.sleeps, [])
+
+    def test_running_stalled_fails_even_with_fresh_heartbeat(self) -> None:
+        clock = FakeClock()
+        with self.assertRaisesRegex(
+            ObserverHealthGateError,
+            r"health state is not healthy:.*health_state=RUNNING_STALLED",
+        ):
+            self.run_gate([
+                self.metrics(
+                    "RUNNING",
+                    heartbeat=clock.now(),
+                    health_state="RUNNING_STALLED",
+                )
+            ], clock)
+
         self.assertEqual(clock.sleeps, [])
 
 

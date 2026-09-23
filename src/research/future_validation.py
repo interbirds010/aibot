@@ -47,13 +47,16 @@ ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_ALPHA_PATH = ROOT / "data" / "alpha_discovery.json"
 DEFAULT_REGISTRY_PATH = ROOT / "data" / "hypothesis_registry.json"
 DEFAULT_REPORT_PATH = ROOT / "data" / "future_validation.json"
-REGISTRY_SCHEMA_VERSION = 1
-REPORT_SCHEMA_VERSION = 1
+DEFAULT_MANIFEST_PATH = ROOT / "data" / "future_validation_manifest.json"
+REGISTRY_SCHEMA_VERSION = 2
+REPORT_SCHEMA_VERSION = 2
+BOUNDARY_MANIFEST_SCHEMA_VERSION = 1
 HORIZONS = ("5m", "15m", "30m", "60m")
 PRIMARY_HORIZON = "60m"
 MAX_HYPOTHESES_PER_FAMILY = 8
 MIN_FUTURE_UNIQUE_MINTS = MIN_HOLDOUT_SAMPLED
 MIN_POSITIVE_UTC_DAYS = 2
+REGISTRY_MODES = frozenset({"prospective-five", "alpha-promising", "combined"})
 REGISTRY_STATUSES = frozenset({
     "DISCOVERY_ONLY",
     "REJECTED_DISCOVERY",
@@ -184,6 +187,9 @@ def _fingerprint(hypothesis: dict[str, Any]) -> str:
             "discovery_source",
             "discovery_data_end",
             "validation_start",
+            "discovery_manifest_digest",
+            "discovery_manifest_count",
+            "discovery_last_stable_identity",
             "bucket_version",
             "feature_contract_digest",
             "alpha_source_schema_version",
@@ -194,6 +200,102 @@ def _fingerprint(hypothesis: dict[str, Any]) -> str:
         )
     }
     return hashlib.sha256(_canonical(frozen).encode("utf-8")).hexdigest()
+
+
+def _boundary_manifest(
+    rows: list[Any], *, cutoff_epoch: float, created_at: str,
+) -> dict[str, Any]:
+    signatures: list[dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        timestamp = _signal_timestamp(row)
+        if timestamp is None or timestamp > cutoff_epoch:
+            continue
+        identity = _event_identity(row)
+        if not identity:
+            continue
+        signatures.append({
+            "timestamp": _iso_timestamp(timestamp),
+            "stable_identity": identity,
+            "row_digest": hashlib.sha256(
+                _canonical(row).encode("utf-8")
+            ).hexdigest(),
+        })
+    signatures.sort(
+        key=lambda item: (item["timestamp"], item["stable_identity"])
+    )
+    cutoff = _iso_timestamp(cutoff_epoch)
+    cutoff_identities = [
+        item["stable_identity"]
+        for item in signatures if item["timestamp"] == cutoff
+    ]
+    manifest = {
+        "schema_version": BOUNDARY_MANIFEST_SCHEMA_VERSION,
+        "immutable": True,
+        "created_at": created_at,
+        "discovery_data_end": cutoff,
+        "manifest_canonicalization": (
+            "timestamp_then_identity_for_digest_only_not_event_sequence"
+        ),
+        "manifest_count": len(signatures),
+        "manifest_digest": hashlib.sha256(
+            _canonical(signatures).encode("utf-8")
+        ).hexdigest(),
+        "last_stable_timestamp": (
+            signatures[-1]["timestamp"] if signatures else None
+        ),
+        "last_stable_identity": (
+            signatures[-1]["stable_identity"] if signatures else None
+        ),
+        "cutoff_stable_identity": max(cutoff_identities, default=""),
+    }
+    manifest["boundary_fingerprint"] = hashlib.sha256(
+        _canonical(manifest).encode("utf-8")
+    ).hexdigest()
+    return manifest
+
+
+def _validate_boundary_document(manifest: Any) -> None:
+    if not isinstance(manifest, dict):
+        raise RuntimeError("future validation boundary manifest is malformed")
+    if (
+        manifest.get("schema_version") != BOUNDARY_MANIFEST_SCHEMA_VERSION
+        or manifest.get("immutable") is not True
+        or manifest.get("manifest_canonicalization")
+        != "timestamp_then_identity_for_digest_only_not_event_sequence"
+    ):
+        raise RuntimeError("future validation boundary manifest is unsupported")
+    if (
+        not isinstance(manifest.get("manifest_count"), int)
+        or manifest["manifest_count"] < 0
+    ):
+        raise RuntimeError("future validation boundary manifest count is invalid")
+    for field in ("manifest_digest", "boundary_fingerprint"):
+        value = str(manifest.get(field) or "")
+        if len(value) != 64:
+            raise RuntimeError("future validation boundary digest is invalid")
+    expected = dict(manifest)
+    supplied = str(expected.pop("boundary_fingerprint"))
+    calculated = hashlib.sha256(_canonical(expected).encode("utf-8")).hexdigest()
+    if not hmac.compare_digest(supplied, calculated):
+        raise RuntimeError("future validation boundary manifest changed")
+    if _signal_timestamp({
+        "signal_detected_at": manifest.get("discovery_data_end"),
+    }) is None:
+        raise RuntimeError("future validation boundary timestamp is invalid")
+
+
+def validate_boundary_manifest(
+    registry: dict[str, Any], manifest: dict[str, Any],
+) -> None:
+    """별도 immutable manifest가 frozen registry와 정확히 같은지 검증한다."""
+    validate_registry(registry)
+    _validate_boundary_document(manifest)
+    if not hmac.compare_digest(
+        _canonical(registry["discovery_boundary"]), _canonical(manifest),
+    ):
+        raise RuntimeError("future validation manifest does not match registry")
 
 
 def _feature_contract_digest(family: str, features: Iterable[str]) -> str:
@@ -429,12 +531,15 @@ def build_hypothesis_registry(
     created_at: str | None = None,
     discovery_data_end: str | None = None,
     maximum_per_family: int = MAX_HYPOTHESES_PER_FAMILY,
+    registry_mode: str = "combined",
 ) -> dict[str, Any]:
     """현재 discovery 끝을 고정하고 future-only registry를 만든다."""
     if not isinstance(rows, list):
         raise TypeError("registry rows must be a list")
     if not 1 <= int(maximum_per_family) <= MAX_HYPOTHESES_PER_FAMILY:
         raise ValueError("maximum_per_family must be between 1 and 8")
+    if registry_mode not in REGISTRY_MODES:
+        raise ValueError("registry_mode is unsupported")
     timestamps = [
         timestamp for row in rows if isinstance(row, dict)
         if (timestamp := _signal_timestamp(row)) is not None
@@ -458,7 +563,20 @@ def build_hypothesis_registry(
         cutoff_epoch = max(timestamps) if timestamps else frozen_epoch
     cutoff = _iso_timestamp(cutoff_epoch)
     validation_start = _iso_timestamp(max(cutoff_epoch, frozen_epoch))
-    definitions = [*_prospective_definitions(), *_alpha_definitions(alpha_report)]
+    boundary = _boundary_manifest(
+        rows, cutoff_epoch=cutoff_epoch, created_at=frozen_at,
+    )
+    prospective = _prospective_definitions()
+    alpha = list(_alpha_definitions(alpha_report))
+    definitions = {
+        "prospective-five": prospective,
+        "alpha-promising": alpha,
+        "combined": [*prospective, *alpha],
+    }[registry_mode]
+    if registry_mode == "prospective-five" and len(definitions) != 5:
+        raise RuntimeError(
+            "prospective-five registry must contain exactly five definitions"
+        )
     counts: Counter[str] = Counter()
     hypotheses: list[dict[str, Any]] = []
     for definition in definitions:
@@ -471,6 +589,9 @@ def build_hypothesis_registry(
             "created_at": frozen_at,
             "discovery_data_end": cutoff,
             "validation_start": validation_start,
+            "discovery_manifest_digest": boundary["manifest_digest"],
+            "discovery_manifest_count": boundary["manifest_count"],
+            "discovery_last_stable_identity": boundary["last_stable_identity"],
             "status": "READY_FOR_FUTURE_VALIDATION",
         }
         hypothesis["definition_fingerprint"] = _fingerprint(hypothesis)
@@ -479,6 +600,8 @@ def build_hypothesis_registry(
     registry = {
         "schema_version": REGISTRY_SCHEMA_VERSION,
         "created_at": frozen_at,
+        "registry_mode": registry_mode,
+        "discovery_boundary": boundary,
         "maximum_hypotheses_per_family": int(maximum_per_family),
         "selection_iteration": 1,
         "multiple_testing_warning": True,
@@ -491,13 +614,20 @@ def build_hypothesis_registry(
 
 def validate_registry(registry: Any) -> None:
     """Registry 정의와 cutoff가 바뀌면 fail-closed한다."""
-    if not isinstance(registry, dict) or registry.get("schema_version") != 1:
+    if (
+        not isinstance(registry, dict)
+        or registry.get("schema_version") != REGISTRY_SCHEMA_VERSION
+    ):
         raise RuntimeError("hypothesis registry schema is unsupported")
     if registry.get("automatic_trading_changes") is not False:
         raise RuntimeError("hypothesis registry must remain research-only")
     hypotheses = registry.get("hypotheses")
     if not isinstance(hypotheses, list):
         raise RuntimeError("hypothesis registry is malformed")
+    if registry.get("registry_mode") not in REGISTRY_MODES:
+        raise RuntimeError("hypothesis registry mode is unsupported")
+    boundary = registry.get("discovery_boundary")
+    _validate_boundary_document(boundary)
     ids: set[str] = set()
     counts: Counter[str] = Counter()
     for item in hypotheses:
@@ -540,6 +670,14 @@ def validate_registry(registry: Any) -> None:
             raise RuntimeError("hypothesis validation boundary is invalid")
         if validation_start < discovery_end:
             raise RuntimeError("hypothesis validation starts before discovery ends")
+        if (
+            item.get("discovery_manifest_digest") != boundary["manifest_digest"]
+            or item.get("discovery_manifest_count") != boundary["manifest_count"]
+            or item.get("discovery_last_stable_identity")
+            != boundary["last_stable_identity"]
+            or item.get("discovery_data_end") != boundary["discovery_data_end"]
+        ):
+            raise RuntimeError("hypothesis discovery provenance changed")
         bucket_features: set[str] = set()
         prospective_features: set[str] = set()
         referenced_features: set[str] = set()
@@ -596,6 +734,15 @@ def validate_registry(registry: Any) -> None:
         counts[family] += 1
     if any(count > MAX_HYPOTHESES_PER_FAMILY for count in counts.values()):
         raise RuntimeError("hypothesis family exceeds the candidate cap")
+    if registry["registry_mode"] == "prospective-five" and (
+        len(hypotheses) != 5
+        or any(
+            item.get("discovery_source") != "prospective_pre_registered_v1"
+            or item.get("family") != "MOMENTUM"
+            for item in hypotheses
+        )
+    ):
+        raise RuntimeError("prospective-five registry lane changed")
 
 
 def _features(row: dict[str, Any], family: str, timestamp: float) -> dict[str, float]:
@@ -812,6 +959,7 @@ def _metrics(events: list[dict[str, Any]], horizon: str) -> dict[str, Any]:
         "positive_utc_day_count": sum(
             item["expectancy_percent"] > 0 for item in day_split
         ),
+        "completed_utc_day_count": len(day_split),
         "utc_day_split": day_split,
         "utc_week_split": week_split,
         "signal_density_per_day": (
@@ -830,6 +978,8 @@ def fast_falsification_reasons(metrics: dict[str, Any]) -> list[str]:
         reasons.append("INSUFFICIENT_UNIQUE_MINTS")
     if coverage is None or coverage < MIN_TRACKABLE_COVERAGE_PERCENT:
         reasons.append("INSUFFICIENT_COVERAGE")
+    if int(metrics.get("completed_utc_day_count", 0) or 0) < 2:
+        reasons.append("INSUFFICIENT_CHRONOLOGICAL_COVERAGE")
     if sampled and int(metrics.get("unique_mint_count", 0) or 0) <= 1:
         reasons.append("ONE_MINT_DEPENDENCY")
     expectancy = metrics.get("expectancy_percent")
@@ -851,6 +1001,7 @@ def fast_falsification_reasons(metrics: dict[str, Any]) -> list[str]:
 def _future_status(metrics: dict[str, Any], reasons: list[str]) -> str:
     insufficient = {
         "SAMPLE_TOO_SMALL", "INSUFFICIENT_UNIQUE_MINTS", "INSUFFICIENT_COVERAGE",
+        "INSUFFICIENT_CHRONOLOGICAL_COVERAGE",
     }
     if insufficient & set(reasons):
         return "FUTURE_INSUFFICIENT"
@@ -866,11 +1017,11 @@ def build_future_validation(
     validate_registry(registry)
     deduplicated, quality = _deduplicated_events(rows)
     hypotheses = registry["hypotheses"]
-    cutoffs = {
-        item["hypothesis_id"]: max(
-            float(_signal_timestamp({"signal_detected_at": item["discovery_data_end"]}) or 0),
-            float(_signal_timestamp({"signal_detected_at": item["validation_start"]}) or 0),
-        )
+    discovery_boundary = registry["discovery_boundary"]
+    validation_boundaries = {
+        item["hypothesis_id"]: float(_signal_timestamp({
+            "signal_detected_at": item["validation_start"],
+        }) or 0)
         for item in hypotheses
     }
     events: list[dict[str, Any]] = []
@@ -900,11 +1051,12 @@ def build_future_validation(
     results: list[dict[str, Any]] = []
     for hypothesis in hypotheses:
         family = hypothesis["family"]
-        cutoff = cutoffs[hypothesis["hypothesis_id"]]
+        validation_boundary = validation_boundaries[hypothesis["hypothesis_id"]]
         missing_feature_count = 0
         future_family_events = [
             event for event in events
-            if event["_family"] == family and event["_timestamp"] > cutoff
+            if event["_family"] == family
+            and float(event["_timestamp"]) > validation_boundary
         ]
 
         def select(
@@ -950,6 +1102,7 @@ def build_future_validation(
             "missing_required_feature_count": missing_feature_count,
             "discovery_data_end": hypothesis["discovery_data_end"],
             "validation_start": hypothesis["validation_start"],
+            "discovery_manifest_digest": hypothesis["discovery_manifest_digest"],
             "horizons": horizons,
         })
     report = {
@@ -965,6 +1118,8 @@ def build_future_validation(
             "rpc_request_count": 0,
         },
         "hypothesis_count": len(hypotheses),
+        "registry_mode": registry["registry_mode"],
+        "discovery_boundary": copy.deepcopy(discovery_boundary),
         "hypotheses": results,
         "shared_outcome_summary": {
             "multi_hypothesis_event_count": sum(
@@ -983,6 +1138,8 @@ def _evaluation_run_id(report: dict[str, Any]) -> str:
     return hashlib.sha256(_canonical({
         "generated_at": report.get("generated_at"),
         "registry_source_version": report.get("registry_source_version"),
+        "registry_mode": report.get("registry_mode"),
+        "discovery_boundary": report.get("discovery_boundary"),
         "input_summary": report.get("input_summary"),
         "hypotheses": report.get("hypotheses"),
     }).encode("utf-8")).hexdigest()
@@ -1029,6 +1186,11 @@ def registry_with_evaluation_statuses(
     source_version = int(registry.get("version", 0) or 0)
     if report.get("registry_source_version") != source_version:
         raise RuntimeError("future validation report registry version is stale")
+    if (
+        report.get("registry_mode") != registry.get("registry_mode")
+        or report.get("discovery_boundary") != registry.get("discovery_boundary")
+    ):
+        raise RuntimeError("future validation report provenance is invalid")
     run_id = str(report.get("evaluation_run_id") or "")
     if len(run_id) != 64 or not hmac.compare_digest(
         run_id, _evaluation_run_id(report),
@@ -1124,11 +1286,14 @@ def _publish_evaluation(
 
 def _validate_cli_paths(
     *, input_path: Path, alpha_path: Path, registry_path: Path, output_path: Path,
+    manifest_path: Path | None = None,
 ) -> None:
     sources = {input_path.resolve(), alpha_path.resolve()}
     registry = registry_path.resolve()
     output = output_path.resolve()
-    if registry in sources or output in sources or registry == output:
+    manifest = manifest_path.resolve() if manifest_path is not None else None
+    outputs = {registry, output, *([manifest] if manifest is not None else [])}
+    if outputs & sources or len(outputs) != (3 if manifest is not None else 2):
         raise ValueError("research outputs must differ from all inputs and each other")
 
 
@@ -1138,6 +1303,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--alpha", type=Path, default=DEFAULT_ALPHA_PATH)
     parser.add_argument("--registry", type=Path, default=DEFAULT_REGISTRY_PATH)
     parser.add_argument("--output", type=Path, default=DEFAULT_REPORT_PATH)
+    parser.add_argument("--manifest", type=Path, default=DEFAULT_MANIFEST_PATH)
+    parser.add_argument(
+        "--registry-mode", choices=sorted(REGISTRY_MODES),
+        default="prospective-five",
+    )
     parser.add_argument("--discovery-data-end")
     args = parser.parse_args(argv)
     _validate_cli_paths(
@@ -1145,18 +1315,55 @@ def main(argv: list[str] | None = None) -> int:
         alpha_path=args.alpha,
         registry_path=args.registry,
         output_path=args.output,
+        manifest_path=args.manifest,
     )
     rows = _load_rows(args.input)
     if args.registry.exists():
         registry = read_json(args.registry, {})
         validate_registry(registry)
+        if registry.get("registry_mode") != args.registry_mode:
+            raise RuntimeError("existing registry mode differs from requested lane")
+        if not args.manifest.exists():
+            raise RuntimeError("immutable future validation manifest is missing")
+        validate_boundary_manifest(registry, read_json(args.manifest, {}))
     else:
-        alpha = read_json(args.alpha, {}) if args.alpha.exists() else {}
+        existing_manifest = (
+            read_json(args.manifest, {}) if args.manifest.exists() else None
+        )
+        if existing_manifest is not None:
+            _validate_boundary_document(existing_manifest)
+            if (
+                args.discovery_data_end is not None
+                and args.discovery_data_end
+                != existing_manifest["discovery_data_end"]
+            ):
+                raise RuntimeError(
+                    "explicit discovery cutoff differs from immutable manifest"
+                )
+        alpha = (
+            read_json(args.alpha, {})
+            if args.registry_mode != "prospective-five" and args.alpha.exists()
+            else {}
+        )
         registry = build_hypothesis_registry(
             rows,
             alpha_report=alpha,
-            discovery_data_end=args.discovery_data_end,
+            created_at=(
+                existing_manifest["created_at"]
+                if existing_manifest is not None else None
+            ),
+            discovery_data_end=(
+                existing_manifest["discovery_data_end"]
+                if existing_manifest is not None else args.discovery_data_end
+            ),
+            registry_mode=args.registry_mode,
         )
+        manifest = copy.deepcopy(registry["discovery_boundary"])
+        if existing_manifest is not None:
+            if existing_manifest != manifest:
+                raise RuntimeError("immutable future validation manifest already differs")
+        else:
+            atomic_write_json(args.manifest, manifest)
         registry = _save(args.registry, registry)
     report = build_future_validation(
         rows, registry, generated_at=datetime.now(timezone.utc).isoformat(),

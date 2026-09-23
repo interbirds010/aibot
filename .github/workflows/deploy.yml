@@ -91,6 +91,9 @@ jobs:
                 "wallet_performance.json",
                 "global_metrics.json",
                 "research_archive_metrics.json",
+                "hypothesis_registry.json",
+                "future_validation.json",
+                "future_validation_manifest.json",
             )
 
             def sized(value):
@@ -146,6 +149,24 @@ jobs:
                         "last_archive_success": document.get(
                             "last_archive_success"
                         ),
+                    }
+                if name == "hypothesis_registry.json":
+                    return {
+                        "schema_version": document.get("schema_version"),
+                        "version": document.get("version"),
+                        "registry_mode": document.get("registry_mode"),
+                        "hypothesis_count": sized(document.get("hypotheses")),
+                    }
+                if name == "future_validation.json":
+                    return {
+                        "schema_version": document.get("schema_version"),
+                        "hypothesis_count": sized(document.get("hypotheses")),
+                    }
+                if name == "future_validation_manifest.json":
+                    return {
+                        "schema_version": document.get("schema_version"),
+                        "manifest_count": document.get("manifest_count"),
+                        "manifest_digest": document.get("manifest_digest"),
                     }
                 return {"wallet_count": sized(document.get("wallets"))}
 
@@ -455,8 +476,11 @@ jobs:
             test "$verification_failed" -eq 0
 
             ./venv/bin/python - "$DEPLOY_SHA" <<'PY'
+            import fcntl
             import hashlib
             import json
+            import os
+            import tempfile
             import time
             import sys
             from pathlib import Path
@@ -514,6 +538,36 @@ jobs:
                 if not isinstance(document, dict):
                     raise SystemExit(f"production ledger malformed: {name}")
                 current[name] = document
+
+            for name in (
+                "hypothesis_registry.json",
+                "future_validation.json",
+                "future_validation_manifest.json",
+            ):
+                backup_item = manifest["files"].get(name, {})
+                if not backup_item.get("exists"):
+                    continue
+                live_path = data / name
+                lock_path = live_path.with_name(f"{live_path.name}.lock")
+                with lock_path.open("a+b") as lock:
+                    fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+                    try:
+                        if not live_path.exists():
+                            payload = (backup_dir / name).read_bytes()
+                            with tempfile.NamedTemporaryFile(
+                                "wb", dir=live_path.parent, delete=False
+                            ) as output:
+                                temporary = Path(output.name)
+                                output.write(payload)
+                                output.flush()
+                                os.fsync(output.fileno())
+                            os.replace(temporary, live_path)
+                        document = json.loads(live_path.read_text(encoding="utf-8"))
+                        if not isinstance(document, dict):
+                            raise SystemExit(f"research state malformed: {name}")
+                    finally:
+                        fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+                print(f"RESEARCH_STATE_RESTORED name={name}")
 
             observations = current["signal_observations.json"]
             if observations.get("schema_version") != 5:

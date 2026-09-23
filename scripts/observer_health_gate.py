@@ -43,6 +43,7 @@ def _diagnostic(
 
     return (
         f"state={metrics.get('observer_state', 'UNKNOWN')} "
+        f"health_state={metrics.get('observer_health_state', 'LEGACY')} "
         f"waited_seconds={waited_seconds:.1f} "
         f"heartbeat_age_seconds={display(heartbeat_age)} "
         f"observer_started_age_seconds={display(started_age)} "
@@ -82,6 +83,11 @@ def wait_for_observer_health(
         report(f"OBSERVER_GATE_POLL {diagnostic}")
 
         if state == "RUNNING":
+            health_state = metrics.get("observer_health_state")
+            if health_state not in (None, "RUNNING_HEALTHY"):
+                raise ObserverHealthGateError(
+                    f"observer health state is not healthy: {diagnostic}"
+                )
             heartbeat_age = _age_seconds(
                 metrics.get("observer_heartbeat_at"), now_epoch
             )

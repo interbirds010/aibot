@@ -22,7 +22,13 @@ from src.research.prospective_features import (
 )
 from src.research.coverage_telemetry import record_funnel_stage
 from src.runtime_memory import current_rss_bytes, record_memory_phase
-from src.state_store import migrate_json, read_json, set_global_metrics, update_json
+from src.state_store import (
+    StateLockTimeout,
+    migrate_json,
+    read_json,
+    set_global_metrics,
+    update_json,
+)
 
 logger = logging.getLogger("signal-observer")
 
@@ -80,6 +86,19 @@ class SampleResult:
     error: str | None = None
     sampled_at_epoch: float | None = None
     quote_latency_ms: float | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _PendingSampleAttempt:
+    """RPC 실패 뒤 attempt 원장 write만 재시도할 bounded 항목."""
+
+    observation_id: str
+    interval: str
+    mint: str
+    target_at_epoch: float
+    error: str
+    sampled_at_epoch: float
+    quote_latency_ms: float
 
 
 @dataclass(frozen=True, slots=True)
@@ -214,6 +233,16 @@ def ensure_observations_migrated() -> dict[str, Any]:
     )
 
 
+def read_observations_snapshot() -> dict[str, Any]:
+    """원자 교체된 원장을 lock 없이 읽고 현재 schema만 허용한다."""
+    document = read_json(OBSERVATION_PATH, empty_observations())
+    if migrate_observation_document(document):
+        raise RuntimeError(
+            "signal observation ledger requires startup migration"
+        )
+    return document
+
+
 def reconcile_interrupted_discoveries(
     *,
     now_epoch: float | None = None,
@@ -339,14 +368,16 @@ def observation_runtime_metrics(
     }
 
 
-async def _publish_observer_metrics(values: dict[str, Any]) -> None:
+async def _publish_observer_metrics(values: dict[str, Any]) -> bool:
     """관측 지표 저장 실패가 monitor 생명주기에 영향을 주지 않게 한다."""
     try:
         await asyncio.to_thread(set_global_metrics, values)
+        return True
     except asyncio.CancelledError:
         raise
     except Exception:
         logger.exception("observer health metric update failed")
+        return False
 
 
 def normalized_safety_metrics(metrics: dict[str, Any] | None) -> dict[str, Any]:
@@ -1038,18 +1069,64 @@ def _due_sample_candidates(
     return due
 
 
+def _fair_recovery_candidates(
+    candidates: list[tuple[str, str, str, int, float]],
+    limit: int,
+) -> list[tuple[str, str, str, int, float]]:
+    """과거 backlog를 observation별 round-robin으로 제한 복구한다."""
+    queues: dict[str, list[tuple[str, str, str, int, float]]] = {}
+    for candidate in candidates:
+        queues.setdefault(candidate[0], []).append(candidate)
+    selected: list[tuple[str, str, str, int, float]] = []
+    while queues and len(selected) < limit:
+        for observation_id in tuple(queues):
+            queue = queues[observation_id]
+            selected.append(queue.pop(0))
+            if not queue:
+                del queues[observation_id]
+            if len(selected) >= limit:
+                break
+    return selected
+
+
+def _select_due_sample_batch(
+    due: list[tuple[str, str, str, int, float]],
+    now: float,
+    *,
+    limit: int | None = None,
+) -> list[tuple[str, str, str, int, float]]:
+    """60초 표본 창을 우선하고 남는 용량으로 오래된 backlog를 복구한다."""
+    bounded_limit = max(0, int(
+        OBSERVATION_SAMPLE_BATCH_SIZE if limit is None else limit
+    ))
+    timely = [
+        candidate for candidate in due
+        if not horizon_sample_is_missed(now, candidate[4])
+    ]
+    selected = timely[:bounded_limit]
+    remaining = bounded_limit - len(selected)
+    if remaining <= 0:
+        return selected
+    historical = [
+        candidate for candidate in due
+        if horizon_sample_is_missed(now, candidate[4])
+    ]
+    selected.extend(_fair_recovery_candidates(historical, remaining))
+    return selected
+
+
 def due_observation_samples(now: float) -> list[tuple[str, str, str, int, float]]:
-    """가장 오래된 deadline부터 bounded batch를 반환한다."""
+    """정상 표본 창과 과거 backlog를 분리한 bounded batch를 반환한다."""
     with phase_memory(
         "observation_due_scan",
         metadata={"workload": "observation", "operation": "scan"},
         include_gc_counts=True,
         include_object_count=True,
     ) as due_scope:
-        document = ensure_observations_migrated()
+        document = read_observations_snapshot()
         rows = document.get("observations", [])
         due = _due_sample_candidates(rows, now)
-        selected = due[:OBSERVATION_SAMPLE_BATCH_SIZE]
+        selected = _select_due_sample_batch(due, now)
         try:
             observation_file_bytes = OBSERVATION_PATH.stat().st_size
         except OSError:
@@ -1431,6 +1508,7 @@ async def observation_loop(interval_seconds: float = 15.0) -> None:
     now = time.time()
     await _publish_observer_metrics({
         "observer_state": "RUNNING",
+        "observer_health_state": "RUNNING_HEALTHY",
         "observer_heartbeat_at": now,
         "observer_state_changed_at": now,
         **{f"research_{key}": value for key, value in archive_metrics.items()},
@@ -1439,6 +1517,31 @@ async def observation_loop(interval_seconds: float = 15.0) -> None:
     # 시작 계측에만 필요한 원장 snapshot을 장기 실행 coroutine에서 해제한다.
     del archive_metrics, startup_runtime_metrics
     last_health_refresh = time.monotonic()
+    pending_finalized: list[SampleResult] = []
+    pending_sample_attempts: list[_PendingSampleAttempt] = []
+    state_lock_stalled = False
+
+    async def publish_state_lock_stall(
+        operation: str,
+        *,
+        pending_count: int,
+    ) -> None:
+        """원장 락 정체를 정상 heartbeat로 숨기지 않는다."""
+        nonlocal state_lock_stalled
+        now = time.time()
+        values: dict[str, Any] = {
+            "observer_state": "RUNNING",
+            "observer_health_state": "RUNNING_STALLED",
+            "observer_heartbeat_at": now,
+            "observer_last_error_at": now,
+            "observer_last_error_type": "StateLockTimeout",
+            "observer_state_lock_operation": operation,
+            "observer_pending_sample_count": pending_count,
+        }
+        if not state_lock_stalled:
+            values["observer_state_changed_at"] = now
+        await _publish_observer_metrics(values)
+        state_lock_stalled = True
 
     timeout = aiohttp.ClientTimeout(total=15)
     async with aiohttp.ClientSession(timeout=timeout) as session:
@@ -1520,12 +1623,30 @@ async def observation_loop(interval_seconds: float = 15.0) -> None:
                 sampled_at = time.time()
                 latency_ms = (time.monotonic() - quote_started) * 1_000
                 error = redact_sensitive_text(exc)
-                attempts = await asyncio.to_thread(
-                    record_sample_attempt,
-                    observation_id,
-                    label,
-                    error=error,
-                )
+                try:
+                    attempts = await asyncio.to_thread(
+                        record_sample_attempt,
+                        observation_id,
+                        label,
+                        error=error,
+                    )
+                except StateLockTimeout:
+                    pending_sample_attempts.append(_PendingSampleAttempt(
+                        observation_id=observation_id,
+                        interval=label,
+                        mint=mint,
+                        target_at_epoch=target_at_epoch,
+                        error=error,
+                        sampled_at_epoch=sampled_at,
+                        quote_latency_ms=latency_ms,
+                    ))
+                    logger.warning(
+                        "observation sample attempt lock stalled: "
+                        "mint=%s interval=%s",
+                        mint,
+                        label,
+                    )
+                    return None
                 if attempts >= MAX_SAMPLE_ATTEMPTS:
                     final_error = (
                         "HORIZON_MISSED"
@@ -1564,11 +1685,117 @@ async def observation_loop(interval_seconds: float = 15.0) -> None:
 
         while True:
             tick_started = time.monotonic()
+            analysis_dirty = False
+            recovered_attempt_writes = False
+            if pending_sample_attempts:
+                retry_items = list(pending_sample_attempts)
+                pending_sample_attempts.clear()
+                for index, item in enumerate(retry_items):
+                    try:
+                        attempts = await asyncio.to_thread(
+                            record_sample_attempt,
+                            item.observation_id,
+                            item.interval,
+                            error=item.error,
+                        )
+                    except StateLockTimeout:
+                        pending_sample_attempts.extend(retry_items[index:])
+                        await publish_state_lock_stall(
+                            "record_sample_attempt",
+                            pending_count=(
+                                len(pending_finalized)
+                                + len(pending_sample_attempts)
+                            ),
+                        )
+                        break
+                    recovered_attempt_writes = True
+                    if attempts < MAX_SAMPLE_ATTEMPTS:
+                        continue
+                    final_error = (
+                        "HORIZON_MISSED"
+                        if horizon_sample_is_missed(
+                            item.sampled_at_epoch, item.target_at_epoch
+                        )
+                        else item.error
+                    )
+                    pending_finalized.append(SampleResult(
+                        observation_id=item.observation_id,
+                        interval=item.interval,
+                        proceeds_lamports=None,
+                        error=final_error,
+                        sampled_at_epoch=item.sampled_at_epoch,
+                        quote_latency_ms=item.quote_latency_ms,
+                    ))
+                    logger.warning(
+                        "observation sample failed permanently after lock recovery: "
+                        "mint=%s interval=%s attempts=%s error=%s",
+                        item.mint,
+                        item.interval,
+                        attempts,
+                        final_error,
+                    )
+                if pending_sample_attempts:
+                    await asyncio.sleep(max(
+                        0.0,
+                        interval_seconds - (time.monotonic() - tick_started),
+                    ))
+                    continue
+            if pending_finalized:
+                try:
+                    await asyncio.to_thread(
+                        record_sample_batch, pending_finalized
+                    )
+                except StateLockTimeout:
+                    await publish_state_lock_stall(
+                        "record_sample_batch",
+                        pending_count=(
+                            len(pending_finalized)
+                            + len(pending_sample_attempts)
+                        ),
+                    )
+                    await asyncio.sleep(max(
+                        0.0,
+                        interval_seconds - (time.monotonic() - tick_started),
+                    ))
+                    continue
+                pending_finalized.clear()
+                analysis_dirty = True
+
+            if recovered_attempt_writes:
+                now = time.time()
+                recovered = await _publish_observer_metrics({
+                    "observer_state": "RUNNING",
+                    "observer_health_state": "RUNNING_HEALTHY",
+                    "observer_heartbeat_at": now,
+                    "observer_state_changed_at": now,
+                    "observer_state_lock_operation": None,
+                    "observer_pending_sample_count": 0,
+                })
+                if recovered:
+                    state_lock_stalled = False
+                    last_health_refresh = time.monotonic()
+                await asyncio.sleep(max(
+                    0.0,
+                    interval_seconds - (time.monotonic() - tick_started),
+                ))
+                continue
+
             due_scan_memory_start = current_rss_bytes()
             try:
-                due = await asyncio.to_thread(
-                    due_observation_samples, time.time()
-                )
+                try:
+                    due = await asyncio.to_thread(
+                        due_observation_samples, time.time()
+                    )
+                except StateLockTimeout:
+                    await publish_state_lock_stall(
+                        "due_observation_samples",
+                        pending_count=0,
+                    )
+                    await asyncio.sleep(max(
+                        0.0,
+                        interval_seconds - (time.monotonic() - tick_started),
+                    ))
+                    continue
             finally:
                 record_memory_phase(
                     "observation_due_scan", due_scan_memory_start
@@ -1576,20 +1803,69 @@ async def observation_loop(interval_seconds: float = 15.0) -> None:
             results = await run_due_sample_batch(due, sample_due)
             finalized = [result for result in results if result is not None]
             if finalized:
-                await asyncio.to_thread(record_sample_batch, finalized)
-            analysis_dirty = bool(finalized)
+                pending_finalized.extend(finalized)
+                try:
+                    await asyncio.to_thread(
+                        record_sample_batch, pending_finalized
+                    )
+                except StateLockTimeout:
+                    await publish_state_lock_stall(
+                        "record_sample_batch",
+                        pending_count=(
+                            len(pending_finalized)
+                            + len(pending_sample_attempts)
+                        ),
+                    )
+                    await asyncio.sleep(max(
+                        0.0,
+                        interval_seconds - (time.monotonic() - tick_started),
+                    ))
+                    continue
+                pending_finalized.clear()
+                analysis_dirty = True
+            if pending_sample_attempts:
+                await publish_state_lock_stall(
+                    "record_sample_attempt",
+                    pending_count=len(pending_sample_attempts),
+                )
+                await asyncio.sleep(max(
+                    0.0,
+                    interval_seconds - (time.monotonic() - tick_started),
+                ))
+                continue
             if (
                 analysis_dirty
+                or state_lock_stalled
                 or time.monotonic() - last_health_refresh
                 >= OBSERVER_HEALTH_INTERVAL_SECONDS
             ):
                 now = time.time()
-                await _publish_observer_metrics({
+                try:
+                    runtime_metrics = observation_runtime_metrics()
+                except StateLockTimeout:
+                    await publish_state_lock_stall(
+                        "observation_runtime_metrics",
+                        pending_count=0,
+                    )
+                    await asyncio.sleep(max(
+                        0.0,
+                        interval_seconds - (time.monotonic() - tick_started),
+                    ))
+                    continue
+                health_values: dict[str, Any] = {
                     "observer_state": "RUNNING",
+                    "observer_health_state": "RUNNING_HEALTHY",
                     "observer_heartbeat_at": now,
-                    **observation_runtime_metrics(),
-                })
-                last_health_refresh = time.monotonic()
+                    "observer_pending_sample_count": 0,
+                    **runtime_metrics,
+                }
+                if state_lock_stalled:
+                    health_values["observer_state_changed_at"] = now
+                    health_values["observer_state_lock_operation"] = None
+                recovered = await _publish_observer_metrics(health_values)
+                if recovered:
+                    last_health_refresh = time.monotonic()
+                    state_lock_stalled = False
             await asyncio.sleep(max(
                 0.0,
                 interval_seconds - (time.monotonic() - tick_started),
@@ -1609,6 +1885,7 @@ async def observation_supervisor(
             now = time.time()
             await _publish_observer_metrics({
                 "observer_state": "RESTARTING",
+                "observer_health_state": "RESTARTING",
                 "observer_heartbeat_at": now,
                 "observer_state_changed_at": now,
                 "observer_last_error_at": now,

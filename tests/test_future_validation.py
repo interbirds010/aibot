@@ -1,11 +1,16 @@
 from __future__ import annotations
 
+import asyncio
 import copy
+import io
 import json
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
+from unittest.mock import patch
 
+from src import observation_tracker
 from src.research.alpha_discovery import (
     BUCKET_VERSION,
     SCHEMA_VERSION as ALPHA_DISCOVERY_SCHEMA_VERSION,
@@ -24,9 +29,12 @@ from src.research.future_validation import (
     derive_momentum_features,
     deterministic_hypothesis_id,
     fast_falsification_reasons,
+    main,
     registry_with_evaluation_statuses,
+    validate_boundary_manifest,
     validate_registry,
 )
+from src.research.prospective_features import MomentumSnapshotStore
 from src.state_store import VersionConflict
 
 
@@ -163,10 +171,21 @@ class FutureValidationTests(unittest.TestCase):
             item["hypothesis_id"] == deterministic_hypothesis_id(item)
             for item in first["hypotheses"]
         ))
+        boundary = first["discovery_boundary"]
+        self.assertEqual(boundary["manifest_count"], 1)
+        self.assertEqual(boundary["last_stable_identity"], "DISCOVERY")
+        self.assertEqual(len(boundary["manifest_digest"]), 64)
+        validate_boundary_manifest(first, copy.deepcopy(boundary))
         self.assertTrue(all(
             item["status"] == "READY_FOR_FUTURE_VALIDATION"
             for item in first["hypotheses"]
         ))
+
+    def test_boundary_manifest_tampering_fails_closed(self) -> None:
+        registry = self.registry()
+        registry["discovery_boundary"]["manifest_count"] += 1
+        with self.assertRaisesRegex(RuntimeError, "manifest changed"):
+            validate_registry(registry)
 
     def test_empty_discovery_preregisters_from_creation_time(self) -> None:
         registry = build_hypothesis_registry(
@@ -269,6 +288,27 @@ class FutureValidationTests(unittest.TestCase):
             metrics["first_signal_per_mint"]["eligible_signal_count"], 1
         )
 
+    def test_same_timestamp_is_excluded_regardless_of_stable_identity(self) -> None:
+        registry = build_hypothesis_registry(
+            [row("MIDDLE", "OLD", FROZEN_TS)],
+            created_at=FROZEN_AT,
+            registry_mode="prospective-five",
+        )
+        report = build_future_validation([
+            row("BEFORE-ID", "A", FROZEN_TS),
+            row("MIDDLE", "OLD", FROZEN_TS),
+            row("Z-FUTURE", "Z", FROZEN_TS),
+        ], registry)
+        primary = report["hypotheses"][0]["horizons"]["60m"]["event_level"]
+        self.assertEqual(primary["eligible_signal_count"], 0)
+        self.assertEqual(
+            report["discovery_boundary"]["cutoff_stable_identity"], "MIDDLE"
+        )
+        self.assertIn(
+            "not_event_sequence",
+            report["discovery_boundary"]["manifest_canonicalization"],
+        )
+
     def test_same_event_matches_multiple_hypotheses_and_reuses_outcome(self) -> None:
         registry = self.registry()
         report = build_future_validation([
@@ -279,6 +319,91 @@ class FutureValidationTests(unittest.TestCase):
         )
         self.assertEqual(report["input_summary"]["canonical_outcome_read_count"], 1)
         self.assertEqual(report["input_summary"]["rpc_request_count"], 0)
+
+    def test_prospective_observer_validator_flow_reuses_one_canonical_outcome(self) -> None:
+        registry = self.registry()
+        store = MomentumSnapshotStore()
+        for timestamp, volume, buys, liquidity, price in (
+            (FROZEN_TS + 80, 10_000, 10, 10_000, 1.00),
+            (FROZEN_TS + 140, 11_000, 12, 10_500, 1.01),
+            (FROZEN_TS + 200, 12_000, 15, 11_000, 1.02),
+        ):
+            self.assertTrue(store.record(
+                mint="FLOW-MINT",
+                pair_address="FLOW-PAIR",
+                snapshot_at_epoch=timestamp,
+                volume_m5_usd=volume,
+                buys_m5=buys,
+                sells_m5=8,
+                liquidity_usd=liquidity,
+                price_usd=price,
+            ))
+        collection = store.collection(
+            mint="FLOW-MINT",
+            pair_address="FLOW-PAIR",
+            signal_timestamp=FROZEN_TS + 200,
+        )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            original_path = observation_tracker.OBSERVATION_PATH
+            observation_tracker.OBSERVATION_PATH = (
+                Path(temporary) / "signal_observations.json"
+            )
+            try:
+                created = asyncio.run(observation_tracker.record_observation(
+                    mint="FLOW-MINT",
+                    route_type="B",
+                    source_wallet="WALLET",
+                    source_signature="FLOW",
+                    safety_score=80,
+                    entry_cost_lamports=1_000,
+                    token_amount_raw=500,
+                    token_decimals=6,
+                    entry_price_impact_pct=0.1,
+                    exit_price_impact_pct=0.2,
+                    expected_slippage_bps=100,
+                    dex_momentum_score=90,
+                    signal_detected_at="2026-09-23T00:03:20Z",
+                    analysis_completed_at="2026-09-23T00:03:21Z",
+                    entry_quote_at="2026-09-23T00:03:22Z",
+                    entry_latency_ms=2_000,
+                    momentum_metrics={
+                        "volume_m5_usd": 12_000,
+                        "buys_m5": 15,
+                        "sells_m5": 8,
+                        "net_buys_m5": 7,
+                        "buy_sell_ratio_m5": 1.875,
+                        "liquidity_usd": 11_000,
+                        "pair_age_seconds": 600,
+                        "unknown_whale_count": 3,
+                    },
+                    prospective_feature_collection=collection,
+                ))
+                self.assertTrue(created)
+                with patch.object(observation_tracker, "record_funnel_stage"):
+                    self.assertTrue(observation_tracker.record_sample(
+                        "FLOW:WALLET:FLOW-MINT",
+                        "60m",
+                        proceeds_lamports=1_050,
+                        sampled_at_epoch=FROZEN_TS + 3_800,
+                        quote_latency_ms=100,
+                    ))
+                document = observation_tracker.read_json(
+                    observation_tracker.OBSERVATION_PATH,
+                    observation_tracker.empty_observations(),
+                )
+            finally:
+                observation_tracker.OBSERVATION_PATH = original_path
+
+        self.assertEqual(len(document["observations"]), 1)
+        self.assertEqual(len(document["observations"][0]["samples"]), 1)
+        report = build_future_validation(document["observations"], registry)
+        self.assertEqual(report["input_summary"]["canonical_outcome_read_count"], 1)
+        self.assertEqual(report["input_summary"]["rpc_request_count"], 0)
+        self.assertEqual(
+            report["shared_outcome_summary"]["maximum_hypotheses_per_event"],
+            5,
+        )
 
     def test_first_signal_per_mint_is_selected_before_hypothesis_filter(self) -> None:
         registry = self.registry()
@@ -326,6 +451,7 @@ class FutureValidationTests(unittest.TestCase):
         candidate = report["hypotheses"][0]
         self.assertEqual(candidate["missing_required_feature_count"], 1)
         self.assertEqual(candidate["future_status"], "FUTURE_INSUFFICIENT")
+        self.assertIn("SAMPLE_TOO_SMALL", candidate["falsification_reasons"])
 
     def test_missing_quote_status_is_untrackable_and_positive_cohort_has_no_loss(self) -> None:
         registry = self.registry()
@@ -376,6 +502,46 @@ class FutureValidationTests(unittest.TestCase):
         candidate = report["hypotheses"][0]
         self.assertEqual(candidate["future_status"], "FUTURE_NEGATIVE")
         self.assertIn("NEGATIVE_EXPECTANCY", candidate["falsification_reasons"])
+
+    def test_one_utc_day_is_insufficient_even_with_sixty_outcomes(self) -> None:
+        registry = self.registry()
+        for outcome in (5, -5):
+            rows = [
+                row(
+                    f"DAY-{outcome}-{index}", f"MINT-{index}",
+                    FROZEN_TS + 200 + index * 60, outcome=outcome,
+                )
+                for index in range(60)
+            ]
+            candidate = build_future_validation(rows, registry)["hypotheses"][0]
+            primary = candidate["horizons"]["60m"]["first_signal_per_mint"]
+            self.assertEqual(candidate["future_status"], "FUTURE_INSUFFICIENT")
+            self.assertEqual(primary["completed_utc_day_count"], 1)
+            self.assertEqual(primary["expectancy_percent"] > 0, outcome > 0)
+            self.assertIn(
+                "INSUFFICIENT_CHRONOLOGICAL_COVERAGE",
+                candidate["falsification_reasons"],
+            )
+
+    def test_mixed_positive_and_negative_days_have_actual_negative_evidence(self) -> None:
+        registry = self.registry()
+        rows = [
+            row(
+                f"MIXED-{index}", f"MINT-{index}",
+                FROZEN_TS + 200 + index * 3600,
+                outcome=5 if index < 24 else -10,
+            )
+            for index in range(60)
+        ]
+        candidate = build_future_validation(rows, registry)["hypotheses"][0]
+        primary = candidate["horizons"]["60m"]["first_signal_per_mint"]
+        day_expectancies = [
+            item["expectancy_percent"] for item in primary["utc_day_split"]
+        ]
+        self.assertTrue(any(value > 0 for value in day_expectancies))
+        self.assertTrue(any(value < 0 for value in day_expectancies))
+        self.assertGreaterEqual(primary["completed_utc_day_count"], 2)
+        self.assertEqual(candidate["future_status"], "FUTURE_NEGATIVE")
 
     def test_registry_status_update_is_atomic_and_versioned(self) -> None:
         registry = self.registry()
@@ -472,6 +638,28 @@ class FutureValidationTests(unittest.TestCase):
         self.assertEqual(smart[0]["status"], "READY_FOR_FUTURE_VALIDATION")
         self.assertFalse(registry["automatic_trading_changes"])
 
+    def test_registry_modes_keep_prospective_five_separate_from_alpha_lane(self) -> None:
+        rows = [row("DISCOVERY", "OLD", FROZEN_TS - 100)]
+        prospective = build_hypothesis_registry(
+            rows,
+            alpha_report=alpha_report(),
+            created_at=FROZEN_AT,
+            registry_mode="prospective-five",
+        )
+        self.assertEqual(len(prospective["hypotheses"]), 5)
+        self.assertTrue(all(
+            item["discovery_source"] == "prospective_pre_registered_v1"
+            for item in prospective["hypotheses"]
+        ))
+        alpha = build_hypothesis_registry(
+            rows,
+            alpha_report=alpha_report(),
+            created_at=FROZEN_AT,
+            registry_mode="alpha-promising",
+        )
+        self.assertEqual(len(alpha["hypotheses"]), 1)
+        self.assertEqual(alpha["hypotheses"][0]["family"], "SMART_MONEY")
+
     def test_stale_alpha_contract_is_not_imported(self) -> None:
         alpha = alpha_report()
         alpha["configuration"]["bucket_version"] = "stale"
@@ -510,6 +698,36 @@ class FutureValidationTests(unittest.TestCase):
                     registry_path=source,
                     output_path=Path(temporary) / "report.json",
                 )
+
+    def test_cli_persists_and_revalidates_immutable_prospective_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "observations.json"
+            source.write_text(json.dumps({
+                "schema_version": 5,
+                "observations": [row("DISCOVERY", "OLD", FROZEN_TS - 100)],
+            }), encoding="utf-8")
+            registry_path = root / "registry.json"
+            manifest_path = root / "manifest.json"
+            report_path = root / "report.json"
+            argv = [
+                "--input", str(source),
+                "--alpha", str(root / "missing-alpha.json"),
+                "--registry", str(registry_path),
+                "--manifest", str(manifest_path),
+                "--output", str(report_path),
+                "--registry-mode", "prospective-five",
+            ]
+            with redirect_stdout(io.StringIO()):
+                self.assertEqual(main(argv), 0)
+                registry_path.unlink()
+                self.assertEqual(main(argv), 0)
+                self.assertEqual(main(argv), 0)
+            registry = json.loads(registry_path.read_text(encoding="utf-8"))
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            self.assertEqual(registry["registry_mode"], "prospective-five")
+            self.assertEqual(len(registry["hypotheses"]), 5)
+            self.assertEqual(registry["discovery_boundary"], manifest)
 
 
 if __name__ == "__main__":

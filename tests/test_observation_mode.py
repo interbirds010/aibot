@@ -520,7 +520,31 @@ class ObservationLedgerTests(unittest.TestCase):
         self.assertTrue(all(item[1] == "1m" for item in due))
         self.assertEqual([item[4] for item in due], sorted(item[4] for item in due))
 
-    def test_due_samples_use_deadline_order_not_row_insertion_order(self) -> None:
+    def test_due_scan_uses_validated_snapshot_without_migration_lock(self) -> None:
+        with patch.object(observation_tracker.time, "time", return_value=1_000):
+            self.record()
+
+        with patch.object(
+            observation_tracker,
+            "ensure_observations_migrated",
+            side_effect=AssertionError("due scan must not migrate"),
+        ):
+            due = observation_tracker.due_observation_samples(1_060)
+
+        self.assertEqual(len(due), 1)
+        self.assertEqual(due[0][1], "1m")
+
+    def test_snapshot_read_fails_closed_when_startup_migration_is_missing(self) -> None:
+        legacy = {
+            "schema_version": observation_tracker.OBSERVATION_SCHEMA_VERSION - 1,
+            "observations": [],
+            "version": 1,
+        }
+        with patch.object(observation_tracker, "read_json", return_value=legacy):
+            with self.assertRaisesRegex(RuntimeError, "requires startup migration"):
+                observation_tracker.read_observations_snapshot()
+
+    def test_due_samples_protect_live_window_before_historical_deadline(self) -> None:
         with patch.object(observation_tracker.time, "time", return_value=1_000):
             self.record(mint="NEW", signature="NEW")
         with patch.object(observation_tracker.time, "time", return_value=900):
@@ -528,10 +552,77 @@ class ObservationLedgerTests(unittest.TestCase):
 
         due = observation_tracker.due_observation_samples(1_061)
 
-        self.assertEqual(due[0][2], "OLD")
+        self.assertEqual(due[0][2], "NEW")
         self.assertEqual(due[0][1], "1m")
-        self.assertEqual(due[0][4], 960)
-        self.assertEqual(due[1][2], "NEW")
+        self.assertEqual(due[0][4], 1_060)
+        self.assertEqual(due[1][2], "OLD")
+        self.assertEqual(due[1][4], 960)
+
+    def test_backlog_simulation_preserves_live_samples_and_recovers_fairly(self) -> None:
+        now = 1_000.0
+        historical = [
+            {
+                "observation_id": f"OLD-{index:02d}",
+                "status": "PENDING",
+                "mint": f"OLD-MINT-{index:02d}",
+                "token_amount_raw": 1,
+                "started_at_epoch": 0.0,
+                "samples": [],
+            }
+            for index in range(30)
+        ]
+        live = [
+            {
+                "observation_id": f"LIVE-{index}",
+                "status": "PENDING",
+                "mint": f"LIVE-MINT-{index}",
+                "token_amount_raw": 1,
+                "started_at_epoch": 940.0,
+                "samples": [],
+            }
+            for index in range(4)
+        ]
+        rows = historical + live
+        legacy_batch = observation_tracker._due_sample_candidates(rows, now)[
+            :observation_tracker.OBSERVATION_SAMPLE_BATCH_SIZE
+        ]
+        self.assertFalse(any(item[0].startswith("LIVE-") for item in legacy_batch))
+        self.assertEqual(
+            sum(
+                observation_tracker.horizon_sample_is_missed(now, item[4])
+                for item in legacy_batch
+            ),
+            20,
+        )
+
+        with (
+            patch.object(
+                observation_tracker,
+                "read_observations_snapshot",
+                return_value={"observations": rows},
+            ),
+            patch.object(observation_tracker, "record_funnel_stage"),
+        ):
+            selected = observation_tracker.due_observation_samples(now)
+
+        self.assertEqual(len(selected), 20)
+        self.assertEqual(
+            [item[0] for item in selected[:4]],
+            ["LIVE-0", "LIVE-1", "LIVE-2", "LIVE-3"],
+        )
+        recovered = selected[4:]
+        self.assertEqual(len({item[0] for item in recovered}), 16)
+        self.assertEqual(
+            sum(
+                not observation_tracker.horizon_sample_is_missed(now, item[4])
+                for item in selected
+            ),
+            4,
+        )
+        self.assertTrue(all(
+            observation_tracker.horizon_sample_is_missed(now, item[4])
+            for item in recovered
+        ))
 
     def test_due_samples_include_multiple_overdue_horizons_for_one_row(self) -> None:
         with patch.object(observation_tracker.time, "time", return_value=1_000):
@@ -1863,6 +1954,136 @@ class ObservationRuntimeHealthTests(unittest.TestCase):
         self.assertEqual(committed[3].error, "retry later")
         self.assertEqual(observation_tracker.OBSERVATION_SAMPLE_BATCH_SIZE, 20)
         self.assertEqual(observation_tracker.OBSERVATION_SAMPLE_CONCURRENCY, 4)
+
+    def test_observation_loop_retries_locked_writes_without_duplicate_rpc(self) -> None:
+        class RecoveryComplete(RuntimeError):
+            pass
+
+        committed: list[observation_tracker.SampleResult] = []
+        commit_calls = 0
+        published: list[dict] = []
+        stalled_seen = False
+
+        def commit(results: list[observation_tracker.SampleResult]) -> int:
+            nonlocal commit_calls
+            commit_calls += 1
+            if commit_calls == 1:
+                raise state_store.StateLockTimeout("observation ledger busy")
+            committed.extend(list(results))
+            return len(results)
+
+        async def publish(metrics: dict) -> None:
+            nonlocal stalled_seen
+            published.append(dict(metrics))
+            if metrics.get("observer_health_state") == "RUNNING_STALLED":
+                stalled_seen = True
+            if (
+                stalled_seen
+                and metrics.get("observer_health_state") == "RUNNING_HEALTHY"
+            ):
+                raise RecoveryComplete
+
+        due = Mock(return_value=[
+            ("ID", "1m", "MINT", 1, 950.0),
+            ("RETRY-ID", "1m", "RETRY-MINT", 1, 950.0),
+        ])
+
+        async def quote_result(_session, _key, mint, *_args, **_kwargs):
+            if mint == "MINT":
+                return {"outAmount": "1100"}
+            raise RuntimeError("quote unavailable")
+
+        quote = AsyncMock(side_effect=quote_result)
+        attempt = Mock(side_effect=[
+            state_store.StateLockTimeout("observation ledger busy"),
+            1,
+        ])
+
+        async def run() -> None:
+            with (
+                patch.object(
+                    observation_tracker,
+                    "ensure_observations_migrated",
+                    return_value={"observations": []},
+                ),
+                patch.object(
+                    observation_tracker,
+                    "reconcile_interrupted_discoveries",
+                    return_value=0,
+                ),
+                patch(
+                    "src.shadow_trade_ledger.current_shadow_trade_ids",
+                    return_value=set(),
+                ),
+                patch(
+                    "src.shadow_trade_ledger.backfill_completed_shadow_trades",
+                    return_value=0,
+                ),
+                patch(
+                    "src.research_archive.backfill_research_archive",
+                    return_value={},
+                ),
+                patch(
+                    "src.research_archive.archive_integrity_metrics",
+                    return_value={},
+                ),
+                patch.object(
+                    observation_tracker,
+                    "_publish_observer_metrics",
+                    new=publish,
+                ),
+                patch.object(observation_tracker, "load_dotenv"),
+                patch.object(observation_tracker.os, "getenv", return_value="KEY"),
+                patch.object(observation_tracker.time, "time", return_value=1_000.0),
+                patch.object(
+                    observation_tracker,
+                    "due_observation_samples",
+                    new=due,
+                ),
+                patch.object(observation_tracker, "record_memory_phase"),
+                patch.object(
+                    observation_tracker,
+                    "record_sample_batch",
+                    side_effect=commit,
+                ),
+                patch.object(
+                    observation_tracker,
+                    "record_sample_attempt",
+                    new=attempt,
+                ),
+                patch.object(executor, "jupiter_quote", new=quote),
+            ):
+                with self.assertRaises(RecoveryComplete):
+                    await observation_tracker.observation_loop(interval_seconds=0)
+
+        asyncio.run(run())
+        self.assertEqual(commit_calls, 2)
+        self.assertEqual(due.call_count, 1)
+        self.assertEqual(quote.await_count, 2)
+        self.assertEqual(
+            [call.args[2] for call in quote.await_args_list],
+            ["MINT", "RETRY-MINT"],
+        )
+        self.assertEqual(attempt.call_count, 2)
+        self.assertEqual(
+            [(item.observation_id, item.proceeds_lamports) for item in committed],
+            [("ID", 1_100)],
+        )
+        stalled = [
+            metrics for metrics in published
+            if metrics.get("observer_health_state") == "RUNNING_STALLED"
+        ]
+        self.assertEqual(len(stalled), 1)
+        self.assertEqual(stalled[0]["observer_state"], "RUNNING")
+        self.assertEqual(stalled[0]["observer_pending_sample_count"], 2)
+        self.assertEqual(
+            stalled[0]["observer_state_lock_operation"],
+            "record_sample_batch",
+        )
+        self.assertTrue(any(
+            metrics.get("observer_health_state") == "RUNNING_HEALTHY"
+            for metrics in published[published.index(stalled[0]) + 1:]
+        ))
 
     def test_observation_startup_validates_shadow_before_archive(self) -> None:
         archive = Mock()
