@@ -133,6 +133,7 @@ class DeployWorkflowTests(unittest.TestCase):
         self.assertIn("src.research.monitor_memory_profile", workflow)
         self.assertIn("src.research.memory_workload_diagnostic", workflow)
         self.assertIn("src.research.alpha_review", workflow)
+        self.assertIn("src.research.future_validation", workflow)
         self.assertIn("python -m src.observation_analysis", workflow)
         self.assertNotIn('sleep "$OBSERVATION_SECONDS"', workflow)
         self.assertIn("src.research.restart_forensics", workflow)
