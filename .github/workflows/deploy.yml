@@ -640,253 +640,85 @@ jobs:
             print(f"RPC_CONFIG providers={names}")
             PY
 
-            ./venv/bin/python -m src.research.alpha_discovery
+            ./venv/bin/python -m src.research.future_validation \
+              --registry-mode prospective-five
             ./venv/bin/python - <<'PY'
             import json
-            from pathlib import Path
-
-            report = json.loads(
-                Path("data/alpha_discovery.json").read_text(encoding="utf-8")
-            )
-            if report.get("automatic_trading_changes") is not False:
-                raise SystemExit("Alpha report trading-change guard failed")
-            source = report.get("input_summary", {})
-            if source.get("source_type") != "research_archive":
-                raise SystemExit("Alpha report is not using Research archive")
-            if source.get("cohort") != "research_v1_60m":
-                raise SystemExit("Alpha report cohort isolation failed")
-            print(
-                "ALPHA_SOURCE "
-                f"type={source.get('source_type')} "
-                f"path={source.get('source_path')} "
-                f"archive_rows={source.get('source_row_count')} "
-                f"cohort={source.get('cohort')} "
-                f"cohort_rows={source.get('cohort_row_count')}"
-            )
-            for family in ("SMART_MONEY", "MOMENTUM"):
-                summary = report["families"][family]["summary"]
-                primary = summary["event_primary_outcome"]
-                print(
-                    "ALPHA_FAMILY "
-                    f"name={family} signals={summary['event_signal_count']} "
-                    f"unique_mints={summary['unique_mint_count']} "
-                    f"trackable_60m={primary['trackable_count']} "
-                    f"sampled_60m={primary['sampled_count']}"
-                )
-            counts = report["candidate_counts"]
-            print(
-                "ALPHA_CANDIDATES "
-                f"promising={counts['PROMISING']} "
-                f"unstable={counts['UNSTABLE']} "
-                f"insufficient={counts['INSUFFICIENT_DATA']}"
-            )
-            PY
-
-            # 일반 배포는 실제 signal을 기다리지 않고 구조 상태만 즉시 확인한다.
-            ./venv/bin/python -m src.research.collection_stability
-            ./venv/bin/python - "$DEPLOY_SHA" <<'PY'
-            import json
-            import subprocess
-            import sys
-            import time
             from collections import Counter
             from pathlib import Path
 
-            from src.research_archive import archive_integrity_metrics
-            from src.solana_rpc import provider_configs_from_env, provider_state
+            from src.research.future_validation import (
+                validate_boundary_manifest,
+                validate_registry,
+            )
 
-            deploy_sha = sys.argv[1]
-            backup_root = Path("/home/deploy/aibot-backups")
-            marker = backup_root / f"latest-{deploy_sha}.txt"
-            backup_dir = Path(marker.read_text(encoding="utf-8").strip())
+            registry = json.loads(
+                Path("data/hypothesis_registry.json").read_text(encoding="utf-8")
+            )
+            report = json.loads(
+                Path("data/future_validation.json").read_text(encoding="utf-8")
+            )
             manifest = json.loads(
-                (backup_dir / "manifest.json").read_text(encoding="utf-8")
-            )
-            since_epoch = float(manifest["created_at_epoch"])
-            observations = json.loads(
-                Path("data/signal_observations.json").read_text(encoding="utf-8")
-            )
-            rows = observations.get("observations")
-            if not isinstance(rows, list):
-                raise SystemExit("signal observation rows are malformed")
-            archive = archive_integrity_metrics(operational_rows=rows)
-            print(
-                "RESEARCH_ARCHIVE "
-                f"total={archive['archive_total_rows']} "
-                f"research_v1={archive['cohort_row_count']} "
-                f"recent={archive['archived_recent_interval']} "
-                f"research_recent={archive['research_v1_signals_recent_interval']} "
-                f"duplicates={archive['duplicate_prevented_count']} "
-                f"write_failures={archive['archive_write_failure_count']} "
-                f"unarchived={archive['unarchived_completed_rows_count']} "
-                f"bytes={archive['archive_total_bytes']} "
-                f"average_row_bytes={archive['average_archive_row_bytes']} "
-                f"last_success={archive['last_archive_success']} "
-                f"last_failure={archive['last_archive_failure']}"
-            )
-            if archive["unarchived_completed_rows_count"]:
-                raise SystemExit("completed Research rows remain unarchived")
-            new_rows = [
-                row for row in rows
-                if isinstance(row, dict)
-                and float(row.get("started_at_epoch", 0) or 0) >= since_epoch
-            ]
-
-            def reasons(row):
-                values = row.get("decision_reasons")
-                return {
-                    str(value).upper()
-                    for value in values if isinstance(value, str)
-                } if isinstance(values, list) else set()
-
-            analyzer_success = sum(
-                1 for row in new_rows
-                if row.get("analysis_completed_at")
-                and str(row.get("decision_status") or "").upper()
-                != "DISCOVERED"
-            )
-            all_exhausted = sum(
-                "RPC_ALL_PROVIDERS_EXHAUSTED" in reasons(row)
-                for row in new_rows
-            )
-            processing_failed = sum(
-                str(row.get("quote_status") or "").upper()
-                == "PROCESSING_FAILED"
-                for row in new_rows
-            )
-            executable = sum(
-                str(row.get("quote_status") or "").upper() == "EXECUTABLE"
-                for row in new_rows
-            )
-            pending_trackable = sum(
-                str(row.get("quote_status") or "").upper() == "EXECUTABLE"
-                and str(row.get("status") or "").upper() == "PENDING"
-                and row.get("tracking_profile") == "research_v1_60m"
-                for row in new_rows
-            )
-            sample_counts = Counter(
-                str(sample.get("interval"))
-                for row in new_rows
-                for sample in (
-                    row.get("samples") if isinstance(row.get("samples"), list)
-                    else []
+                Path("data/future_validation_manifest.json").read_text(
+                    encoding="utf-8"
                 )
-                if isinstance(sample, dict)
             )
-            print(
-                "RESEARCH_FUNNEL "
-                f"signals={len(new_rows)} analyzer_success={analyzer_success} "
-                f"rpc_all_providers_exhausted={all_exhausted} "
-                f"processing_failed={processing_failed} "
-                f"executable={executable} "
-                f"pending_trackable={pending_trackable}"
-            )
-            print(
-                "RESEARCH_HORIZONS "
-                f"sample_1m={sample_counts['1m']} "
-                f"sample_3m={sample_counts['3m']} "
-                f"sample_5m={sample_counts['5m']} "
-                f"first_executable_pending={pending_trackable > 0}"
-            )
-
-            stranded = [
-                row for row in rows
-                if isinstance(row, dict)
-                and str(row.get("status") or "").upper() == "DISCOVERED"
-                and str(row.get("decision_status") or "").upper() == "DISCOVERED"
-                and str(row.get("quote_status") or "").upper() == "NOT_REQUESTED"
-            ]
-            ages = [
-                max(0.0, time.time() - float(row.get("started_at_epoch", 0) or 0))
-                for row in stranded
-                if float(row.get("started_at_epoch", 0) or 0) > 0
-            ]
-            print(
-                "STRANDED_DISCOVERED "
-                f"count={len(stranded)} "
-                f"missing_analysis_completed={sum(not row.get('analysis_completed_at') for row in stranded)} "
-                f"empty_decision_reasons={sum(not row.get('decision_reasons') for row in stranded)} "
-                f"oldest_age_seconds={max(ages) if ages else None} "
-                f"newest_age_seconds={min(ages) if ages else None}"
-            )
-
-            providers = provider_configs_from_env()
-            baseline_states = manifest.get("rpc_provider_states", {})
-            for provider in providers:
-                state = provider_state(provider.name, providers)
-                baseline = baseline_states.get(provider.name, {})
-                print(
-                    "RPC_PROVIDER_DELTA "
-                    f"provider={provider.name} enabled={state['enabled']} "
-                    f"requests={state['request_count']} "
-                    f"successes={state['success_count']} "
-                    f"failures={state['failure_count']} "
-                    f"rate_limits={state['rate_limit_count']} "
-                    f"request_delta={int(state['request_count']) - int(baseline.get('request_count', 0) or 0)} "
-                    f"success_delta={int(state['success_count']) - int(baseline.get('success_count', 0) or 0)} "
-                    f"failure_delta={int(state['failure_count']) - int(baseline.get('failure_count', 0) or 0)} "
-                    f"rate_limit_delta={int(state['rate_limit_count']) - int(baseline.get('rate_limit_count', 0) or 0)} "
-                    f"circuit={state['circuit_state']} "
-                    f"last_success={state['last_success_at_epoch']}"
+            validate_registry(registry)
+            validate_boundary_manifest(registry, manifest)
+            hypotheses = registry.get("hypotheses", [])
+            if (
+                registry.get("registry_mode") != "prospective-five"
+                or len(hypotheses) != 5
+                or any(
+                    item.get("family") != "MOMENTUM"
+                    or item.get("discovery_source")
+                    != "prospective_pre_registered_v1"
+                    for item in hypotheses
                 )
-
-            metrics_document = json.loads(
-                Path("data/global_metrics.json").read_text(encoding="utf-8")
+            ):
+                raise SystemExit("prospective H1-H5 registry contract failed")
+            if (
+                report.get("registry_mode") != "prospective-five"
+                or report.get("hypothesis_count") != 5
+                or report.get("discovery_boundary") != manifest
+            ):
+                raise SystemExit("future validation report provenance failed")
+            statuses = Counter(
+                str(item.get("status") or "UNKNOWN") for item in hypotheses
             )
-            metrics = metrics_document.get("metrics", {})
-            ws_heartbeat = metrics.get("monitor_process_heartbeat_at")
             print(
-                "COLLECTION_HEALTH "
-                f"wallet_ws_state={metrics.get('wallet_ws_state')} "
-                f"monitor_heartbeat_age_seconds="
-                f"{time.time() - ws_heartbeat if isinstance(ws_heartbeat, (int, float)) else None} "
-                f"observer_state={metrics.get('observer_state')}"
+                "FUTURE_H1_H5 "
+                f"count={len(hypotheses)} "
+                f"mode={registry.get('registry_mode')} "
+                f"cutoff={manifest.get('discovery_data_end')} "
+                f"manifest_count={manifest.get('manifest_count')} "
+                f"manifest_digest={manifest.get('manifest_digest')} "
+                f"statuses={dict(sorted(statuses.items()))}"
             )
 
-            alpha = json.loads(
-                Path("data/alpha_discovery.json").read_text(encoding="utf-8")
+            paper = json.loads(
+                Path("data/paper_trades.json").read_text(encoding="utf-8")
             )
-            candidate_fields = {
-                "family", "analysis_type", "labels", "status",
-                "sampled_count", "trackable_coverage_rate_percent",
-                "train_expectancy_percent", "holdout_expectancy_percent",
-                "train_profit_factor", "holdout_profit_factor",
-                "holdout_expectancy_retention_ratio",
-            }
-            top_candidates = alpha.get("top_candidates")
-            top_candidates = top_candidates if isinstance(top_candidates, list) else []
-            missing_top_fields = sorted({
-                field
-                for candidate in top_candidates
-                if isinstance(candidate, dict)
-                for field in candidate_fields - set(candidate)
-            })
+            events = paper.get("events")
+            if not isinstance(events, list):
+                raise SystemExit("paper ledger events are malformed")
+            sequences = [
+                int(item["event_seq"]) for item in events
+                if isinstance(item, dict) and item.get("event_seq") is not None
+            ]
+            if sequences != sorted(sequences) or len(sequences) != len(set(sequences)):
+                raise SystemExit("paper ledger event sequence is invalid")
+            event_types = Counter(
+                str(item.get("type") or "UNKNOWN") for item in events
+                if isinstance(item, dict)
+            )
             print(
-                "ALPHA_DASHBOARD_READINESS "
-                f"families={isinstance(alpha.get('families'), dict)} "
-                f"candidate_counts={isinstance(alpha.get('candidate_counts'), dict)} "
-                f"top_candidates={isinstance(alpha.get('top_candidates'), list)} "
-                f"missing_top_fields={','.join(missing_top_fields) or 'NONE'} "
-                f"has_flat_unstable_candidates="
-                f"{isinstance(alpha.get('unstable_candidates'), list)}"
+                "PAPER_LEDGER "
+                f"buys={event_types['BUY']} sells={event_types['SELL']} "
+                f"positions={len(paper.get('positions', {}))} "
+                f"next_event_seq={paper.get('next_event_seq')}"
             )
-
-            apps = json.loads(subprocess.check_output(["pm2", "jlist"]))
-            wanted = {
-                "aibot-monitor", "aibot-risk-manager",
-                "aibot-dashboard", "wallet_feeder",
-            }
-            for app in apps:
-                if app.get("name") not in wanted:
-                    continue
-                env = app.get("pm2_env", {})
-                print(
-                    "PM2_DELAYED_HEALTH "
-                    f"name={app.get('name')} status={env.get('status')} "
-                    f"pid={app.get('pid')} restarts={env.get('restart_time', 0)}"
-                )
             PY
-
             upstream_status="$(curl --silent --show-error --output /dev/null \
               --write-out '%{http_code}' http://127.0.0.1:8501/ai-bot/)"
             test "$upstream_status" = "200"
