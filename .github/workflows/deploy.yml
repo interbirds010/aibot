@@ -631,100 +631,13 @@ jobs:
             PY
 
             ./venv/bin/python - <<'PY'
-            import asyncio
+            from src.solana_rpc import provider_configs_from_env
 
-            import aiohttp
-
-            from src.solana_rpc import (
-                canonical_rpc_failure_reason,
-                provider_configs_from_env,
-                provider_state,
-                solana_rpc_call,
-            )
-
-            async def main():
-                providers = provider_configs_from_env()
-                names = ",".join(provider.name for provider in providers)
-                print(f"RPC_ACTIVE_PROVIDERS names={names or 'NONE'}")
-                timeout = aiohttp.ClientTimeout(total=10)
-                async with aiohttp.ClientSession(timeout=timeout) as session:
-                    for provider in providers:
-                        outcome = "SUCCESS"
-                        reason = "NONE"
-                        try:
-                            await solana_rpc_call(
-                                session,
-                                "getHealth",
-                                [],
-                                workload="deployment_smoke",
-                                providers=[provider],
-                                provider_local_attempts=1,
-                                overall_attempt_budget=1,
-                            )
-                        except Exception as exc:
-                            outcome = "FAILURE"
-                            reason = (
-                                canonical_rpc_failure_reason(exc)
-                                or type(exc).__name__
-                            )
-                        state = provider_state(provider.name, providers)
-                        print(
-                            "RPC_PROVIDER_SMOKE "
-                            f"provider={provider.name} enabled={state['enabled']} "
-                            f"outcome={outcome} reason={reason} "
-                            f"requests={state['request_count']} "
-                            f"successes={state['success_count']} "
-                            f"failures={state['failure_count']} "
-                            f"rate_limits={state['rate_limit_count']} "
-                            f"success_rate={state['success_rate_percent']} "
-                            f"consecutive_failures={state['consecutive_failures']} "
-                            f"circuit_opens={state['circuit_open_count']} "
-                            f"circuit={state['circuit_state']} "
-                            f"last_success={state['last_success_at_epoch']} "
-                            f"last_failure={state['last_failure_at_epoch']} "
-                            f"last_failure_category={state['last_failure_category']}"
-                        )
-
-                    before = {
-                        provider.name: int(
-                            provider_state(provider.name, providers).get(
-                                "success_count", 0
-                            ) or 0
-                        )
-                        for provider in providers
-                    }
-                    result = "SUCCESS"
-                    reason = "NONE"
-                    try:
-                        await solana_rpc_call(
-                            session,
-                            "getHealth",
-                            [],
-                            workload="deployment_smoke",
-                            providers=providers,
-                        )
-                    except Exception as exc:
-                        result = "FAILURE"
-                        reason = (
-                            canonical_rpc_failure_reason(exc)
-                            or type(exc).__name__
-                        )
-                    winners = [
-                        provider.name
-                        for provider in providers
-                        if int(
-                            provider_state(provider.name, providers).get(
-                                "success_count", 0
-                            ) or 0
-                        ) > before[provider.name]
-                    ]
-                    print(
-                        "RPC_ROUTER_SMOKE "
-                        f"outcome={result} reason={reason} "
-                        f"successful_provider={','.join(winners) or 'NONE'}"
-                    )
-
-            asyncio.run(main())
+            providers = provider_configs_from_env()
+            names = ",".join(provider.name for provider in providers)
+            if not providers:
+                raise SystemExit("no Solana RPC provider is configured")
+            print(f"RPC_CONFIG providers={names}")
             PY
 
             ./venv/bin/python -m src.research.alpha_discovery

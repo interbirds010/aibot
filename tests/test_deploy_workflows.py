@@ -23,7 +23,8 @@ class DeployWorkflowTests(unittest.TestCase):
         )
         self.assertNotIn("sleep 360", workflow)
         self.assertIn("src.research.collection_stability", workflow)
-        self.assertIn("RPC_ROUTER_SMOKE", workflow)
+        self.assertIn("RPC_CONFIG providers=", workflow)
+        self.assertNotIn('workload="deployment_smoke"', workflow)
 
     def test_monitor_memory_ceiling_remains_unchanged(self) -> None:
         ecosystem = (ROOT / "ecosystem.config.js").read_text(encoding="utf-8")
