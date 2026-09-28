@@ -103,6 +103,10 @@ class DeployWorkflowTests(unittest.TestCase):
             "- name: Back up ledgers and prepare deploy ownership", 1
         )[1].split("- name: Upload application source", 1)[0]
         self.assertIn("command_timeout: 10m", backup)
+        install = workflow.split(
+            "- name: Install, validate, and reload PM2 services", 1
+        )[1].split("- name: Post Check out main", 1)[0]
+        self.assertIn("command_timeout: 20m", install)
         self.assertIn("timeout-minutes: 30", workflow)
 
     def test_backup_integrity_semantics_remain(self) -> None:
