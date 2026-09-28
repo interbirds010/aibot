@@ -142,7 +142,44 @@ class DeployWorkflowTests(unittest.TestCase):
         self.assertIn('- "tests/test_deploy_contract.py"', workflow)
         self.assertIn('- "tests/test_deploy_workflows.py"', workflow)
         self.assertIn('- "tests/test_pm2_topology_check.py"', workflow)
-        self.assertIn("if: github.ref == 'refs/heads/main'", workflow)
+        self.assertIn("github.ref == 'refs/heads/main'", workflow)
+
+    def test_changed_path_classifier_is_unprivileged_and_gates_deploy(self) -> None:
+        workflow = (ROOT / ".github" / "workflows" / "deploy.yml").read_text(
+            encoding="utf-8"
+        )
+        classifier = workflow.split("  classify:\n", 1)[1].split(
+            "\n  deploy:\n", 1
+        )[0]
+        deploy = workflow.split("\n  deploy:\n", 1)[1]
+
+        self.assertIn("fetch-depth: 0", classifier)
+        self.assertIn("github.event.before", classifier)
+        self.assertIn("--classify-push", classifier)
+        self.assertNotIn("environment:", classifier)
+        self.assertNotIn("secrets.", classifier)
+        self.assertNotIn("appleboy/", classifier)
+
+        self.assertIn("needs: classify", deploy)
+        self.assertIn("always()", deploy)
+        self.assertIn("needs.classify.result != 'success'", deploy)
+        self.assertIn("needs.classify.outputs.deploy == 'true'", deploy)
+        self.assertIn("github.event_name == 'workflow_dispatch'", deploy)
+        self.assertIn("environment: production", deploy)
+
+    def test_production_upload_excludes_known_non_runtime_paths(self) -> None:
+        workflow = (ROOT / ".github" / "workflows" / "deploy.yml").read_text(
+            encoding="utf-8"
+        )
+        upload = workflow.split("- name: Upload application source", 1)[1].split(
+            "- name: Install, validate, and reload PM2 services", 1
+        )[0]
+        self.assertIn(
+            'source: "src,requirements.txt,ecosystem.config.js,scripts"',
+            upload,
+        )
+        self.assertNotIn("tests", upload)
+        self.assertNotIn("docs", upload)
 
     def test_normal_deploy_requires_explicit_retention_intent(self) -> None:
         workflow = (ROOT / ".github" / "workflows" / "deploy.yml").read_text(

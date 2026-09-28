@@ -34,9 +34,48 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  classify:
+    name: Classify deploy trigger
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    outputs:
+      deploy: ${{ steps.trigger.outputs.deploy || 'true' }}
+      trigger_reason: ${{ steps.trigger.outputs.trigger_reason || 'resolver_unknown' }}
+
+    steps:
+      - name: Check out push history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve changed-path deploy trigger
+        id: trigger
+        shell: bash
+        env:
+          BEFORE_SHA: ${{ github.event.before }}
+          AFTER_SHA: ${{ github.sha }}
+        run: |
+          set -Eeuo pipefail
+          trigger="$(
+            python scripts/deploy_contract.py \
+              --classify-push \
+              --before-sha "$BEFORE_SHA" \
+              --after-sha "$AFTER_SHA"
+          )"
+          printf '%s\n' "$trigger" >> "$GITHUB_OUTPUT"
+          printf 'DEPLOY_TRIGGER %s\n' "$(tr '\n' ' ' <<<"$trigger")"
+
   deploy:
     name: Deploy to Ubuntu
-    if: github.ref == 'refs/heads/main'
+    needs: classify
+    if: >-
+      always() &&
+      github.ref == 'refs/heads/main' &&
+      (
+        github.event_name == 'workflow_dispatch' ||
+        needs.classify.result != 'success' ||
+        needs.classify.outputs.deploy == 'true'
+      )
     runs-on: ubuntu-latest
     environment: production
     timeout-minutes: 30
