@@ -95,7 +95,7 @@ class DeployWorkflowTests(unittest.TestCase):
             self.assertIn(path, workflow)
         self.assertIn("stat -c '%U:%G'", workflow)
 
-    def test_backup_timeout_is_bounded_without_changing_job_timeout(self) -> None:
+    def test_backup_and_job_timeouts_cover_bounded_observer_startup(self) -> None:
         workflow = (ROOT / ".github" / "workflows" / "deploy.yml").read_text(
             encoding="utf-8"
         )
@@ -103,7 +103,7 @@ class DeployWorkflowTests(unittest.TestCase):
             "- name: Back up ledgers and prepare deploy ownership", 1
         )[1].split("- name: Upload application source", 1)[0]
         self.assertIn("command_timeout: 5m", backup)
-        self.assertIn("timeout-minutes: 15", workflow)
+        self.assertIn("timeout-minutes: 30", workflow)
 
     def test_backup_integrity_semantics_remain(self) -> None:
         workflow = (ROOT / ".github" / "workflows" / "deploy.yml").read_text(
@@ -239,13 +239,16 @@ class ObserverHealthGateTests(unittest.TestCase):
         clock = FakeClock()
         with self.assertRaisesRegex(
             ObserverHealthGateError,
-            r"STARTING timed out:.*waited_seconds=120\.0.*last_error_type=StateLockTimeout",
+            r"STARTING timed out:.*waited_seconds=600\.0.*last_error_type=StateLockTimeout",
         ):
             self.run_gate([self.metrics("STARTING", heartbeat=800.0)], clock)
 
         self.assertEqual(sum(clock.sleeps), MAX_ADDITIONAL_WAIT_SECONDS)
-        self.assertEqual(clock.sleeps, [POLL_INTERVAL_SECONDS] * 24)
-        self.assertEqual(clock.read_count, 25)
+        expected_polls = int(
+            MAX_ADDITIONAL_WAIT_SECONDS / POLL_INTERVAL_SECONDS
+        )
+        self.assertEqual(clock.sleeps, [POLL_INTERVAL_SECONDS] * expected_polls)
+        self.assertEqual(clock.read_count, expected_polls + 1)
 
     def test_restarting_fails_immediately(self) -> None:
         clock = FakeClock()
