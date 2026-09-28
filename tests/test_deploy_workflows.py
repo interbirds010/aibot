@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import ast
 import re
+import textwrap
 import unittest
 from pathlib import Path
 
@@ -42,7 +44,7 @@ class DeployWorkflowTests(unittest.TestCase):
             encoding="utf-8"
         )
         gate = "metrics = wait_for_observer_health(read_observer_metrics)"
-        marker = 'printf \'%s\\n\' "$DEPLOY_SHA" > .deployed-sha.tmp'
+        marker = "--success-marker .deployed-sha"
         self.assertIn(gate, workflow)
         self.assertLess(workflow.index(gate), workflow.index(marker))
 
@@ -130,16 +132,186 @@ class DeployWorkflowTests(unittest.TestCase):
             self.assertIn(invariant, backup)
         self.assertIn('RESEARCH_STATE_RESTORED name={name}', workflow)
 
-    def test_storage_retention_runs_only_after_success_gates(self) -> None:
+    def test_deploy_contract_change_does_not_trigger_production(self) -> None:
         workflow = (ROOT / ".github" / "workflows" / "deploy.yml").read_text(
             encoding="utf-8"
         )
+        self.assertIn('paths-ignore:', workflow)
+        self.assertIn('- ".github/workflows/deploy.yml"', workflow)
+        self.assertIn('- "scripts/deploy_contract.py"', workflow)
+        self.assertIn('- "tests/test_deploy_contract.py"', workflow)
+        self.assertIn('- "tests/test_deploy_workflows.py"', workflow)
+        self.assertIn('- "tests/test_pm2_topology_check.py"', workflow)
+        self.assertIn("if: github.ref == 'refs/heads/main'", workflow)
+
+    def test_normal_deploy_requires_explicit_retention_intent(self) -> None:
+        workflow = (ROOT / ".github" / "workflows" / "deploy.yml").read_text(
+            encoding="utf-8"
+        )
+        resolver = (ROOT / "scripts" / "deploy_contract.py").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("default: false", workflow)
+        self.assertIn("python scripts/deploy_contract.py", workflow)
+        self.assertIn('or "false"', resolver)
+        self.assertIn(
+            "push deploy requires a Deploy-Mode trailer", resolver
+        )
+        self.assertIn('"$DEPLOY_MODE" == "normal" && \\', workflow)
+        self.assertIn('"$RETENTION_ENABLED" == "true"', workflow)
+        self.assertEqual(workflow.count("scripts/storage_retention.py"), 1)
+
+    def test_health_failure_cannot_reach_retention_or_marker(self) -> None:
+        workflow = (ROOT / ".github" / "workflows" / "deploy.yml").read_text(
+            encoding="utf-8"
+        )
+        gate = "metrics = wait_for_observer_health(read_observer_metrics)"
         retention = "scripts/storage_retention.py"
-        self.assertEqual(workflow.count(retention), 1)
+        marker = "--success-marker .deployed-sha"
+        self.assertIn("set -Eeuo pipefail", workflow)
+        self.assertLess(workflow.index(gate), workflow.index(retention))
+        self.assertLess(workflow.index(gate), workflow.index(marker))
         self.assertLess(workflow.index("JUPITER_POSITION_HEALTH=OK"), workflow.index(retention))
-        self.assertLess(workflow.index(retention), workflow.index(".deployed-sha.tmp"))
-        self.assertIn("--legacy-temp-min-age-seconds 600", workflow)
-        self.assertIn("--keep-backups 3", workflow)
+
+    def test_diagnostic_mode_hard_disables_retention(self) -> None:
+        workflow = (ROOT / ".github" / "workflows" / "deploy.yml").read_text(
+            encoding="utf-8"
+        )
+        resolver = (ROOT / "scripts" / "deploy_contract.py").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn('- diagnostic', workflow)
+        self.assertIn('diagnostic deploy cannot enable retention', resolver)
+        self.assertIn('RETENTION_SKIPPED mode=$DEPLOY_MODE', workflow)
+        retention_block = workflow.split(
+            'if [[ "$DEPLOY_MODE" == "normal" &&', 1
+        )[1].split("fi", 1)[0]
+        self.assertNotIn(
+            '"$DEPLOY_MODE" == "diagnostic"', retention_block
+        )
+
+    def test_diagnostic_mode_has_no_production_tmp_cleanup(self) -> None:
+        workflow = (ROOT / ".github" / "workflows" / "deploy.yml").read_text(
+            encoding="utf-8"
+        )
+        self.assertNotIn("/tmp/aibot-pm2-before.json", workflow)
+        self.assertNotIn("/tmp/aibot-pm2-after.json", workflow)
+        self.assertNotRegex(workflow, re.compile(r"(?m)^\s*rm\s"))
+        self.assertNotRegex(workflow, re.compile(r"find\b[^\n]*-delete"))
+        self.assertNotIn("shutil.rmtree", workflow)
+        self.assertNotRegex(workflow, re.compile(r"\.unlink\s*\("))
+        self.assertIn('DIAGNOSTIC_SKIP maintenance=research_archive', workflow)
+        self.assertIn('DIAGNOSTIC_SKIP maintenance=research_state_restore', workflow)
+        self.assertIn('DIAGNOSTIC_SKIP maintenance=future_validation', workflow)
+        self.assertIn('DIAGNOSTIC_SKIP maintenance=nginx_reconfigure', workflow)
+        self.assertIn('DIAGNOSTIC_SKIP maintenance=pm2_reset', workflow)
+        self.assertIn('DIAGNOSTIC_SKIP maintenance=pm2_save', workflow)
+        normal_maintenance = workflow.split(
+            'if [[ "$DEPLOY_MODE" == "normal" ]]; then', 4
+        )[4].split("else", 1)[0]
+        self.assertIn("pm2 save", normal_maintenance)
+
+    def test_projected_disk_gate_is_fail_closed_before_backup(self) -> None:
+        workflow = (ROOT / ".github" / "workflows" / "deploy.yml").read_text(
+            encoding="utf-8"
+        )
+        disk_gate = 'if projected_percent >= 90.0:'
+        backup = 'backup_dir="$backup_root/predeploy-'
+        upload = '- name: Upload application source'
+        reload = 'pm2 startOrReload ecosystem.config.js --update-env'
+        self.assertIn('projected_available < 512 * 1024 * 1024', workflow)
+        self.assertIn('metadata.st_blocks * 512', workflow)
+        self.assertIn('PREDEPLOY_DISK_GATE', workflow)
+        self.assertLess(workflow.index(disk_gate), workflow.index(backup))
+        self.assertLess(workflow.index(disk_gate), workflow.index(upload))
+        self.assertLess(workflow.index(disk_gate), workflow.index(reload))
+
+    def test_projected_disk_gate_enforces_boundaries(self) -> None:
+        workflow = (ROOT / ".github" / "workflows" / "deploy.yml").read_text(
+            encoding="utf-8"
+        )
+        lines = workflow.splitlines()
+        start = next(
+            index for index, line in enumerate(lines) if "python3 - <<'PY'" in line
+        )
+        end = next(
+            index
+            for index in range(start + 1, len(lines))
+            if lines[index].strip() == "PY"
+        )
+        module = ast.parse(textwrap.dedent("\n".join(lines[start + 1 : end])))
+        projection = next(
+            node
+            for node in module.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "require_safe_projection"
+        )
+        namespace: dict[str, object] = {}
+        exec(compile(ast.Module([projection], []), "disk-gate", "exec"), namespace)
+        require_safe_projection = namespace["require_safe_projection"]
+
+        gib = 1024**3
+        self.assertEqual(require_safe_projection(7 * gib, 3 * gib, 0)[1], 70.0)
+        with self.assertRaisesRegex(SystemExit, "90% safety gate"):
+            require_safe_projection(8 * gib, 2 * gib, 1 * gib)
+        with self.assertRaisesRegex(SystemExit, "90% safety gate"):
+            require_safe_projection(8 * gib, 2 * gib, 2 * gib)
+        with self.assertRaisesRegex(SystemExit, "below 512MiB"):
+            require_safe_projection(1 * gib, 600 * 1024**2, 100 * 1024**2)
+        with self.assertRaisesRegex(SystemExit, "no usable bytes"):
+            require_safe_projection(0, 0, 0)
+
+    def test_success_marker_is_atomic_last_and_preserves_failure_marker(self) -> None:
+        workflow = (ROOT / ".github" / "workflows" / "deploy.yml").read_text(
+            encoding="utf-8"
+        )
+        marker = "--success-marker .deployed-sha"
+        self.assertEqual(workflow.count(marker), 1)
+        self.assertLess(workflow.index("JUPITER_POSITION_HEALTH=OK"), workflow.index(marker))
+        self.assertLess(workflow.index("scripts/storage_retention.py"), workflow.index(marker))
+        self.assertIn("NO_AUTOMATIC_ROLLBACK=true", workflow)
+        self.assertIn("LAST_SUCCESSFUL_DEPLOY_SHA=", workflow)
+        tail = workflow.split(marker, 1)[1]
+        self.assertNotIn("exit 1", tail)
+        self.assertNotIn("scripts/storage_retention.py", tail)
+
+    def test_diagnostic_mode_keeps_one_backup_reload_and_health_gate(self) -> None:
+        workflow = (ROOT / ".github" / "workflows" / "deploy.yml").read_text(
+            encoding="utf-8"
+        )
+        self.assertEqual(workflow.count('backup_dir="$backup_root/predeploy-'), 1)
+        self.assertEqual(
+            workflow.count("pm2 startOrReload ecosystem.config.js --update-env"),
+            1,
+        )
+        self.assertEqual(
+            workflow.count("metrics = wait_for_observer_health(read_observer_metrics)"),
+            1,
+        )
+        self.assertIn('automatic_rollback=false', workflow)
+
+    def test_embedded_python_blocks_compile(self) -> None:
+        workflow = (ROOT / ".github" / "workflows" / "deploy.yml").read_text(
+            encoding="utf-8"
+        )
+        lines = workflow.splitlines()
+        blocks: list[str] = []
+        index = 0
+        while index < len(lines):
+            if "<<'PY'" not in lines[index]:
+                index += 1
+                continue
+            block: list[str] = []
+            index += 1
+            while index < len(lines) and lines[index].strip() != "PY":
+                block.append(lines[index])
+                index += 1
+            self.assertLess(index, len(lines), "unterminated Python heredoc")
+            blocks.append(textwrap.dedent("\n".join(block)))
+            index += 1
+        self.assertGreater(len(blocks), 5)
+        for sequence, block in enumerate(blocks):
+            compile(block, f"deploy.yml:python-heredoc-{sequence}", "exec")
 
     def test_extended_observation_is_manual_and_bounded(self) -> None:
         workflow = (

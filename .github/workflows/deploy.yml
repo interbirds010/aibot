@@ -4,6 +4,27 @@ on:
   push:
     branches:
       - main
+    paths-ignore:
+      - ".github/workflows/deploy.yml"
+      - "scripts/deploy_contract.py"
+      - "tests/test_deploy_contract.py"
+      - "tests/test_deploy_workflows.py"
+      - "tests/test_pm2_topology_check.py"
+  workflow_dispatch:
+    inputs:
+      deploy_mode:
+        description: Production deploy mode
+        required: true
+        type: choice
+        default: normal
+        options:
+          - normal
+          - diagnostic
+      retention_enabled:
+        description: Allow post-health retention in normal mode
+        required: true
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -15,6 +36,7 @@ concurrency:
 jobs:
   deploy:
     name: Deploy to Ubuntu
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     environment: production
     timeout-minutes: 30
@@ -23,6 +45,25 @@ jobs:
       - name: Check out main
         uses: actions/checkout@v4
 
+      - name: Resolve explicit deploy contract
+        id: deploy_contract
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_DEPLOY_MODE: ${{ inputs.deploy_mode }}
+          INPUT_RETENTION_ENABLED: ${{ inputs.retention_enabled }}
+        run: |
+          set -Eeuo pipefail
+          contract="$(
+            git log -1 --format=%B | python scripts/deploy_contract.py \
+              --event-name "$EVENT_NAME" \
+              --input-mode "$INPUT_DEPLOY_MODE" \
+              --input-retention-enabled "$INPUT_RETENTION_ENABLED"
+          )"
+          printf '%s\n' "$contract" >> "$GITHUB_OUTPUT"
+          printf 'DEPLOY_CONTRACT %s automatic_rollback=false\n' \
+            "$(tr '\n' ' ' <<<"$contract")"
+
       # No fingerprint input is supplied: appleboy connects without pinning the
       # server host key, as required for this password-only deployment.
       - name: Back up ledgers and prepare deploy ownership
@@ -30,6 +71,8 @@ jobs:
         env:
           SUDO_PASSWORD: ${{ secrets.SSH_PASSWORD }}
           DEPLOY_SHA: ${{ github.sha }}
+          DEPLOY_MODE: ${{ steps.deploy_contract.outputs.deploy_mode }}
+          RETENTION_ENABLED: ${{ steps.deploy_contract.outputs.retention_enabled }}
         with:
           host: ${{ secrets.SSH_HOST }}
           username: deploy
@@ -37,13 +80,78 @@ jobs:
           port: 22
           timeout: 30s
           command_timeout: 10m
-          envs: SUDO_PASSWORD,DEPLOY_SHA
+          envs: SUDO_PASSWORD,DEPLOY_SHA,DEPLOY_MODE,RETENTION_ENABLED
           script: |
             set -Eeuo pipefail
 
             printf '%s\n' "$SUDO_PASSWORD" | sudo -S -p '' true
 
-            if sudo test -d /root/.pm2; then
+            python3 - <<'PY'
+            import os
+            from pathlib import Path
+
+            data_root = Path("/var/www/aibot/data")
+            names = (
+                "signal_observations.json",
+                "shadow_trades.json",
+                "paper_trades.json",
+                "wallet_performance.json",
+                "global_metrics.json",
+                "research_archive_metrics.json",
+                "hypothesis_registry.json",
+                "future_validation.json",
+                "future_validation_manifest.json",
+            )
+            def allocated_bytes(path):
+                metadata = path.stat()
+                return max(metadata.st_size, metadata.st_blocks * 512)
+
+            def require_safe_projection(used_bytes, available_bytes, expected_bytes):
+                usable_bytes = used_bytes + available_bytes
+                if usable_bytes <= 0:
+                    raise SystemExit("root filesystem has no usable bytes")
+                projected_used = used_bytes + expected_bytes
+                projected_available = available_bytes - expected_bytes
+                projected_percent = 100.0 * projected_used / usable_bytes
+                if projected_percent >= 90.0:
+                    raise SystemExit(
+                        "projected root usage reaches the 90% safety gate"
+                    )
+                if projected_available < 512 * 1024 * 1024:
+                    raise SystemExit(
+                        "projected root headroom is below 512MiB"
+                    )
+                return projected_available, projected_percent
+
+            expected_bytes = sum(
+                allocated_bytes(path)
+                for name in names
+                if (path := data_root / name).is_file()
+            )
+            archive_root = data_root / "research_archive" / "records"
+            if archive_root.is_dir():
+                expected_bytes += sum(
+                    allocated_bytes(path)
+                    for path in archive_root.glob("*/*.json")
+                    if path.is_file()
+                )
+            expected_bytes += 1024 * 1024
+
+            disk = os.statvfs("/")
+            used_bytes = (disk.f_blocks - disk.f_bfree) * disk.f_frsize
+            available_bytes = disk.f_bavail * disk.f_frsize
+            projected_available, projected_percent = require_safe_projection(
+                used_bytes, available_bytes, expected_bytes
+            )
+            print(
+                "PREDEPLOY_DISK_GATE "
+                f"used_bytes={used_bytes} available_bytes={available_bytes} "
+                f"expected_backup_bytes={expected_bytes} "
+                f"projected_percent={projected_percent:.3f}"
+            )
+            PY
+
+            if [[ "$DEPLOY_MODE" == "normal" ]] && sudo test -d /root/.pm2; then
               sudo env PM2_HOME=/root/.pm2 pm2 delete \
                 aibot-monitor aibot-risk-manager aibot-dashboard wallet_feeder || true
               sudo env PM2_HOME=/root/.pm2 pm2 save --force || true
@@ -289,6 +397,8 @@ jobs:
         env:
           SUDO_PASSWORD: ${{ secrets.SSH_PASSWORD }}
           DEPLOY_SHA: ${{ github.sha }}
+          DEPLOY_MODE: ${{ steps.deploy_contract.outputs.deploy_mode }}
+          RETENTION_ENABLED: ${{ steps.deploy_contract.outputs.retention_enabled }}
         with:
           host: ${{ secrets.SSH_HOST }}
           username: deploy
@@ -296,7 +406,7 @@ jobs:
           port: 22
           timeout: 30s
           command_timeout: 20m
-          envs: SUDO_PASSWORD,DEPLOY_SHA
+          envs: SUDO_PASSWORD,DEPLOY_SHA,DEPLOY_MODE,RETENTION_ENABLED
           script: |
             set -Eeuo pipefail
 
@@ -321,7 +431,19 @@ jobs:
 
             mkdir -p data logs
 
+            last_successful_sha="MISSING"
+            if [[ -f .deployed-sha ]]; then
+              last_successful_sha="$(tr -d '[:space:]' < .deployed-sha)"
+            fi
+            echo "ACTIVE_SOURCE_SHA=$DEPLOY_SHA"
+            echo "LAST_SUCCESSFUL_DEPLOY_SHA=$last_successful_sha"
+            echo "NO_AUTOMATIC_ROLLBACK=true"
+
             if [[ ! -x ./venv/bin/python ]]; then
+              if [[ "$DEPLOY_MODE" == "diagnostic" ]]; then
+                echo "diagnostic deploy requires the existing production venv" >&2
+                exit 1
+              fi
               echo "Existing venv not found; creating /var/www/aibot/venv"
               python3 -m venv venv
             fi
@@ -331,17 +453,25 @@ jobs:
               exit 1
             fi
 
-            PIP_NO_CACHE_DIR=1 ./venv/bin/python -m pip install \
-              --disable-pip-version-check \
-              --only-binary=:all: \
-              -r requirements.txt
+            if [[ "$DEPLOY_MODE" == "normal" ]]; then
+              PIP_NO_CACHE_DIR=1 ./venv/bin/python -m pip install \
+                --disable-pip-version-check \
+                --only-binary=:all: \
+                -r requirements.txt
+            else
+              echo "DIAGNOSTIC_SKIP maintenance=dependency_install"
+            fi
 
             ./venv/bin/python -m compileall -q src
             ./venv/bin/python -c \
               "import fcntl; from src.state_store import exclusive_file_lock; print('fcntl/state_store: OK')"
             export PM2_HOME=/home/deploy/.pm2
             ./venv/bin/python scripts/pm2_topology_check.py --phase preflight
-            ./venv/bin/python -m src.research_archive
+            if [[ "$DEPLOY_MODE" == "normal" ]]; then
+              ./venv/bin/python -m src.research_archive
+            else
+              echo "DIAGNOSTIC_SKIP maintenance=research_archive"
+            fi
 
             pm2 startOrReload ecosystem.config.js --update-env
 
@@ -371,69 +501,43 @@ jobs:
               fi
             done
 
+            pm2_snapshot() {
+              ./venv/bin/python - <<'PY'
+            import json
+            import subprocess
+
+            apps = json.loads(subprocess.check_output(["pm2", "jlist"]))
+            selected = {}
+            for app in apps:
+                name = app.get("name")
+                if name in {
+                    "aibot-monitor",
+                    "aibot-risk-manager",
+                    "aibot-dashboard",
+                    "wallet_feeder",
+                }:
+                    env = app.get("pm2_env", {})
+                    selected[name] = {
+                        "status": env.get("status"),
+                        "pid": app.get("pid"),
+                        "restart_time": env.get("restart_time", 0),
+                    }
+            print(json.dumps(selected, sort_keys=True, separators=(",", ":")))
+            PY
+            }
+
             sleep 20
-            ./venv/bin/python - /tmp/aibot-pm2-before.json <<'PY'
-            import json
-            import subprocess
-            import sys
-            from pathlib import Path
-
-            apps = json.loads(subprocess.check_output(["pm2", "jlist"]))
-            selected = {}
-            for app in apps:
-                name = app.get("name")
-                if name in {
-                    "aibot-monitor",
-                    "aibot-risk-manager",
-                    "aibot-dashboard",
-                    "wallet_feeder",
-                }:
-                    env = app.get("pm2_env", {})
-                    selected[name] = {
-                        "status": env.get("status"),
-                        "pid": app.get("pid"),
-                        "restart_time": env.get("restart_time", 0),
-                    }
-            Path(sys.argv[1]).write_text(json.dumps(selected), encoding="utf-8")
-            PY
-
+            pm2_before="$(pm2_snapshot)"
             sleep 10
-            ./venv/bin/python - /tmp/aibot-pm2-after.json <<'PY'
-            import json
-            import subprocess
-            import sys
-            from pathlib import Path
-
-            apps = json.loads(subprocess.check_output(["pm2", "jlist"]))
-            selected = {}
-            for app in apps:
-                name = app.get("name")
-                if name in {
-                    "aibot-monitor",
-                    "aibot-risk-manager",
-                    "aibot-dashboard",
-                    "wallet_feeder",
-                }:
-                    env = app.get("pm2_env", {})
-                    selected[name] = {
-                        "status": env.get("status"),
-                        "pid": app.get("pid"),
-                        "restart_time": env.get("restart_time", 0),
-                    }
-            Path(sys.argv[1]).write_text(json.dumps(selected), encoding="utf-8")
-            PY
+            pm2_after="$(pm2_snapshot)"
 
             ./venv/bin/python scripts/pm2_topology_check.py --phase poststart
-            ./venv/bin/python - <<'PY'
+            ./venv/bin/python - "$pm2_before" "$pm2_after" <<'PY'
             import json
-            from pathlib import Path
+            import sys
 
-            before = json.loads(
-                Path("/tmp/aibot-pm2-before.json").read_text(encoding="utf-8")
-            )
-            after = json.loads(
-                Path("/tmp/aibot-pm2-after.json").read_text(encoding="utf-8")
-            )
+            before = json.loads(sys.argv[1])
+            after = json.loads(sys.argv[2])
             core = (
                 "aibot-monitor",
                 "aibot-risk-manager",
@@ -460,7 +564,6 @@ jobs:
                 f"restarts={feeder.get('restart_time')}"
             )
             PY
-            rm -f /tmp/aibot-pm2-before.json /tmp/aibot-pm2-after.json
 
             verification_failed=0
             for app in aibot-monitor aibot-risk-manager aibot-dashboard; do
@@ -475,7 +578,7 @@ jobs:
 
             test "$verification_failed" -eq 0
 
-            ./venv/bin/python - "$DEPLOY_SHA" <<'PY'
+            ./venv/bin/python - "$DEPLOY_SHA" "$DEPLOY_MODE" <<'PY'
             import fcntl
             import hashlib
             import json
@@ -491,6 +594,7 @@ jobs:
             )
 
             deploy_sha = sys.argv[1]
+            deploy_mode = sys.argv[2]
             backup_root = Path("/home/deploy/aibot-backups")
             marker = backup_root / f"latest-{deploy_sha}.txt"
             backup_dir = Path(marker.read_text(encoding="utf-8").strip())
@@ -539,35 +643,42 @@ jobs:
                     raise SystemExit(f"production ledger malformed: {name}")
                 current[name] = document
 
-            for name in (
-                "hypothesis_registry.json",
-                "future_validation.json",
-                "future_validation_manifest.json",
-            ):
-                backup_item = manifest["files"].get(name, {})
-                if not backup_item.get("exists"):
-                    continue
-                live_path = data / name
-                lock_path = live_path.with_name(f"{live_path.name}.lock")
-                with lock_path.open("a+b") as lock:
-                    fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
-                    try:
-                        if not live_path.exists():
-                            payload = (backup_dir / name).read_bytes()
-                            with tempfile.NamedTemporaryFile(
-                                "wb", dir=live_path.parent, delete=False
-                            ) as output:
-                                temporary = Path(output.name)
-                                output.write(payload)
-                                output.flush()
-                                os.fsync(output.fileno())
-                            os.replace(temporary, live_path)
-                        document = json.loads(live_path.read_text(encoding="utf-8"))
-                        if not isinstance(document, dict):
-                            raise SystemExit(f"research state malformed: {name}")
-                    finally:
-                        fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
-                print(f"RESEARCH_STATE_RESTORED name={name}")
+            if deploy_mode == "normal":
+                for name in (
+                    "hypothesis_registry.json",
+                    "future_validation.json",
+                    "future_validation_manifest.json",
+                ):
+                    backup_item = manifest["files"].get(name, {})
+                    if not backup_item.get("exists"):
+                        continue
+                    live_path = data / name
+                    lock_path = live_path.with_name(f"{live_path.name}.lock")
+                    with lock_path.open("a+b") as lock:
+                        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+                        try:
+                            if not live_path.exists():
+                                payload = (backup_dir / name).read_bytes()
+                                with tempfile.NamedTemporaryFile(
+                                    "wb", dir=live_path.parent, delete=False
+                                ) as output:
+                                    temporary = Path(output.name)
+                                    output.write(payload)
+                                    output.flush()
+                                    os.fsync(output.fileno())
+                                os.replace(temporary, live_path)
+                            document = json.loads(
+                                live_path.read_text(encoding="utf-8")
+                            )
+                            if not isinstance(document, dict):
+                                raise SystemExit(
+                                    f"research state malformed: {name}"
+                                )
+                        finally:
+                            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+                    print(f"RESEARCH_STATE_RESTORED name={name}")
+            else:
+                print("DIAGNOSTIC_SKIP maintenance=research_state_restore")
 
             observations = current["signal_observations.json"]
             if observations.get("schema_version") != 5:
@@ -640,9 +751,10 @@ jobs:
             print(f"RPC_CONFIG providers={names}")
             PY
 
-            ./venv/bin/python -m src.research.future_validation \
-              --registry-mode prospective-five
-            ./venv/bin/python - <<'PY'
+            if [[ "$DEPLOY_MODE" == "normal" ]]; then
+              ./venv/bin/python -m src.research.future_validation \
+                --registry-mode prospective-five
+              ./venv/bin/python - <<'PY'
             import json
             from collections import Counter
             from pathlib import Path
@@ -695,6 +807,15 @@ jobs:
                 f"manifest_digest={manifest.get('manifest_digest')} "
                 f"statuses={dict(sorted(statuses.items()))}"
             )
+            PY
+            else
+              echo "DIAGNOSTIC_SKIP maintenance=future_validation"
+            fi
+
+            ./venv/bin/python - <<'PY'
+            import json
+            from collections import Counter
+            from pathlib import Path
 
             paper = json.loads(
                 Path("data/paper_trades.json").read_text(encoding="utf-8")
@@ -723,13 +844,18 @@ jobs:
               --write-out '%{http_code}' http://127.0.0.1:8501/ai-bot/)"
             test "$upstream_status" = "200"
 
-            printf '%s\n' "$SUDO_PASSWORD" | \
-              sudo -S -p '' bash ./scripts/configure_nginx_aibot.sh
-
-            pm2 reset aibot-monitor
-            pm2 reset aibot-risk-manager
-            pm2 reset aibot-dashboard
-            pm2 save
+            if [[ "$DEPLOY_MODE" == "normal" ]]; then
+              printf '%s\n' "$SUDO_PASSWORD" | \
+                sudo -S -p '' bash ./scripts/configure_nginx_aibot.sh
+              pm2 reset aibot-monitor
+              pm2 reset aibot-risk-manager
+              pm2 reset aibot-dashboard
+              pm2 save
+            else
+              echo "DIAGNOSTIC_SKIP maintenance=nginx_reconfigure"
+              echo "DIAGNOSTIC_SKIP maintenance=pm2_reset"
+              echo "DIAGNOSTIC_SKIP maintenance=pm2_save"
+            fi
             pm2 status
 
             echo "Recent aibot-risk-manager logs:"
@@ -764,11 +890,17 @@ jobs:
             print("JUPITER_POSITION_HEALTH=OK")
             PY
 
-            ./venv/bin/python scripts/storage_retention.py \
-              --data-root data \
-              --legacy-temp-min-age-seconds 600 \
-              --backup-root /home/deploy/aibot-backups \
-              --keep-backups 3
-            printf '%s\n' "$DEPLOY_SHA" > .deployed-sha.tmp
-            mv .deployed-sha.tmp .deployed-sha
+            if [[ "$DEPLOY_MODE" == "normal" && \
+                  "$RETENTION_ENABLED" == "true" ]]; then
+              ./venv/bin/python scripts/storage_retention.py \
+                --data-root data \
+                --legacy-temp-min-age-seconds 600 \
+                --backup-root /home/deploy/aibot-backups \
+                --keep-backups 3
+            else
+              echo "RETENTION_SKIPPED mode=$DEPLOY_MODE enabled=$RETENTION_ENABLED"
+            fi
+            ./venv/bin/python scripts/deploy_contract.py \
+              --success-marker .deployed-sha \
+              --deploy-sha "$DEPLOY_SHA"
             echo "DEPLOYED_SHA=$DEPLOY_SHA"

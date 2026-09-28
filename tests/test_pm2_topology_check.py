@@ -245,7 +245,7 @@ class WorkflowOrderingTests(unittest.TestCase):
         start = "pm2 startOrReload ecosystem.config.js --update-env"
         poststart = "scripts/pm2_topology_check.py --phase poststart"
         save = "pm2 save"
-        marker = 'printf \'%s\\n\' "$DEPLOY_SHA" > .deployed-sha.tmp'
+        marker = "--success-marker .deployed-sha"
         self.assertLess(workflow.index(preflight), workflow.index(start))
         self.assertLess(workflow.index(start), workflow.index(poststart))
         self.assertLess(workflow.index(poststart), workflow.rindex(save))
