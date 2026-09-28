@@ -763,6 +763,11 @@ jobs:
             print("JUPITER_POSITION_HEALTH=OK")
             PY
 
+            ./venv/bin/python scripts/storage_retention.py \
+              --data-root data \
+              --legacy-temp-min-age-seconds 600 \
+              --backup-root /home/deploy/aibot-backups \
+              --keep-backups 3
             printf '%s\n' "$DEPLOY_SHA" > .deployed-sha.tmp
             mv .deployed-sha.tmp .deployed-sha
             echo "DEPLOYED_SHA=$DEPLOY_SHA"

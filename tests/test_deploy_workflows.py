@@ -126,6 +126,17 @@ class DeployWorkflowTests(unittest.TestCase):
             self.assertIn(invariant, backup)
         self.assertIn('RESEARCH_STATE_RESTORED name={name}', workflow)
 
+    def test_storage_retention_runs_only_after_success_gates(self) -> None:
+        workflow = (ROOT / ".github" / "workflows" / "deploy.yml").read_text(
+            encoding="utf-8"
+        )
+        retention = "scripts/storage_retention.py"
+        self.assertEqual(workflow.count(retention), 1)
+        self.assertLess(workflow.index("JUPITER_POSITION_HEALTH=OK"), workflow.index(retention))
+        self.assertLess(workflow.index(retention), workflow.index(".deployed-sha.tmp"))
+        self.assertIn("--legacy-temp-min-age-seconds 600", workflow)
+        self.assertIn("--keep-backups 3", workflow)
+
     def test_extended_observation_is_manual_and_bounded(self) -> None:
         workflow = (
             ROOT / ".github" / "workflows" / "research-observation.yml"

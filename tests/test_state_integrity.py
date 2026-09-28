@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import multiprocessing
+import os
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -25,6 +27,26 @@ class AtomicStateStoreTests(unittest.TestCase):
 
             self.assertFalse(target.exists())
             self.assertEqual(list(root.iterdir()), [])
+
+    def test_write_removes_only_stale_target_scoped_temporary_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target = root / "state.json"
+            stale = root / ".state.json.abandoned.tmp"
+            fresh = root / ".state.json.inflight.tmp"
+            unrelated = root / ".other.json.abandoned.tmp"
+            for path in (stale, fresh, unrelated):
+                path.write_text("temporary", encoding="utf-8")
+            old = time.time() - (7 * 60 * 60)
+            os.utime(stale, (old, old))
+            os.utime(unrelated, (old, old))
+
+            state_store.atomic_write_json(target, {"value": 1})
+
+            self.assertFalse(stale.exists())
+            self.assertTrue(fresh.exists())
+            self.assertTrue(unrelated.exists())
+            self.assertEqual(state_store.read_json(target, {}), {"value": 1})
 
 
 def competing_exit_worker(

@@ -121,11 +121,34 @@ def atomic_write_json(
             pass
 
     path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_prefix = f".{path.name}."
+    temporary_suffix = ".tmp"
+    stale_before = time.time() - (6 * 60 * 60)
+    for candidate in path.parent.glob(f"{temporary_prefix}*{temporary_suffix}"):
+        try:
+            candidate_stat = candidate.lstat()
+            if (
+                candidate.is_symlink()
+                or not candidate.is_file()
+                or candidate_stat.st_mtime > stale_before
+            ):
+                continue
+            candidate.unlink()
+        except FileNotFoundError:
+            continue
+        except OSError:
+            # Cleanup failure must not block the canonical state write.
+            continue
     temporary: str | None = None
     serialized_size = 0
     try:
         with tempfile.NamedTemporaryFile(
-            "w", encoding="utf-8", dir=path.parent, delete=False
+            "w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=temporary_prefix,
+            suffix=temporary_suffix,
+            delete=False,
         ) as file:
             temporary = file.name
             # Compact encoding shortens fsync and therefore the cross-process
