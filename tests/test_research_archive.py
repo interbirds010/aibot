@@ -115,7 +115,7 @@ class ResearchArchiveTests(unittest.TestCase):
         self.assertEqual({row["observation_id"] for row in rows}, {"OPS", "SHADOW"})
         self.assertEqual(stats["archive_total_rows"], 2)
 
-    def test_archive_survives_operational_trim(self) -> None:
+    def test_unarchived_terminal_survives_pure_operational_trim(self) -> None:
         observation_path = self.root / "signal_observations.json"
         old_path = observation_tracker.OBSERVATION_PATH
         observation_tracker.OBSERVATION_PATH = observation_path
@@ -123,32 +123,24 @@ class ResearchArchiveTests(unittest.TestCase):
             rows = [terminal_row("OLD"), terminal_row("NEW")]
             with patch.object(observation_tracker, "MAX_OBSERVATIONS", 1):
                 retained = observation_tracker.archive_and_retain_observations(rows)
-            self.assertEqual([row["observation_id"] for row in retained], ["NEW"])
-            archived, stats = research_archive.load_research_archive(
-                archive_path=self.archive,
+            self.assertEqual(
+                [row["observation_id"] for row in retained],
+                ["OLD", "NEW"],
             )
-            self.assertEqual({row["observation_id"] for row in archived}, {"OLD", "NEW"})
-            self.assertEqual(stats["archive_total_rows"], 2)
+            self.assertFalse(self.archive.exists())
         finally:
             observation_tracker.OBSERVATION_PATH = old_path
 
-    def test_archive_failure_keeps_terminal_row_outside_cap(self) -> None:
+    def test_unmarked_terminal_rows_remain_outside_cap(self) -> None:
         observation_path = self.root / "signal_observations.json"
         old_path = observation_tracker.OBSERVATION_PATH
         observation_tracker.OBSERVATION_PATH = observation_path
         try:
             rows = [terminal_row("OLD"), terminal_row("NEW")]
-            with patch.object(
-                observation_tracker, "MAX_OBSERVATIONS", 1
-            ), patch(
-                "src.research_archive.archive_terminal_rows",
-            ) as archive_rows:
-                archive_rows.side_effect = lambda rows, **kwargs: {
-                    "eligible": len(list(rows)), "archived": 0,
-                    "duplicate": 0, "failed": 2,
-                }
+            with patch.object(observation_tracker, "MAX_OBSERVATIONS", 1):
                 retained = observation_tracker.archive_and_retain_observations(rows)
             self.assertEqual(len(retained), 2)
+            self.assertFalse(self.archive.exists())
         finally:
             observation_tracker.OBSERVATION_PATH = old_path
 

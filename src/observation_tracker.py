@@ -51,6 +51,9 @@ MAX_SAMPLE_ATTEMPTS = 3
 MAX_HORIZON_SAMPLE_LAG_SECONDS = 60.0
 OBSERVER_HEALTH_INTERVAL_SECONDS = 60.0
 OBSERVER_RESTART_DELAY_SECONDS = 30.0
+# 1GB VPS에서 archive 파일 I/O가 sampling을 압박하지 않도록 cycle당 제한한다.
+ARCHIVE_DRAIN_BATCH_SIZE = 100
+ARCHIVE_DRAIN_INTERVAL_SECONDS = OBSERVER_HEALTH_INTERVAL_SECONDS
 DISCOVERY_RECONCILIATION_GRACE_SECONDS = 3_600.0
 DISCOVERY_PROCESSING_INTERRUPTED = "DISCOVERY_PROCESSING_INTERRUPTED"
 OBSERVATION_SCHEMA_VERSION = 5
@@ -59,6 +62,19 @@ CANDIDATE_V2_MIN_SCORE = 90.0
 CANDIDATE_V2_MAX_SCORE = 100.0
 CANDIDATE_V2_MINT_COOLDOWN_SECONDS = 86_400.0
 CANDIDATE_V2_EARLY_FAILURE_PERCENT = -10.0
+
+_archive_maintenance_task: asyncio.Task[None] | None = None
+_archive_maintenance_completed_at: float | None = None
+_archive_maintenance_last_error_type: str | None = None
+
+
+def _runtime_observer_health_state() -> str:
+    """현재 process의 startup maintenance 상태를 health에 반영한다."""
+    if _archive_maintenance_completed_at is not None:
+        return "RUNNING_HEALTHY"
+    if _archive_maintenance_last_error_type is not None:
+        return "RUNNING_MAINTENANCE_RETRYING"
+    return "RUNNING_STARTING"
 
 
 def required_observation_intervals(row: dict[str, Any]) -> set[str]:
@@ -457,39 +473,7 @@ def retained_observations(rows: list[Any]) -> list[Any]:
 
 
 def archive_and_retain_observations(rows: list[Any]) -> list[Any]:
-    """terminal row를 먼저 보존하고 operational ledger를 제한한다."""
-    from src.research_archive import archive_terminal_rows
-
-    archive_path = OBSERVATION_PATH.parent / "research_archive"
-    metrics_path = OBSERVATION_PATH.parent / "research_archive_metrics.json"
-    with phase_memory(
-        "archive_write",
-        metadata={
-            "workload": "observation",
-            "operation": "archive",
-            "row_count": len(rows),
-        },
-        include_gc_counts=True,
-        include_object_count=True,
-    ) as archive_scope:
-        archive_result = archive_terminal_rows(
-            (
-                row for row in rows
-                if isinstance(row, dict)
-                and not (
-                    row.get("archive_schema_version") == 1
-                    and row.get("archived_at")
-                )
-            ),
-            archive_path=archive_path,
-            metrics_path=metrics_path,
-        )
-        archive_scope.add_metadata(
-            candidate_count=archive_result["eligible"],
-            archive_count=archive_result["archived"],
-            duplicate_count=archive_result["duplicate"],
-            failure_count=archive_result["failed"],
-        )
+    """파일 I/O 없이 operational cap을 적용하고 미보존 terminal은 유지한다."""
     with phase_memory(
         "archive_retention_projection",
         metadata={
@@ -501,7 +485,8 @@ def archive_and_retain_observations(rows: list[Any]) -> list[Any]:
         unarchived_ids = {
             id(row) for row in rows
             if isinstance(row, dict)
-            and str(row.get("status") or "").upper() in TERMINAL_OBSERVATION_STATUSES
+            and str(row.get("status") or "").upper()
+            in TERMINAL_OBSERVATION_STATUSES
             and not (
                 row.get("archive_schema_version") == 1
                 and row.get("archived_at")
@@ -520,6 +505,91 @@ def archive_and_retain_observations(rows: list[Any]) -> list[Any]:
             row for row in rows
             if id(row) in kept_ids or id(row) in unarchived_ids
         ]
+
+
+def _unarchived_terminal_snapshots() -> list[dict[str, Any]]:
+    """배경 archive용 bounded snapshot을 operational 원장과 분리한다."""
+    document = read_json(OBSERVATION_PATH, empty_observations())
+    rows = document.get("observations", [])
+    if not isinstance(rows, list):
+        raise RuntimeError("signal observation rows are malformed")
+    return [
+        dict(row) for row in rows
+        if isinstance(row, dict)
+        and str(row.get("status") or "").upper() in TERMINAL_OBSERVATION_STATUSES
+        and not (
+            row.get("archive_schema_version") == 1
+            and row.get("archived_at")
+        )
+    ][:ARCHIVE_DRAIN_BATCH_SIZE]
+
+
+def _persist_archive_markers(snapshots: list[dict[str, Any]]) -> int:
+    """성공한 archive marker만 fresh document에 반영하고 보존 한도를 적용한다."""
+    markers = {
+        str(row.get("observation_id") or ""): str(row.get("archived_at") or "")
+        for row in snapshots
+        if row.get("archive_schema_version") == 1
+        and row.get("archived_at")
+        and str(row.get("observation_id") or "")
+    }
+    if not markers:
+        return 0
+
+    def mutate(document: dict[str, Any]) -> int:
+        migrate_observation_document(document)
+        persisted = 0
+        rows = document.get("observations", [])
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            archived_at = markers.get(str(row.get("observation_id") or ""))
+            if not archived_at:
+                continue
+            row["archive_schema_version"] = 1
+            row["archived_at"] = archived_at
+            persisted += 1
+        document["observations"] = archive_and_retain_observations(rows)
+        document["updated_at"] = datetime.now(timezone.utc).isoformat()
+        return persisted
+
+    persisted, _ = update_json(
+        OBSERVATION_PATH, empty_observations(), mutate
+    )
+    return int(persisted)
+
+
+def drain_research_archive() -> dict[str, int]:
+    """bounded snapshot을 원장 락 밖에서 archive하고 marker를 짧게 반영한다."""
+    from src.research_archive import archive_terminal_rows
+
+    snapshots = _unarchived_terminal_snapshots()
+    with phase_memory(
+        "archive_write",
+        metadata={
+            "workload": "observation",
+            "operation": "archive",
+            "row_count": len(snapshots),
+        },
+        include_gc_counts=True,
+        include_object_count=True,
+    ) as archive_scope:
+        result = archive_terminal_rows(
+            snapshots,
+            archive_path=OBSERVATION_PATH.parent / "research_archive",
+            metrics_path=OBSERVATION_PATH.parent
+            / "research_archive_metrics.json",
+        )
+        archive_scope.add_metadata(
+            candidate_count=result["eligible"],
+            archive_count=result["archived"],
+            duplicate_count=result["duplicate"],
+            failure_count=result["failed"],
+        )
+    return {
+        **result,
+        "markers_persisted": _persist_archive_markers(snapshots),
+    }
 
 
 def expire_observation_backlog(rows: list[Any]) -> None:
@@ -1404,13 +1474,131 @@ def record_sample(
     )]))
 
 
+def _run_startup_archive_maintenance() -> dict[str, Any]:
+    """observer와 분리된 단일 시작 maintenance를 실행한다."""
+    from src.research_archive import archive_integrity_metrics
+    from src.shadow_trade_ledger import (
+        backfill_completed_shadow_trades,
+        current_shadow_trade_ids,
+    )
+
+    archive_result = drain_research_archive()
+    observation_document = read_json(OBSERVATION_PATH, empty_observations())
+    observation_rows = observation_document.get("observations", [])
+    if not isinstance(observation_rows, list):
+        raise RuntimeError("signal observation rows are malformed")
+    shadow_trade_ids = current_shadow_trade_ids()
+    backfilled = backfill_completed_shadow_trades(
+        observation_rows,
+        existing_ids=shadow_trade_ids,
+    )
+    integrity = archive_integrity_metrics(
+        operational_rows=observation_rows,
+        archive_path=OBSERVATION_PATH.parent / "research_archive",
+        metrics_path=OBSERVATION_PATH.parent / "research_archive_metrics.json",
+    )
+    logger.info("research archive background drain: %s", archive_result)
+    if backfilled:
+        logger.info("completed shadow trades backfilled: count=%s", backfilled)
+    return {
+        "archive_result": archive_result,
+        "archive_metrics": integrity,
+        "shadow_backfilled": int(backfilled),
+    }
+
+
+async def _run_archive_maintenance_loop() -> None:
+    """단일 background task에서 bounded drain을 반복하고 오류를 격리한다."""
+    global _archive_maintenance_completed_at
+    global _archive_maintenance_last_error_type
+
+    startup_pending = True
+    while True:
+        try:
+            if startup_pending:
+                result = await asyncio.to_thread(
+                    _run_startup_archive_maintenance
+                )
+                metrics = result.get("archive_metrics", {})
+                completed_at = time.time()
+                published = await _publish_observer_metrics({
+                    **(
+                        {
+                            f"research_{key}": value
+                            for key, value in metrics.items()
+                        }
+                        if isinstance(metrics, dict) else {}
+                    ),
+                    "observer_health_state": "RUNNING_HEALTHY",
+                    "observer_archive_maintenance_completed_at": completed_at,
+                    "observer_archive_maintenance_last_error_type": None,
+                })
+                if not published:
+                    raise RuntimeError(
+                        "observer startup maintenance metrics were not persisted"
+                    )
+                _archive_maintenance_completed_at = completed_at
+                _archive_maintenance_last_error_type = None
+                startup_pending = False
+            else:
+                await asyncio.to_thread(drain_research_archive)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            if startup_pending:
+                _archive_maintenance_last_error_type = type(exc).__name__
+                await _publish_observer_metrics({
+                    "observer_health_state": "RUNNING_MAINTENANCE_RETRYING",
+                    "observer_archive_maintenance_last_error_type": (
+                        _archive_maintenance_last_error_type
+                    ),
+                })
+            logger.exception("observer background archive maintenance failed")
+        await asyncio.sleep(ARCHIVE_DRAIN_INTERVAL_SECONDS)
+
+
+def _schedule_startup_archive_maintenance() -> asyncio.Task[None]:
+    """프로세스 내 동시 maintenance를 하나로 제한한다."""
+    global _archive_maintenance_task
+    if (
+        _archive_maintenance_task is None
+        or _archive_maintenance_task.done()
+    ):
+        _archive_maintenance_task = asyncio.create_task(
+            _run_archive_maintenance_loop(),
+            name="observer-archive-maintenance",
+        )
+    return _archive_maintenance_task
+
+
 async def observation_loop(interval_seconds: float = 15.0) -> None:
     """기존 bounded Jupiter 경로로 1/3/5/15/30/60분 값을 표본화한다."""
+    global _archive_maintenance_completed_at
+    global _archive_maintenance_last_error_type
+
+    if (
+        _archive_maintenance_task is None
+        or _archive_maintenance_task.done()
+    ):
+        _archive_maintenance_completed_at = None
+        _archive_maintenance_last_error_type = None
     started_at = time.time()
     await _publish_observer_metrics({
         "observer_state": "STARTING",
+        "observer_health_state": "STARTING",
         "observer_started_at": started_at,
         "observer_heartbeat_at": started_at,
+        "observer_state_changed_at": started_at,
+        "observer_last_error_at": None,
+        "observer_last_error_type": None,
+        "observer_state_lock_operation": None,
+        "observer_pending_sample_count": 0,
+        "observer_archive_maintenance_completed_at": (
+            _archive_maintenance_completed_at
+        ),
+        "observer_archive_maintenance_last_error_type": (
+            _archive_maintenance_last_error_type
+        ),
     })
     observation_document = await asyncio.to_thread(ensure_observations_migrated)
     reconciled = await asyncio.to_thread(reconcile_interrupted_discoveries)
@@ -1426,70 +1614,8 @@ async def observation_loop(interval_seconds: float = 15.0) -> None:
         "discovery_reconciliation_last_at": time.time(),
         "discovery_reconciliation_reason": DISCOVERY_PROCESSING_INTERRUPTED,
     })
-    from src.shadow_trade_ledger import (
-        backfill_completed_shadow_trades,
-        current_shadow_trade_ids,
-    )
-    from src.research_archive import (
-        archive_integrity_metrics,
-        backfill_research_archive,
-    )
-
-    observation_rows = observation_document.get("observations", [])
-    shadow_trade_ids = await asyncio.to_thread(current_shadow_trade_ids)
-    with phase_memory(
-        "archive_write",
-        metadata={
-            "workload": "observation",
-            "operation": "archive",
-            "kind": "startup",
-            "row_count": (
-                len(observation_rows) if isinstance(observation_rows, list) else 0
-            ),
-        },
-        include_gc_counts=True,
-        include_object_count=True,
-    ) as archive_scope:
-        archive_backfill = await asyncio.to_thread(
-            backfill_research_archive,
-            observation_rows,
-            archive_path=OBSERVATION_PATH.parent / "research_archive",
-            metrics_path=OBSERVATION_PATH.parent / "research_archive_metrics.json",
-        )
-        logger.info("research archive reconciliation: %s", archive_backfill)
-        archive_metrics = await asyncio.to_thread(
-            archive_integrity_metrics,
-            operational_rows=observation_rows,
-            archive_path=OBSERVATION_PATH.parent / "research_archive",
-            metrics_path=OBSERVATION_PATH.parent / "research_archive_metrics.json",
-        )
-        backfilled = await asyncio.to_thread(
-            backfill_completed_shadow_trades,
-            observation_rows,
-            existing_ids=shadow_trade_ids,
-        )
-        archive_scope.add_metadata(
-            archive_count=sum(
-                int(value)
-                for key, value in archive_backfill.items()
-                if key.endswith("_archived")
-            ),
-            duplicate_count=sum(
-                int(value)
-                for key, value in archive_backfill.items()
-                if key.endswith("_duplicate")
-            ),
-            failure_count=sum(
-                int(value)
-                for key, value in archive_backfill.items()
-                if key.endswith("_failed")
-            ),
-            success_count=int(backfilled),
-        )
     startup_runtime_metrics = observation_runtime_metrics(observation_document)
-    del shadow_trade_ids, observation_rows, observation_document
-    if backfilled:
-        logger.info("completed shadow trades backfilled: count=%s", backfilled)
+    del observation_document
 
     load_dotenv()
     api_key = os.getenv("JUPITER_API_KEY", "").strip()
@@ -1499,7 +1625,6 @@ async def observation_loop(interval_seconds: float = 15.0) -> None:
             "observer_state": "DISABLED_MISSING_API_KEY",
             "observer_heartbeat_at": now,
             "observer_state_changed_at": now,
-            **{f"research_{key}": value for key, value in archive_metrics.items()},
         })
         logger.warning("signal observer disabled: JUPITER_API_KEY is missing")
         return
@@ -1508,14 +1633,14 @@ async def observation_loop(interval_seconds: float = 15.0) -> None:
     now = time.time()
     await _publish_observer_metrics({
         "observer_state": "RUNNING",
-        "observer_health_state": "RUNNING_HEALTHY",
+        "observer_health_state": _runtime_observer_health_state(),
         "observer_heartbeat_at": now,
         "observer_state_changed_at": now,
-        **{f"research_{key}": value for key, value in archive_metrics.items()},
         **startup_runtime_metrics,
     })
+    _schedule_startup_archive_maintenance()
     # 시작 계측에만 필요한 원장 snapshot을 장기 실행 coroutine에서 해제한다.
-    del archive_metrics, startup_runtime_metrics
+    del startup_runtime_metrics
     last_health_refresh = time.monotonic()
     pending_finalized: list[SampleResult] = []
     pending_sample_attempts: list[_PendingSampleAttempt] = []
@@ -1765,7 +1890,7 @@ async def observation_loop(interval_seconds: float = 15.0) -> None:
                 now = time.time()
                 recovered = await _publish_observer_metrics({
                     "observer_state": "RUNNING",
-                    "observer_health_state": "RUNNING_HEALTHY",
+                    "observer_health_state": _runtime_observer_health_state(),
                     "observer_heartbeat_at": now,
                     "observer_state_changed_at": now,
                     "observer_state_lock_operation": None,
@@ -1854,7 +1979,7 @@ async def observation_loop(interval_seconds: float = 15.0) -> None:
                     continue
                 health_values: dict[str, Any] = {
                     "observer_state": "RUNNING",
-                    "observer_health_state": "RUNNING_HEALTHY",
+                    "observer_health_state": _runtime_observer_health_state(),
                     "observer_heartbeat_at": now,
                     "observer_pending_sample_count": 0,
                     **runtime_metrics,

@@ -196,6 +196,7 @@ class ObserverHealthGateTests(unittest.TestCase):
         *,
         heartbeat: float = 1_000.0,
         health_state: str | None = None,
+        maintenance_completed_at: float | None = 995.0,
     ) -> dict:
         metrics = {
             "observer_state": state,
@@ -204,8 +205,14 @@ class ObserverHealthGateTests(unittest.TestCase):
             "observer_last_error_type": "StateLockTimeout",
             "observer_last_error_at": 980.0,
         }
+        if state == "RUNNING" and health_state is None:
+            health_state = "RUNNING_HEALTHY"
         if health_state is not None:
             metrics["observer_health_state"] = health_state
+        if maintenance_completed_at is not None:
+            metrics["observer_archive_maintenance_completed_at"] = (
+                maintenance_completed_at
+            )
         return metrics
 
     def run_gate(self, states: list[dict], clock: FakeClock, **kwargs):
@@ -293,6 +300,49 @@ class ObserverHealthGateTests(unittest.TestCase):
         ], clock)
 
         self.assertEqual(result["observer_state"], "RUNNING")
+        self.assertEqual(clock.sleeps, [])
+
+    def test_running_waits_for_current_startup_maintenance(self) -> None:
+        clock = FakeClock()
+        result = self.run_gate([
+            self.metrics(
+                "RUNNING",
+                heartbeat=clock.now(),
+                health_state="RUNNING_STARTING",
+                maintenance_completed_at=None,
+            ),
+            self.metrics(
+                "RUNNING",
+                heartbeat=clock.now() + 5.0,
+                health_state="RUNNING_MAINTENANCE_RETRYING",
+                maintenance_completed_at=None,
+            ),
+            self.metrics(
+                "RUNNING",
+                heartbeat=clock.now() + 10.0,
+                health_state="RUNNING_HEALTHY",
+                maintenance_completed_at=1_009.0,
+            ),
+        ], clock)
+
+        self.assertEqual(result["observer_health_state"], "RUNNING_HEALTHY")
+        self.assertEqual(clock.sleeps, [5.0, 5.0])
+
+    def test_running_healthy_rejects_missing_current_maintenance(self) -> None:
+        clock = FakeClock()
+        with self.assertRaisesRegex(
+            ObserverHealthGateError,
+            "startup maintenance is missing or stale",
+        ):
+            self.run_gate([
+                self.metrics(
+                    "RUNNING",
+                    heartbeat=clock.now(),
+                    health_state="RUNNING_HEALTHY",
+                    maintenance_completed_at=None,
+                )
+            ], clock)
+
         self.assertEqual(clock.sleeps, [])
 
     def test_running_stalled_fails_even_with_fresh_heartbeat(self) -> None:

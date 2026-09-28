@@ -943,6 +943,157 @@ class ObservationLedgerTests(unittest.TestCase):
         )
         self.assertEqual(observation_tracker.OBSERVATION_SAMPLE_CONCURRENCY, 4)
 
+    def test_archive_drain_runs_outside_ledger_write_and_persists_markers(self) -> None:
+        rows = [
+            {
+                "observation_id": identity,
+                "status": "COMPLETE",
+                "paper_experiment_status": "CLOSED",
+                "samples": [],
+            }
+            for identity in ("OLD", "NEW")
+        ]
+        state_store.atomic_write_json(
+            observation_tracker.OBSERVATION_PATH,
+            {
+                **observation_tracker.empty_observations(),
+                "observations": rows,
+            },
+        )
+        original_update = observation_tracker.update_json
+        write_active = False
+
+        def tracked_update(*args, **kwargs):
+            nonlocal write_active
+            write_active = True
+            try:
+                return original_update(*args, **kwargs)
+            finally:
+                write_active = False
+
+        def archive(snapshots, **_kwargs):
+            self.assertFalse(write_active)
+            archived = list(snapshots)
+            for snapshot in archived:
+                snapshot["archive_schema_version"] = 1
+                snapshot["archived_at"] = "2026-09-28T00:00:00+00:00"
+            return {
+                "eligible": len(archived),
+                "archived": len(archived),
+                "duplicate": 0,
+                "failed": 0,
+            }
+
+        with (
+            patch.object(
+                observation_tracker,
+                "update_json",
+                side_effect=tracked_update,
+            ),
+            patch.object(observation_tracker, "MAX_OBSERVATIONS", 1),
+            patch(
+                "src.research_archive.archive_terminal_rows",
+                side_effect=archive,
+            ) as archive_rows,
+        ):
+            result = observation_tracker.drain_research_archive()
+
+        archive_rows.assert_called_once()
+        self.assertEqual(result["markers_persisted"], 2)
+        saved = state_store.read_json(
+            observation_tracker.OBSERVATION_PATH,
+            observation_tracker.empty_observations(),
+        )
+        self.assertEqual(
+            [row["observation_id"] for row in saved["observations"]],
+            ["NEW"],
+        )
+        self.assertEqual(
+            saved["observations"][0]["archive_schema_version"], 1
+        )
+
+    def test_archive_drain_is_bounded_and_picks_up_later_terminal_rows(self) -> None:
+        state_store.atomic_write_json(
+            observation_tracker.OBSERVATION_PATH,
+            observation_tracker.empty_observations(),
+        )
+        self.assertEqual(
+            observation_tracker.drain_research_archive()["eligible"], 0
+        )
+        state_store.atomic_write_json(
+            observation_tracker.OBSERVATION_PATH,
+            {
+                **observation_tracker.empty_observations(),
+                "observations": [
+                    {
+                        "observation_id": identity,
+                        "status": "COMPLETE",
+                        "paper_experiment_status": "CLOSED",
+                        "samples": [],
+                    }
+                    for identity in ("FIRST", "LATER")
+                ],
+            },
+        )
+
+        with patch.object(observation_tracker, "ARCHIVE_DRAIN_BATCH_SIZE", 1):
+            first = observation_tracker.drain_research_archive()
+            later = observation_tracker.drain_research_archive()
+
+        self.assertEqual(first["eligible"], 1)
+        self.assertEqual(later["eligible"], 1)
+        saved = state_store.read_json(
+            observation_tracker.OBSERVATION_PATH,
+            observation_tracker.empty_observations(),
+        )
+        self.assertEqual(
+            {
+                row["observation_id"]
+                for row in saved["observations"]
+                if row.get("archive_schema_version") == 1
+                and row.get("archived_at")
+            },
+            {"FIRST", "LATER"},
+        )
+
+    def test_archive_drain_recovers_after_crash_before_marker_persist(self) -> None:
+        state_store.atomic_write_json(
+            observation_tracker.OBSERVATION_PATH,
+            {
+                **observation_tracker.empty_observations(),
+                "observations": [{
+                    "observation_id": "CRASH-WINDOW",
+                    "status": "COMPLETE",
+                    "paper_experiment_status": "CLOSED",
+                    "samples": [],
+                }],
+            },
+        )
+
+        with patch.object(
+            observation_tracker,
+            "_persist_archive_markers",
+            side_effect=RuntimeError("process stopped before marker write"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "before marker write"):
+                observation_tracker.drain_research_archive()
+
+        interrupted = state_store.read_json(
+            observation_tracker.OBSERVATION_PATH,
+            observation_tracker.empty_observations(),
+        )["observations"][0]
+        self.assertNotIn("archived_at", interrupted)
+
+        replayed = observation_tracker.drain_research_archive()
+        self.assertEqual(replayed["duplicate"], 1)
+        self.assertEqual(replayed["markers_persisted"], 1)
+        recovered = state_store.read_json(
+            observation_tracker.OBSERVATION_PATH,
+            observation_tracker.empty_observations(),
+        )["observations"][0]
+        self.assertEqual(recovered["archive_schema_version"], 1)
+        self.assertTrue(recovered["archived_at"])
+
     def test_sample_batch_rejects_unbounded_input_before_write(self) -> None:
         results = [
             observation_tracker.SampleResult(str(index), "1m", 1)
@@ -1927,6 +2078,11 @@ class ObservationRuntimeHealthTests(unittest.TestCase):
                     "record_sample_batch",
                     new=batch,
                 ),
+                patch.object(
+                    observation_tracker,
+                    "_schedule_startup_archive_maintenance",
+                    return_value=Mock(),
+                ),
                 patch.object(executor, "jupiter_quote", new=quote_mock),
             ):
                 with self.assertRaises(BatchCommitted):
@@ -2051,6 +2207,16 @@ class ObservationRuntimeHealthTests(unittest.TestCase):
                     "record_sample_attempt",
                     new=attempt,
                 ),
+                patch.object(
+                    observation_tracker,
+                    "_schedule_startup_archive_maintenance",
+                    return_value=Mock(),
+                ),
+                patch.object(
+                    observation_tracker,
+                    "_runtime_observer_health_state",
+                    return_value="RUNNING_HEALTHY",
+                ),
                 patch.object(executor, "jupiter_quote", new=quote),
             ):
                 with self.assertRaises(RecoveryComplete):
@@ -2085,8 +2251,20 @@ class ObservationRuntimeHealthTests(unittest.TestCase):
             for metrics in published[published.index(stalled[0]) + 1:]
         ))
 
-    def test_observation_startup_validates_shadow_before_archive(self) -> None:
-        archive = Mock()
+    def test_observation_starts_before_background_archive_maintenance(self) -> None:
+        class LoopStarted(RuntimeError):
+            pass
+
+        events: list[str] = []
+
+        async def publish(metrics: dict) -> None:
+            state = metrics.get("observer_state")
+            if state:
+                events.append(str(state))
+
+        def schedule() -> Mock:
+            events.append("ARCHIVE_MAINTENANCE")
+            return Mock()
 
         async def run() -> None:
             with (
@@ -2100,25 +2278,210 @@ class ObservationRuntimeHealthTests(unittest.TestCase):
                     "reconcile_interrupted_discoveries",
                     return_value=0,
                 ),
-                patch(
-                    "src.shadow_trade_ledger.current_shadow_trade_ids",
-                    side_effect=RuntimeError("shadow ledger malformed"),
-                ),
-                patch(
-                    "src.research_archive.backfill_research_archive",
-                    new=archive,
-                ),
                 patch.object(
                     observation_tracker,
                     "_publish_observer_metrics",
-                    new=AsyncMock(),
+                    new=publish,
                 ),
+                patch.object(observation_tracker, "load_dotenv"),
+                patch.object(observation_tracker.os, "getenv", return_value="KEY"),
+                patch.object(
+                    observation_tracker,
+                    "_schedule_startup_archive_maintenance",
+                    side_effect=schedule,
+                ),
+                patch.object(
+                    observation_tracker,
+                    "due_observation_samples",
+                    side_effect=LoopStarted,
+                ),
+                patch.object(observation_tracker, "record_memory_phase"),
             ):
-                with self.assertRaisesRegex(RuntimeError, "shadow ledger malformed"):
+                with self.assertRaises(LoopStarted):
                     await observation_tracker.observation_loop(interval_seconds=0)
 
         asyncio.run(run())
-        archive.assert_not_called()
+        self.assertLess(events.index("RUNNING"), events.index("ARCHIVE_MAINTENANCE"))
+
+    def test_hung_archive_maintenance_does_not_block_sampling(self) -> None:
+        class SamplingStarted(RuntimeError):
+            pass
+
+        async def blocked_maintenance() -> None:
+            await asyncio.Event().wait()
+
+        async def run() -> None:
+            previous = observation_tracker._archive_maintenance_task
+            observation_tracker._archive_maintenance_task = None
+            try:
+                with (
+                    patch.object(
+                        observation_tracker,
+                        "ensure_observations_migrated",
+                        return_value={"observations": []},
+                    ),
+                    patch.object(
+                        observation_tracker,
+                        "reconcile_interrupted_discoveries",
+                        return_value=0,
+                    ),
+                    patch.object(
+                        observation_tracker,
+                        "_publish_observer_metrics",
+                        new=AsyncMock(return_value=True),
+                    ),
+                    patch.object(observation_tracker, "load_dotenv"),
+                    patch.object(
+                        observation_tracker.os,
+                        "getenv",
+                        return_value="KEY",
+                    ),
+                    patch.object(
+                        observation_tracker,
+                        "_run_archive_maintenance_loop",
+                        new=blocked_maintenance,
+                    ),
+                    patch.object(
+                        observation_tracker,
+                        "due_observation_samples",
+                        side_effect=SamplingStarted,
+                    ),
+                    patch.object(observation_tracker, "record_memory_phase"),
+                ):
+                    with self.assertRaises(SamplingStarted):
+                        await observation_tracker.observation_loop(
+                            interval_seconds=0
+                        )
+                    task = observation_tracker._archive_maintenance_task
+                    self.assertIsNotNone(task)
+                    self.assertFalse(task.done())
+                    task.cancel()
+                    try:
+                        await task
+                    except asyncio.CancelledError:
+                        pass
+            finally:
+                observation_tracker._archive_maintenance_task = previous
+
+        asyncio.run(run())
+
+    def test_starting_metrics_clear_stale_health_and_lock_state(self) -> None:
+        class StartingPublished(RuntimeError):
+            pass
+
+        published: list[dict] = []
+
+        async def publish(metrics: dict) -> None:
+            published.append(dict(metrics))
+            raise StartingPublished
+
+        async def run() -> None:
+            with patch.object(
+                observation_tracker,
+                "_publish_observer_metrics",
+                new=publish,
+            ):
+                with self.assertRaises(StartingPublished):
+                    await observation_tracker.observation_loop(interval_seconds=0)
+
+        asyncio.run(run())
+        starting = published[0]
+        self.assertEqual(starting["observer_health_state"], "STARTING")
+        self.assertIsNone(starting["observer_last_error_at"])
+        self.assertIsNone(starting["observer_last_error_type"])
+        self.assertIsNone(starting["observer_state_lock_operation"])
+        self.assertEqual(starting["observer_pending_sample_count"], 0)
+
+    def test_archive_maintenance_failure_retries_startup_work(self) -> None:
+        class CyclesComplete(RuntimeError):
+            pass
+
+        sleeps = 0
+
+        async def sleep(_seconds: float) -> None:
+            nonlocal sleeps
+            sleeps += 1
+            if sleeps >= 2:
+                raise CyclesComplete
+
+        async def run() -> None:
+            previous_completed = (
+                observation_tracker._archive_maintenance_completed_at
+            )
+            previous_error = (
+                observation_tracker._archive_maintenance_last_error_type
+            )
+            try:
+                with (
+                    patch.object(
+                        observation_tracker,
+                        "_run_startup_archive_maintenance",
+                        side_effect=[
+                            RuntimeError("integrity unavailable"),
+                            {"archive_metrics": {}},
+                        ],
+                    ) as startup,
+                    patch.object(
+                        observation_tracker,
+                        "drain_research_archive",
+                        return_value={},
+                    ) as drain,
+                    patch.object(
+                        observation_tracker,
+                        "_publish_observer_metrics",
+                        new=AsyncMock(return_value=True),
+                    ),
+                    patch.object(
+                        observation_tracker.asyncio, "sleep", new=sleep
+                    ),
+                ):
+                    with self.assertRaises(CyclesComplete):
+                        await observation_tracker._run_archive_maintenance_loop()
+                self.assertEqual(startup.call_count, 2)
+                drain.assert_not_called()
+                self.assertIsNotNone(
+                    observation_tracker._archive_maintenance_completed_at
+                )
+                self.assertIsNone(
+                    observation_tracker._archive_maintenance_last_error_type
+                )
+            finally:
+                observation_tracker._archive_maintenance_completed_at = (
+                    previous_completed
+                )
+                observation_tracker._archive_maintenance_last_error_type = (
+                    previous_error
+                )
+
+        asyncio.run(run())
+
+    def test_archive_maintenance_schedule_is_singleton(self) -> None:
+        async def run() -> None:
+            previous = observation_tracker._archive_maintenance_task
+            observation_tracker._archive_maintenance_task = None
+            blocker = asyncio.Event()
+
+            async def blocked_loop() -> None:
+                await blocker.wait()
+
+            try:
+                with patch.object(
+                    observation_tracker,
+                    "_run_archive_maintenance_loop",
+                    new=blocked_loop,
+                ):
+                    first = observation_tracker._schedule_startup_archive_maintenance()
+                    second = observation_tracker._schedule_startup_archive_maintenance()
+                    self.assertIs(first, second)
+                    first.cancel()
+                    try:
+                        await first
+                    except asyncio.CancelledError:
+                        pass
+            finally:
+                observation_tracker._archive_maintenance_task = previous
+
+        asyncio.run(run())
 
     def test_observation_startup_releases_documents_before_running(self) -> None:
         released = []
@@ -2137,8 +2500,6 @@ class ObservationRuntimeHealthTests(unittest.TestCase):
         def load_observations() -> dict:
             return TrackedDocument({"observations": TrackedRows()})
 
-        shadow_ids = Mock(return_value=set())
-
         async def publish(metrics) -> None:
             if metrics.get("observer_state") == "RUNNING":
                 self.assertCountEqual(released, ["rows", "document"])
@@ -2156,22 +2517,6 @@ class ObservationRuntimeHealthTests(unittest.TestCase):
                     "reconcile_interrupted_discoveries",
                     new=lambda: 0,
                 ),
-                patch(
-                    "src.shadow_trade_ledger.current_shadow_trade_ids",
-                    new=shadow_ids,
-                ),
-                patch(
-                    "src.shadow_trade_ledger.backfill_completed_shadow_trades",
-                    new=lambda rows, **options: 0,
-                ),
-                patch(
-                    "src.research_archive.backfill_research_archive",
-                    new=lambda rows, **options: {},
-                ),
-                patch(
-                    "src.research_archive.archive_integrity_metrics",
-                    new=lambda **options: {},
-                ),
                 patch.object(observation_tracker, "_publish_observer_metrics", new=publish),
                 patch.object(observation_tracker, "load_dotenv"),
                 patch.object(observation_tracker.os, "getenv", return_value="KEY"),
@@ -2181,7 +2526,6 @@ class ObservationRuntimeHealthTests(unittest.TestCase):
 
         asyncio.run(run())
         self.assertCountEqual(released, ["rows", "document"])
-        shadow_ids.assert_called_once_with()
 
     def test_runtime_metrics_report_pending_success_and_missed_samples(self) -> None:
         metrics = observation_tracker.observation_runtime_metrics({
