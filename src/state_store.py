@@ -15,6 +15,8 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Callable, Iterator, TypeVar
 
+from src import state_lock_diagnostics
+
 if os.name == "nt":
     import msvcrt
 else:  # pragma: no cover - exercised by the Linux deployment.
@@ -36,6 +38,15 @@ class VersionConflict(RuntimeError):
 
 class StateLockTimeout(TimeoutError):
     """Raised when another process holds a state lock beyond the deadline."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        diagnostics: dict[str, Any] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.diagnostics = dict(diagnostics or {})
 
 
 def normalized_route_metadata(
@@ -66,18 +77,27 @@ def read_json(path: Path, fallback: dict[str, Any]) -> dict[str, Any]:
 
 @contextmanager
 def exclusive_file_lock(
-    path: Path, *, timeout_seconds: float = 15.0, poll_seconds: float = 0.05
+    path: Path,
+    *,
+    timeout_seconds: float = 15.0,
+    poll_seconds: float = 0.05,
+    operation: str = "external_or_unknown",
 ) -> Iterator[None]:
     """Acquire an OS-visible exclusive lock using a stable sidecar file."""
     lock_path = path.with_name(f"{path.name}.lock")
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     handle = open(lock_path, "a+b")
     locked = False
+    diagnostic_attempt = None
     try:
         handle.seek(0, os.SEEK_END)
         if handle.tell() == 0:
             handle.write(b"\0")
             handle.flush()
+        try:
+            diagnostic_attempt = state_lock_diagnostics.begin(operation)
+        except Exception:
+            diagnostic_attempt = None
         deadline = time.monotonic() + timeout_seconds
         while True:
             try:
@@ -87,10 +107,26 @@ def exclusive_file_lock(
                 else:  # pragma: no cover
                     fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
                 locked = True
+                if diagnostic_attempt is not None:
+                    try:
+                        state_lock_diagnostics.acquired(diagnostic_attempt, handle)
+                    except Exception:
+                        pass
                 break
             except OSError as exc:
                 if time.monotonic() >= deadline:
-                    raise StateLockTimeout(f"timed out locking {path}") from exc
+                    diagnostic: dict[str, Any] = {"unavailable": True}
+                    if diagnostic_attempt is not None:
+                        try:
+                            diagnostic = state_lock_diagnostics.timeout(
+                                diagnostic_attempt, handle
+                            )
+                        except Exception:
+                            pass
+                    raise StateLockTimeout(
+                        f"timed out locking {path}",
+                        diagnostics=diagnostic,
+                    ) from exc
                 time.sleep(poll_seconds)
         yield
     finally:
@@ -102,6 +138,11 @@ def exclusive_file_lock(
                 else:  # pragma: no cover
                     fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
             except OSError:
+                pass
+        if diagnostic_attempt is not None:
+            try:
+                state_lock_diagnostics.released(diagnostic_attempt)
+            except Exception:
                 pass
         handle.close()
 
@@ -183,9 +224,10 @@ def update_json(
     mutator: Mutator[T],
     *,
     expected_version: int | None = None,
+    operation: str = "state_update",
 ) -> tuple[T, dict[str, Any]]:
     """Lock, reread, CAS-check, mutate, increment version, and atomically save."""
-    with exclusive_file_lock(path):
+    with exclusive_file_lock(path, operation=operation):
         document = read_json(path, fallback)
         current_version = int(document.get("version", 0) or 0)
         if expected_version is not None and current_version != expected_version:
@@ -203,9 +245,11 @@ def migrate_json(
     path: Path,
     fallback: dict[str, Any],
     migrator: Callable[[dict[str, Any]], bool],
+    *,
+    operation: str = "state_migration",
 ) -> dict[str, Any]:
     """Run an idempotent migration while holding the cross-process lock."""
-    with exclusive_file_lock(path):
+    with exclusive_file_lock(path, operation=operation):
         document = read_json(path, fallback)
         changed = migrator(document)
         if changed:
@@ -219,7 +263,9 @@ def get_last_trade_time(token_address: str) -> float:
     token = str(token_address).strip()
     if not token:
         return 0.0
-    with exclusive_file_lock(PAPER_TRADES_PATH):
+    with exclusive_file_lock(
+        PAPER_TRADES_PATH, operation="paper_last_trade_read"
+    ):
         document = read_json(PAPER_TRADES_PATH, {"events": []})
         events = document.get("events", [])
         if not isinstance(events, list):
@@ -256,7 +302,9 @@ def get_recent_stop_loss_time(
         "LIVE_STOP_LOSS_15",
         "POST_TP_TRAILING_STOP_50",
     }
-    with exclusive_file_lock(PAPER_TRADES_PATH):
+    with exclusive_file_lock(
+        PAPER_TRADES_PATH, operation="paper_recent_stop_loss_read"
+    ):
         document = read_json(PAPER_TRADES_PATH, {"events": []})
         events = document.get("events", [])
         if not isinstance(events, list):
@@ -297,7 +345,9 @@ def get_route_initial_stop_streak(route_type: str) -> tuple[int, float]:
     initial_stop_reason = (
         "STOP_LOSS_15" if route == "A" else "ROUTE_B_STOP_LOSS_10"
     )
-    with exclusive_file_lock(PAPER_TRADES_PATH):
+    with exclusive_file_lock(
+        PAPER_TRADES_PATH, operation="paper_route_stop_streak_read"
+    ):
         document = read_json(PAPER_TRADES_PATH, {"events": []})
         events = document.get("events", [])
         if not isinstance(events, list):
@@ -348,7 +398,7 @@ def datetime_from_iso(value: Any) -> float:
 
 def get_active_wallets_count() -> int:
     """현재 감시 목록에 포함된 정상 지갑 수를 파일 락 안에서 계산한다."""
-    with exclusive_file_lock(WALLETS_PATH):
+    with exclusive_file_lock(WALLETS_PATH, operation="wallets_active_count_read"):
         document = read_json(WALLETS_PATH, {"wallets": []})
         rows = document.get("wallets", [])
         if not isinstance(rows, list):
@@ -373,7 +423,7 @@ def get_global_metric(name: str, default: Any = None) -> Any:
     key = str(name).strip()
     if not key:
         raise ValueError("global metric name must not be empty")
-    with exclusive_file_lock(GLOBAL_METRICS_PATH):
+    with exclusive_file_lock(GLOBAL_METRICS_PATH, operation="global_metric_read"):
         document = read_json(
             GLOBAL_METRICS_PATH,
             {"schema_version": 2, "version": 0, "metrics": {}},
@@ -407,6 +457,7 @@ def set_global_metrics(values: dict[str, Any]) -> None:
         GLOBAL_METRICS_PATH,
         {"schema_version": 2, "version": 0, "metrics": {}},
         mutate,
+        operation="global_metrics_update",
     )
 
 def claim_global_interval(name: str, now: float, interval_seconds: float) -> bool:
@@ -436,6 +487,7 @@ def claim_global_interval(name: str, now: float, interval_seconds: float) -> boo
         GLOBAL_METRICS_PATH,
         {"schema_version": 2, "version": 0, "metrics": {}},
         mutate,
+        operation="global_interval_claim",
     )
     return bool(claimed)
 
@@ -443,7 +495,9 @@ def claim_global_interval(name: str, now: float, interval_seconds: float) -> boo
 def get_wallets_by_status(status: str) -> list[dict[str, Any]]:
     """성과 원장에서 지정 상태의 지갑 스냅샷을 반환한다."""
     normalized_status = str(status).upper()
-    with exclusive_file_lock(WALLET_PERFORMANCE_PATH):
+    with exclusive_file_lock(
+        WALLET_PERFORMANCE_PATH, operation="wallet_status_read"
+    ):
         document = read_json(
             WALLET_PERFORMANCE_PATH,
             {"schema_version": 4, "version": 0, "wallets": {}},
@@ -504,5 +558,6 @@ def set_wallet_status(
         WALLET_PERFORMANCE_PATH,
         {"schema_version": 4, "version": 0, "wallets": {}},
         mutate,
+        operation="wallet_status_update",
     )
     return bool(changed)

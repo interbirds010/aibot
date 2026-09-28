@@ -173,7 +173,8 @@ class ShadowTradeLedgerTests(unittest.TestCase):
                 "version": 1,
             })
 
-        def locked_update(path, fallback, mutator):
+        def locked_update(path, fallback, mutator, *, operation):
+            self.assertEqual(operation, "shadow_trade_backfill")
             self.assertEqual(released, [True])
             document = shadow_trade_ledger.empty_shadow_trades()
             return mutator(document), document
@@ -215,7 +216,8 @@ class ShadowTradeLedgerTests(unittest.TestCase):
         existing = shadow_trade_ledger.completed_shadow_trade(candidate)
         self.assertIsNotNone(existing)
 
-        def locked_update(path, fallback, mutator):
+        def locked_update(path, fallback, mutator, *, operation):
+            self.assertEqual(operation, "shadow_trade_backfill")
             document = shadow_trade_ledger.empty_shadow_trades()
             document["trades"] = [existing]
             return mutator(document), document

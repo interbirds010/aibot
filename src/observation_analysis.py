@@ -889,6 +889,7 @@ def refresh_observation_analysis(
         target_path,
         {"schema_version": 1, "version": 0},
         mutate,
+        operation="observation_analysis_refresh",
     )
     return saved
 

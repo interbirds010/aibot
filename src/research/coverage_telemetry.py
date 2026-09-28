@@ -908,6 +908,7 @@ def _refresh_hourly_rollups_body(
         HOURLY_TELEMETRY_PATH,
         _empty_hourly_document(),
         mutate,
+        operation="coverage_hourly_rollup_refresh",
     )
     return saved
 
@@ -1002,7 +1003,10 @@ def _flush_coverage_telemetry_body(*, now_epoch: float | None = None) -> bool:
 
     try:
         _, raw_document = state_store.update_json(
-            TELEMETRY_PATH, _empty_document(), mutate
+            TELEMETRY_PATH,
+            _empty_document(),
+            mutate,
+            operation="coverage_telemetry_flush",
         )
     except Exception:
         _merge_pending_back(pending)
@@ -1044,7 +1048,9 @@ def _ratio(
 def coverage_report(*, now_epoch: float | None = None) -> dict[str, Any]:
     """보존 bucket 전체의 event/unique estimate와 명시적 ratio를 반환한다."""
     flush_coverage_telemetry(now_epoch=now_epoch)
-    with state_store.exclusive_file_lock(TELEMETRY_PATH):
+    with state_store.exclusive_file_lock(
+        TELEMETRY_PATH, operation="coverage_report_read"
+    ):
         document = state_store.read_json(TELEMETRY_PATH, _empty_document())
     cutoff = _bucket_start(now_epoch) - (MAX_BUCKETS - 1) * BUCKET_SECONDS
     buckets = [
@@ -1224,7 +1230,9 @@ def coverage_review_window_status(
         end_exclusive,
         HOUR_SECONDS,
     ))
-    with state_store.exclusive_file_lock(HOURLY_TELEMETRY_PATH):
+    with state_store.exclusive_file_lock(
+        HOURLY_TELEMETRY_PATH, operation="coverage_window_read"
+    ):
         document = state_store.read_json(
             HOURLY_TELEMETRY_PATH, _empty_hourly_document()
         )
@@ -1427,7 +1435,9 @@ def coverage_review_report(
     )
     if not status["eligible"]:
         return {"window_status": status, "summary": None}
-    with state_store.exclusive_file_lock(HOURLY_TELEMETRY_PATH):
+    with state_store.exclusive_file_lock(
+        HOURLY_TELEMETRY_PATH, operation="coverage_review_read"
+    ):
         document = state_store.read_json(
             HOURLY_TELEMETRY_PATH, _empty_hourly_document()
         )

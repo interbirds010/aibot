@@ -1165,6 +1165,7 @@ def refresh_alpha_discovery(
 
     _, saved = update_json(
         target, {"schema_version": SCHEMA_VERSION, "version": 0}, mutate,
+        operation="alpha_discovery_refresh",
     )
     return saved
 

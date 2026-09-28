@@ -246,6 +246,7 @@ def ensure_observations_migrated() -> dict[str, Any]:
         OBSERVATION_PATH,
         empty_observations(),
         migrate_observation_document,
+        operation="startup_migration",
     )
 
 
@@ -312,7 +313,12 @@ def reconcile_interrupted_discoveries(
             document["updated_at"] = datetime.now(timezone.utc).isoformat()
         return changed
 
-    migrate_json(OBSERVATION_PATH, empty_observations(), migrate)
+    migrate_json(
+        OBSERVATION_PATH,
+        empty_observations(),
+        migrate,
+        operation="startup_reconciliation",
+    )
     return reconciled
 
 
@@ -554,7 +560,10 @@ def _persist_archive_markers(snapshots: list[dict[str, Any]]) -> int:
         return persisted
 
     persisted, _ = update_json(
-        OBSERVATION_PATH, empty_observations(), mutate
+        OBSERVATION_PATH,
+        empty_observations(),
+        mutate,
+        operation="archive_marker_persist",
     )
     return int(persisted)
 
@@ -765,7 +774,11 @@ async def record_candidate_discovery(
         return ObservationDecision(True, observation_id, False, variants)
 
     decision, _ = await asyncio.to_thread(
-        update_json, OBSERVATION_PATH, empty_observations(), mutate
+        update_json,
+        OBSERVATION_PATH,
+        empty_observations(),
+        mutate,
+        operation="candidate_discovery",
     )
     return decision
 
@@ -849,7 +862,12 @@ def finalize_candidate_without_quote(
         document["updated_at"] = datetime.now(timezone.utc).isoformat()
         return True
 
-    changed, _ = update_json(OBSERVATION_PATH, empty_observations(), mutate)
+    changed, _ = update_json(
+        OBSERVATION_PATH,
+        empty_observations(),
+        mutate,
+        operation="finalize_without_quote",
+    )
     return bool(changed)
 
 
@@ -1010,7 +1028,11 @@ async def record_observation_decision(
         return ObservationDecision(True, observation_id, candidate_eligible, variants)
 
     decision, _ = await asyncio.to_thread(
-        update_json, OBSERVATION_PATH, empty_observations(), mutate
+        update_json,
+        OBSERVATION_PATH,
+        empty_observations(),
+        mutate,
+        operation="observation_decision",
     )
     return decision
 
@@ -1101,7 +1123,10 @@ def mark_paper_experiment_status(
         return True
 
     changed, _ = update_json(
-        OBSERVATION_PATH, empty_observations(), mutate
+        OBSERVATION_PATH,
+        empty_observations(),
+        mutate,
+        operation="paper_experiment_status",
     )
     return bool(changed)
 
@@ -1286,6 +1311,7 @@ def record_sample_attempt(
         OBSERVATION_PATH,
         empty_observations(),
         mutate,
+        operation="sample_attempt",
     )
     return int(count)
 
@@ -1448,7 +1474,10 @@ def record_sample_batch(results: list[SampleResult]) -> int:
         ]
 
     applied, _ = update_json(
-        OBSERVATION_PATH, empty_observations(), mutate
+        OBSERVATION_PATH,
+        empty_observations(),
+        mutate,
+        operation="sample_batch",
     )
     _emit_sample_side_effects(applied)
     return len(applied)

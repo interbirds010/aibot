@@ -1174,7 +1174,12 @@ def _save(path: Path, payload: dict[str, Any]) -> dict[str, Any]:
         document.clear()
         document.update(payload)
 
-    _, saved = update_json(path, {"schema_version": payload["schema_version"]}, mutate)
+    _, saved = update_json(
+        path,
+        {"schema_version": payload["schema_version"]},
+        mutate,
+        operation="future_validation_registry_save",
+    )
     return saved
 
 
@@ -1280,6 +1285,7 @@ def _publish_evaluation(
         {"schema_version": REGISTRY_SCHEMA_VERSION},
         mutate,
         expected_version=expected_version,
+        operation="future_validation_evaluation_publish",
     )
     return saved, published_report
 

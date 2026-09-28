@@ -116,7 +116,12 @@ def _cooldown_and_replace(wallet: str, reason: str) -> bool:
         })
         return replacement
 
-    replacement, _ = update_json(WALLETS_PATH, {"wallets": []}, mutate)
+    replacement, _ = update_json(
+        WALLETS_PATH,
+        {"wallets": []},
+        mutate,
+        operation="wallet_cooldown_replace",
+    )
     logger.warning(
         "wallet cool-down started wallet=%s duration_seconds=%s reason=%s replacement=%s",
         wallet, COOLDOWN_SECONDS, reason, (replacement or {}).get("address"),
@@ -279,6 +284,7 @@ def ensure_performance_migrated() -> dict[str, Any]:
     return migrate_json(
         PERFORMANCE_PATH, {"schema_version": 4, "version": 0, "wallets": {}},
         migrate_performance_document,
+        operation="wallet_performance_migration",
     )
 
 
@@ -368,7 +374,12 @@ async def record_paper_buy_success(wallet: str, mint: str, signature: str) -> No
             sync_pipeline_counts(row)
             state["updated_at"] = datetime.now(timezone.utc).isoformat()
 
-        update_json(PERFORMANCE_PATH, {"wallets": {}}, mutate)
+        update_json(
+            PERFORMANCE_PATH,
+            {"wallets": {}},
+            mutate,
+            operation="wallet_paper_buy_success",
+        )
 
 
 async def record_virtual_buy(wallet: str, mint: str, signature: str) -> None:
@@ -420,7 +431,12 @@ async def observe_buy(wallet: str, mint: str, acquired_raw: int, paid_lamports: 
             state.pop("latest_prices", None)
             state["updated_at"] = datetime.now(timezone.utc).isoformat()
 
-        update_json(PERFORMANCE_PATH, {"wallets": {}}, mutate)
+        update_json(
+            PERFORMANCE_PATH,
+            {"wallets": {}},
+            mutate,
+            operation="wallet_buy_observation_record",
+        )
 
 
 async def reject_unsafe_buy(
@@ -453,7 +469,12 @@ async def reject_unsafe_buy(
             state["updated_at"] = datetime.now(timezone.utc).isoformat()
             return should_cool_down
 
-        should_cool_down, _ = update_json(PERFORMANCE_PATH, {"wallets": {}}, mutate)
+        should_cool_down, _ = update_json(
+            PERFORMANCE_PATH,
+            {"wallets": {}},
+            mutate,
+            operation="wallet_unsafe_buy_rejection",
+        )
     if should_cool_down:
         cooldown_and_replace(wallet, "repeated unsafe-token purchases")
 
@@ -533,7 +554,12 @@ def complete_observation(
         state["updated_at"] = datetime.now(timezone.utc).isoformat()
         return reason
 
-    reason, _ = update_json(PERFORMANCE_PATH, {"wallets": {}}, mutate)
+    reason, _ = update_json(
+        PERFORMANCE_PATH,
+        {"wallets": {}},
+        mutate,
+        operation="wallet_observation_complete",
+    )
     return reason
 
 
@@ -564,7 +590,12 @@ def fail_observation(wallet: str, sample: dict[str, Any], error: Exception) -> N
         sync_pipeline_counts(row)
         state["updated_at"] = datetime.now(timezone.utc).isoformat()
 
-    update_json(PERFORMANCE_PATH, {"wallets": {}}, mutate)
+    update_json(
+        PERFORMANCE_PATH,
+        {"wallets": {}},
+        mutate,
+        operation="wallet_observation_failure",
+    )
 
 
 def skip_observation(
@@ -607,7 +638,12 @@ def skip_observation(
         state["updated_at"] = datetime.now(timezone.utc).isoformat()
         return True
 
-    skipped, _ = update_json(PERFORMANCE_PATH, {"wallets": {}}, mutate)
+    skipped, _ = update_json(
+        PERFORMANCE_PATH,
+        {"wallets": {}},
+        mutate,
+        operation="wallet_observation_skip",
+    )
     return bool(skipped)
 
 

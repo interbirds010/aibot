@@ -92,7 +92,12 @@ def _metric_update(
         "archive_metric_write",
         metadata={"workload": "observation", "operation": "update"},
     ):
-        update_json(metrics_path, empty_archive_metrics(), mutate)
+        update_json(
+            metrics_path,
+            empty_archive_metrics(),
+            mutate,
+            operation="archive_metrics_update",
+        )
 
 
 def _existing_archive_record(path: Path, observation_id: str) -> dict[str, Any] | None:
@@ -126,7 +131,7 @@ def archive_observation(
     record_path = archive_record_path(observation_id, archive_path=archive_path)
     metric_file = metrics_path or RESEARCH_ARCHIVE_METRICS_PATH
     archived_at = _now()
-    with exclusive_file_lock(record_path):
+    with exclusive_file_lock(record_path, operation="archive_record_write"):
         existing = _existing_archive_record(record_path, observation_id)
         if existing is not None:
             _metric_update(metrics_path=metric_file, duplicate_count=1)
