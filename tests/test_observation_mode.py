@@ -886,7 +886,11 @@ class ObservationLedgerTests(unittest.TestCase):
                 started = time.perf_counter()
                 with original_lock(*args, **kwargs):
                     yield
-                lock_durations.append(time.perf_counter() - started)
+                if (
+                    args
+                    and Path(args[0]) == observation_tracker.OBSERVATION_PATH
+                ):
+                    lock_durations.append(time.perf_counter() - started)
 
             with (
                 patch.object(
@@ -908,8 +912,14 @@ class ObservationLedgerTests(unittest.TestCase):
                 started = time.perf_counter()
                 operation()
                 elapsed = time.perf_counter() - started
+            observation_writes = sum(
+                1
+                for call in writes.call_args_list
+                if call.args
+                and Path(call.args[0]) == observation_tracker.OBSERVATION_PATH
+            )
             return (
-                writes.call_count,
+                observation_writes,
                 archive.call_count,
                 sum(lock_durations),
                 max(lock_durations, default=0.0),
