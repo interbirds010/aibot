@@ -348,7 +348,10 @@ def summarize_memory_samples(
 
 
 def _global_metrics() -> dict[str, Any]:
-    with state_store.exclusive_file_lock(state_store.GLOBAL_METRICS_PATH):
+    with state_store.exclusive_file_lock(
+        state_store.GLOBAL_METRICS_PATH,
+        operation="monitor_memory_metrics_read",
+    ):
         document = state_store.read_json(
             state_store.GLOBAL_METRICS_PATH,
             {"schema_version": 2, "version": 0, "metrics": {}},

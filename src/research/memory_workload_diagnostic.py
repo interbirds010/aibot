@@ -36,7 +36,9 @@ DEFAULT_REPETITIONS = 3
 
 
 def _read_locked(path: Path, fallback: dict[str, Any]) -> dict[str, Any]:
-    with state_store.exclusive_file_lock(path):
+    with state_store.exclusive_file_lock(
+        path, operation="memory_workload_read"
+    ):
         return state_store.read_json(path, fallback)
 
 

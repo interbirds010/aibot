@@ -653,7 +653,7 @@ def read_paper_ledger_snapshot(path: Path | None = None) -> dict[str, Any]:
         return document
     if path is not None:
         return read_json(source, _empty_ledger())
-    with exclusive_file_lock(source):
+    with exclusive_file_lock(source, operation="paper_mvp_review_read"):
         return read_json(source, _empty_ledger())
 
 

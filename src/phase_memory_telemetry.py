@@ -937,7 +937,12 @@ def _persist_batch(batch: dict[str, Any], state_path: Path) -> bool:
         })
 
     try:
-        state_store.update_json(state_path, _empty_document(), mutate)
+        state_store.update_json(
+            state_path,
+            _empty_document(),
+            mutate,
+            operation="phase_memory_batch_persist",
+        )
     except Exception:
         return False
     return True

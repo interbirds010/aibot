@@ -819,7 +819,11 @@ def _reserve_provider_slot_sync(
 ) -> ProviderReservation | None:
     """전역 pacing과 provider/method availability를 원자적으로 예약한다."""
     path = _state_path(provider.name)
-    with exclusive_file_lock(path, timeout_seconds=180.0):
+    with exclusive_file_lock(
+        path,
+        timeout_seconds=180.0,
+        operation="solana_rpc_provider_reserve",
+    ):
         state = _migrate_provider_state(
             provider.name,
             read_json(path, _empty_provider_state(provider.name)),
@@ -944,7 +948,11 @@ def _record_provider_success_sync(
     latency_ms: float = 0.0,
 ) -> None:
     path = _state_path(provider.name)
-    with exclusive_file_lock(path, timeout_seconds=180.0):
+    with exclusive_file_lock(
+        path,
+        timeout_seconds=180.0,
+        operation="solana_rpc_provider_success",
+    ):
         state = _migrate_provider_state(
             provider.name,
             read_json(path, _empty_provider_state(provider.name)),
@@ -988,7 +996,11 @@ def _record_provider_failure_sync(
     latency_ms: float = 0.0,
 ) -> None:
     path = _state_path(provider.name)
-    with exclusive_file_lock(path, timeout_seconds=180.0):
+    with exclusive_file_lock(
+        path,
+        timeout_seconds=180.0,
+        operation="solana_rpc_provider_failure",
+    ):
         state = _migrate_provider_state(
             provider.name,
             read_json(path, _empty_provider_state(provider.name)),
@@ -1105,7 +1117,11 @@ def _record_provider_exhaustion_sync(
 ) -> None:
     """최종 logical-call exhaustion을 마지막 실제 provider에 귀속한다."""
     path = _state_path(provider.name)
-    with exclusive_file_lock(path, timeout_seconds=180.0):
+    with exclusive_file_lock(
+        path,
+        timeout_seconds=180.0,
+        operation="solana_rpc_provider_exhaustion",
+    ):
         state = _migrate_provider_state(
             provider.name,
             read_json(path, _empty_provider_state(provider.name)),
@@ -1129,7 +1145,7 @@ def provider_state(
 ) -> dict[str, Any]:
     """endpoint 없이 provider 운영 state만 반환한다."""
     path = _state_path(provider_name)
-    with exclusive_file_lock(path):
+    with exclusive_file_lock(path, operation="solana_rpc_provider_read"):
         state = _migrate_provider_state(
             provider_name,
             read_json(path, _empty_provider_state(provider_name)),

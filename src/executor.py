@@ -248,7 +248,11 @@ def _wait_for_jupiter_slot_sync(
     interval_seconds: float = _QUOTE_INTERVAL_SECONDS,
 ) -> float:
     """Reserve one organisation-wide Jupiter request slot across PM2 processes."""
-    with exclusive_file_lock(JUPITER_RATE_LIMIT_PATH, timeout_seconds=180.0):
+    with exclusive_file_lock(
+        JUPITER_RATE_LIMIT_PATH,
+        timeout_seconds=180.0,
+        operation="jupiter_rate_limit_reserve",
+    ):
         state = read_json(JUPITER_RATE_LIMIT_PATH, JUPITER_RATE_LIMIT_FALLBACK)
         now = time.time()
         last_request = float(state.get("last_request_at_epoch", 0.0) or 0.0)
@@ -271,7 +275,11 @@ async def _wait_for_global_jupiter_slot() -> None:
 
 def _defer_jupiter_until_sync(not_before_epoch: float) -> None:
     """Publish a Jupiter cooldown so every local PM2 process observes it."""
-    with exclusive_file_lock(JUPITER_RATE_LIMIT_PATH, timeout_seconds=180.0):
+    with exclusive_file_lock(
+        JUPITER_RATE_LIMIT_PATH,
+        timeout_seconds=180.0,
+        operation="jupiter_rate_limit_defer",
+    ):
         state = read_json(JUPITER_RATE_LIMIT_PATH, JUPITER_RATE_LIMIT_FALLBACK)
         current = float(state.get("not_before_epoch", 0.0) or 0.0)
         state["not_before_epoch"] = max(current, not_before_epoch)

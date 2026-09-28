@@ -92,7 +92,11 @@ def _wait_for_helius_slot_sync(
 ) -> float:
     """전체 PM2 프로세스에서 Helius 요청 시작 시각을 직렬화한다."""
     interval = max(0.0, float(interval_seconds))
-    with exclusive_file_lock(HELIUS_RATE_LIMIT_PATH, timeout_seconds=180.0):
+    with exclusive_file_lock(
+        HELIUS_RATE_LIMIT_PATH,
+        timeout_seconds=180.0,
+        operation="helius_rate_limit_reserve",
+    ):
         state = read_json(HELIUS_RATE_LIMIT_PATH, HELIUS_RATE_LIMIT_FALLBACK)
         now = time.time()
         last_request = _finite_nonnegative(state.get("last_request_at_epoch")) or 0.0
@@ -122,7 +126,11 @@ def _defer_helius_until_sync(
     rate_limited: bool,
 ) -> None:
     """한 프로세스가 본 cooldown을 다른 PM2 프로세스와 공유한다."""
-    with exclusive_file_lock(HELIUS_RATE_LIMIT_PATH, timeout_seconds=180.0):
+    with exclusive_file_lock(
+        HELIUS_RATE_LIMIT_PATH,
+        timeout_seconds=180.0,
+        operation="helius_rate_limit_defer",
+    ):
         state = read_json(HELIUS_RATE_LIMIT_PATH, HELIUS_RATE_LIMIT_FALLBACK)
         current = _finite_nonnegative(state.get("not_before_epoch")) or 0.0
         state["schema_version"] = 1

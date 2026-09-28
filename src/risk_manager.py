@@ -315,7 +315,12 @@ def migrate_ledger_document(document: dict[str, Any]) -> bool:
 
 
 def ensure_ledger_migrated() -> dict[str, Any]:
-    return migrate_json(LEDGER_PATH, empty_ledger(), migrate_ledger_document)
+    return migrate_json(
+        LEDGER_PATH,
+        empty_ledger(),
+        migrate_ledger_document,
+        operation="paper_ledger_migration",
+    )
 
 
 def read_ledger() -> dict[str, Any]:
@@ -465,7 +470,12 @@ async def record_paper_buy(
         ledger["updated_at"] = utc_now()
         return position_id
 
-    position_id, _ = update_json(LEDGER_PATH, empty_ledger(), mutate)
+    position_id, _ = update_json(
+        LEDGER_PATH,
+        empty_ledger(),
+        mutate,
+        operation="paper_buy_record",
+    )
     return position_id
 
 
@@ -491,7 +501,12 @@ async def record_paper_rejection(
         ledger["events"] = ledger["events"][-2_000:]
         ledger["updated_at"] = utc_now()
 
-    update_json(LEDGER_PATH, empty_ledger(), mutate)
+    update_json(
+        LEDGER_PATH,
+        empty_ledger(),
+        mutate,
+        operation="paper_rejection_record",
+    )
 
 
 async def record_rpc_skip(
@@ -520,7 +535,12 @@ async def record_rpc_skip(
         ledger["events"] = ledger["events"][-2_000:]
         ledger["updated_at"] = utc_now()
 
-    update_json(LEDGER_PATH, empty_ledger(), mutate)
+    update_json(
+        LEDGER_PATH,
+        empty_ledger(),
+        mutate,
+        operation="paper_rpc_skip_record",
+    )
 
 
 async def claim_position_exit(
@@ -544,7 +564,12 @@ async def claim_position_exit(
         ledger["updated_at"] = utc_now()
         return exit_id, int(position.get("token_amount_raw", 0))
 
-    result, _ = update_json(LEDGER_PATH, empty_ledger(), mutate)
+    result, _ = update_json(
+        LEDGER_PATH,
+        empty_ledger(),
+        mutate,
+        operation="paper_position_exit_claim",
+    )
     return result
 
 
@@ -564,7 +589,12 @@ async def release_exit_claim(
             position["version"] = int(position.get("version", 0)) + 1
             ledger["updated_at"] = utc_now()
 
-    update_json(LEDGER_PATH, empty_ledger(), mutate)
+    update_json(
+        LEDGER_PATH,
+        empty_ledger(),
+        mutate,
+        operation="paper_position_exit_release",
+    )
 
 
 async def record_paper_sell(
@@ -663,7 +693,12 @@ async def record_paper_sell(
         ledger["updated_at"] = utc_now()
         return True
 
-    recorded, _ = update_json(LEDGER_PATH, empty_ledger(), mutate)
+    recorded, _ = update_json(
+        LEDGER_PATH,
+        empty_ledger(),
+        mutate,
+        operation="paper_sell_record",
+    )
     if recorded and closed_experiment:
         try:
             from src.observation_tracker import mark_paper_experiment_status
@@ -721,7 +756,12 @@ async def record_position_mark(
         position["version"] = int(position.get("version", 0)) + 1
         ledger["updated_at"] = now
 
-    update_json(LEDGER_PATH, empty_ledger(), mutate)
+    update_json(
+        LEDGER_PATH,
+        empty_ledger(),
+        mutate,
+        operation="paper_position_mark_record",
+    )
 
 
 async def record_live_transaction_lifecycle(
@@ -749,7 +789,12 @@ async def record_live_transaction_lifecycle(
         position["version"] = int(position.get("version", 0)) + 1
         ledger["updated_at"] = utc_now()
 
-    update_json(LEDGER_PATH, empty_ledger(), mutate)
+    update_json(
+        LEDGER_PATH,
+        empty_ledger(),
+        mutate,
+        operation="live_transaction_lifecycle_record",
+    )
 
 
 async def ensure_break_even_floor(mint: str, position_id: str) -> bool:
@@ -776,7 +821,12 @@ async def ensure_break_even_floor(mint: str, position_id: str) -> bool:
         ledger["updated_at"] = utc_now()
         return True
 
-    armed, _ = update_json(LEDGER_PATH, empty_ledger(), mutate)
+    armed, _ = update_json(
+        LEDGER_PATH,
+        empty_ledger(),
+        mutate,
+        operation="paper_break_even_floor_ensure",
+    )
     return bool(armed)
 
 
@@ -804,7 +854,12 @@ async def record_quote_failure(mint: str, position_id: str, error: Exception) ->
         ledger["updated_at"] = utc_now()
         return failures, str(position.get("risk_state", "NORMAL"))
 
-    result, _ = update_json(LEDGER_PATH, empty_ledger(), mutate)
+    result, _ = update_json(
+        LEDGER_PATH,
+        empty_ledger(),
+        mutate,
+        operation="paper_quote_failure_record",
+    )
     if result and result[0] >= QUOTE_FAILURE_WARNING_COUNT:
         logger.warning(
             "Jupiter quote degraded: mint=%s position_id=%s failures=%s state=%s",

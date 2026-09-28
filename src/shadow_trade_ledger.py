@@ -87,6 +87,7 @@ def ensure_shadow_trades_migrated() -> dict[str, Any]:
         SHADOW_TRADE_PATH,
         empty_shadow_trades(),
         migrate_shadow_trade_document,
+        operation="shadow_trade_migration",
     )
 
 
@@ -238,6 +239,7 @@ def record_completed_shadow_trade(row: dict[str, Any]) -> bool:
         SHADOW_TRADE_PATH,
         empty_shadow_trades(),
         mutate,
+        operation="shadow_trade_record",
     )
     return bool(recorded)
 
@@ -310,5 +312,6 @@ def backfill_completed_shadow_trades(
         SHADOW_TRADE_PATH,
         empty_shadow_trades(),
         mutate,
+        operation="shadow_trade_backfill",
     )
     return int(added)

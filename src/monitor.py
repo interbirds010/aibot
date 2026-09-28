@@ -651,6 +651,7 @@ def record_wallet_ws_failure(reason: str, *, now_epoch: float | None = None) -> 
         state_store.GLOBAL_METRICS_PATH,
         {"schema_version": 2, "version": 0, "metrics": {}},
         mutate,
+        operation="wallet_ws_failure_record",
     )
 
 
