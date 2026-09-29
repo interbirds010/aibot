@@ -197,6 +197,8 @@ class DeployWorkflowTests(unittest.TestCase):
         self.assertIn('"$DEPLOY_MODE" == "normal" && \\', workflow)
         self.assertIn('"$RETENTION_ENABLED" == "true"', workflow)
         self.assertEqual(workflow.count("scripts/storage_retention.py"), 1)
+        self.assertIn('--deployed-sha "$last_successful_sha"', workflow)
+        self.assertIn('--active-source-sha "$DEPLOY_SHA"', workflow)
 
     def test_health_failure_cannot_reach_retention_or_marker(self) -> None:
         workflow = (ROOT / ".github" / "workflows" / "deploy.yml").read_text(
