@@ -9,6 +9,22 @@ from src import monitor, observation_tracker, runtime_memory
 
 
 class RuntimeMemoryTests(unittest.TestCase):
+    def setUp(self) -> None:
+        runtime_memory._malloc_trim_function = (
+            runtime_memory._MALLOC_TRIM_UNINITIALIZED
+        )
+        runtime_memory._allocator_libc_handle = None
+        runtime_memory._allocator_trim_last_attempt_monotonic = None
+        runtime_memory._allocator_trim_stats.update({
+            "attempt_count": 0,
+            "success_count": 0,
+            "failure_count": 0,
+            "last_at_epoch_seconds": None,
+            "last_rss_before_bytes": None,
+            "last_rss_after_bytes": None,
+            "last_latency_ms": None,
+        })
+
     def test_full_analysis_is_not_in_observer_hot_path(self) -> None:
         source = inspect.getsource(observation_tracker.observation_loop)
         self.assertNotIn("refresh_observation_analysis", source)
@@ -38,6 +54,145 @@ class RuntimeMemoryTests(unittest.TestCase):
         )
         self.assertNotIn("public", repr(metrics))
         self.assertIn("monitor_transaction_payload_max_bytes", metrics)
+
+    def test_allocator_trim_linux_glibc_available_and_rate_limited(self) -> None:
+        malloc_trim = mock.Mock(return_value=1)
+        clock = mock.Mock(
+            side_effect=[100.0, 100.01, 100.02, 120.0, 161.0, 161.01, 161.02]
+        )
+        with (
+            mock.patch.object(runtime_memory.sys, "platform", "linux"),
+            mock.patch.object(
+                runtime_memory, "current_rss_bytes", return_value=220 * 1024 * 1024
+            ),
+            mock.patch.object(
+                runtime_memory, "_load_malloc_trim", return_value=malloc_trim
+            ),
+            mock.patch.object(runtime_memory.time, "monotonic", clock),
+            mock.patch.object(runtime_memory.time, "time", return_value=1_000.0),
+            mock.patch.object(runtime_memory.time, "perf_counter", clock),
+        ):
+            self.assertTrue(runtime_memory.maybe_trim_allocator())
+            self.assertFalse(runtime_memory.maybe_trim_allocator())
+            self.assertTrue(runtime_memory.maybe_trim_allocator())
+        self.assertEqual(malloc_trim.call_count, 2)
+
+    def test_allocator_trim_skips_below_threshold_and_unknown_rss(self) -> None:
+        with (
+            mock.patch.object(runtime_memory.sys, "platform", "linux"),
+            mock.patch.object(
+                runtime_memory,
+                "current_rss_bytes",
+                side_effect=[None, 199 * 1024 * 1024],
+            ),
+            mock.patch.object(runtime_memory, "_load_malloc_trim") as load,
+        ):
+            self.assertFalse(runtime_memory.maybe_trim_allocator())
+            self.assertFalse(runtime_memory.maybe_trim_allocator())
+        load.assert_not_called()
+
+    def test_allocator_trim_is_noop_on_unsupported_platforms(self) -> None:
+        for platform_name in ("win32", "darwin"):
+            with (
+                self.subTest(platform=platform_name),
+                mock.patch.object(runtime_memory.sys, "platform", platform_name),
+                mock.patch.object(runtime_memory, "current_rss_bytes") as rss,
+            ):
+                self.assertFalse(runtime_memory.maybe_trim_allocator())
+                rss.assert_not_called()
+
+    def test_allocator_trim_load_and_symbol_failures_are_non_fatal(self) -> None:
+        with mock.patch.object(
+            runtime_memory.ctypes, "CDLL", side_effect=OSError("load failed")
+        ):
+            self.assertIsNone(runtime_memory._load_malloc_trim())
+
+        class VersionSymbol:
+            argtypes = None
+            restype = None
+
+            def __call__(self):
+                return b"2.39"
+
+        class GlibcWithoutTrim:
+            gnu_get_libc_version = VersionSymbol()
+
+        runtime_memory._malloc_trim_function = (
+            runtime_memory._MALLOC_TRIM_UNINITIALIZED
+        )
+        with mock.patch.object(
+            runtime_memory.ctypes, "CDLL", return_value=GlibcWithoutTrim()
+        ):
+            self.assertIsNone(runtime_memory._load_malloc_trim())
+
+    def test_allocator_trim_proc_read_failure_is_non_fatal(self) -> None:
+        with (
+            mock.patch.object(runtime_memory.sys, "platform", "linux"),
+            mock.patch.object(
+                runtime_memory,
+                "current_rss_bytes",
+                side_effect=OSError("proc unavailable"),
+            ),
+        ):
+            self.assertFalse(runtime_memory.maybe_trim_allocator())
+
+    def test_allocator_trim_call_exception_and_failure_are_non_fatal(self) -> None:
+        for outcome in (RuntimeError("trim failed"), 0):
+            trim = mock.Mock(side_effect=outcome) if isinstance(
+                outcome, Exception
+            ) else mock.Mock(return_value=outcome)
+            with (
+                self.subTest(outcome=repr(outcome)),
+                mock.patch.object(runtime_memory.sys, "platform", "linux"),
+                mock.patch.object(
+                    runtime_memory,
+                    "current_rss_bytes",
+                    return_value=220 * 1024 * 1024,
+                ),
+                mock.patch.object(
+                    runtime_memory, "_load_malloc_trim", return_value=trim
+                ),
+            ):
+                runtime_memory._allocator_trim_last_attempt_monotonic = None
+                self.assertFalse(runtime_memory.maybe_trim_allocator())
+
+    def test_allocator_trim_signature_is_explicit(self) -> None:
+        class Symbol:
+            argtypes = None
+            restype = None
+
+            def __init__(self, result):
+                self.result = result
+
+            def __call__(self):
+                return self.result
+
+        class Libc:
+            gnu_get_libc_version = Symbol(b"2.39")
+            malloc_trim = Symbol(1)
+
+        libc = Libc()
+        with mock.patch.object(runtime_memory.ctypes, "CDLL", return_value=libc):
+            resolved = runtime_memory._load_malloc_trim()
+            self.assertIs(runtime_memory._load_malloc_trim(), resolved)
+        self.assertIs(resolved, libc.malloc_trim)
+        self.assertEqual(libc.gnu_get_libc_version.argtypes, [])
+        self.assertIs(
+            libc.gnu_get_libc_version.restype, runtime_memory.ctypes.c_char_p
+        )
+        self.assertEqual(libc.malloc_trim.argtypes, [runtime_memory.ctypes.c_size_t])
+        self.assertIs(libc.malloc_trim.restype, runtime_memory.ctypes.c_int)
+
+    @unittest.skipUnless(
+        runtime_memory.sys.platform.startswith("linux"), "requires Linux glibc"
+    )
+    def test_real_linux_glibc_malloc_trim_is_available(self) -> None:
+        self.assertIsNotNone(runtime_memory._load_malloc_trim())
+        result = runtime_memory.maybe_trim_allocator(
+            rss_threshold_bytes=0, minimum_interval_seconds=0
+        )
+        self.assertIsInstance(result, bool)
+        self.assertEqual(runtime_memory._allocator_trim_stats["attempt_count"], 1)
 
     def test_completed_tracked_task_is_removed_from_both_registries(self) -> None:
         async def scenario() -> None:

@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import ctypes
 import math
 import sys
+import threading
+import time
 from collections import deque
 from pathlib import Path
 from typing import Any
@@ -19,11 +22,31 @@ MEMORY_PHASES = frozenset({
 })
 PAYLOAD_SIZE_WINDOW = 128
 PAYLOAD_ESTIMATE_MAX_NODES = 20_000
+# Production's normal p95 is about 188.7 MiB.  This threshold avoids normal
+# churn while preserving 60 MiB of headroom below PM2's 260 MiB ceiling.
+ALLOCATOR_TRIM_RSS_THRESHOLD_BYTES = 200 * 1024 * 1024
+# PM2 samples RSS every 30 seconds; one attempt per minute is soon enough to be
+# visible by the next samples without putting malloc_trim on every ledger call.
+ALLOCATOR_TRIM_MIN_INTERVAL_SECONDS = 60.0
 
 _phase_stats: dict[str, dict[str, int]] = {}
 _transaction_payload_sizes: deque[int] = deque(maxlen=PAYLOAD_SIZE_WINDOW)
 _transaction_payload_count = 0
 _transaction_payload_truncated_count = 0
+_MALLOC_TRIM_UNINITIALIZED = object()
+_malloc_trim_function: Any = _MALLOC_TRIM_UNINITIALIZED
+_allocator_libc_handle: Any = None
+_allocator_trim_lock = threading.Lock()
+_allocator_trim_last_attempt_monotonic: float | None = None
+_allocator_trim_stats: dict[str, int | float | None] = {
+    "attempt_count": 0,
+    "success_count": 0,
+    "failure_count": 0,
+    "last_at_epoch_seconds": None,
+    "last_rss_before_bytes": None,
+    "last_rss_after_bytes": None,
+    "last_latency_ms": None,
+}
 
 
 def _proc_values(text: str) -> dict[str, int]:
@@ -77,6 +100,93 @@ def process_memory_snapshot(
 
 def current_rss_bytes() -> int | None:
     return process_memory_snapshot()["rss_bytes"]
+
+
+def _load_malloc_trim() -> Any:
+    """Resolve glibc malloc_trim lazily, caching unsupported environments."""
+    global _allocator_libc_handle, _malloc_trim_function
+    if _malloc_trim_function is not _MALLOC_TRIM_UNINITIALIZED:
+        return _malloc_trim_function
+    try:
+        libc = ctypes.CDLL("libc.so.6", use_errno=True)
+        glibc_version = libc.gnu_get_libc_version
+        glibc_version.argtypes = []
+        glibc_version.restype = ctypes.c_char_p
+        if not glibc_version():
+            raise RuntimeError("glibc version is unavailable")
+        malloc_trim = libc.malloc_trim
+        malloc_trim.argtypes = [ctypes.c_size_t]
+        malloc_trim.restype = ctypes.c_int
+    except Exception:
+        _malloc_trim_function = None
+        return None
+    _allocator_libc_handle = libc
+    _malloc_trim_function = malloc_trim
+    return malloc_trim
+
+
+def maybe_trim_allocator(
+    *,
+    rss_threshold_bytes: int = ALLOCATOR_TRIM_RSS_THRESHOLD_BYTES,
+    minimum_interval_seconds: float = ALLOCATOR_TRIM_MIN_INTERVAL_SECONDS,
+) -> bool:
+    """Rate-limited, fail-open glibc heap release after a large document dies.
+
+    Callers must invoke this only after releasing their state lock and final
+    full-document reference.  Unsupported platforms and every diagnostic or
+    allocator failure are deliberately treated as a no-op.
+    """
+    global _allocator_trim_last_attempt_monotonic
+    try:
+        if not sys.platform.startswith("linux"):
+            return False
+        rss_before = current_rss_bytes()
+        threshold = max(0, int(rss_threshold_bytes))
+        if rss_before is None or rss_before < threshold:
+            return False
+        now = time.monotonic()
+        interval = max(0.0, float(minimum_interval_seconds))
+        with _allocator_trim_lock:
+            if (
+                _allocator_trim_last_attempt_monotonic is not None
+                and now - _allocator_trim_last_attempt_monotonic < interval
+            ):
+                return False
+            _allocator_trim_last_attempt_monotonic = now
+            _allocator_trim_stats["attempt_count"] = int(
+                _allocator_trim_stats["attempt_count"] or 0
+            ) + 1
+            _allocator_trim_stats["last_at_epoch_seconds"] = time.time()
+            _allocator_trim_stats["last_rss_before_bytes"] = rss_before
+            started = time.perf_counter()
+            malloc_trim = _load_malloc_trim()
+            if malloc_trim is None:
+                _allocator_trim_stats["failure_count"] = int(
+                    _allocator_trim_stats["failure_count"] or 0
+                ) + 1
+                _allocator_trim_stats["last_latency_ms"] = round(
+                    (time.perf_counter() - started) * 1000, 4
+                )
+                return False
+            try:
+                succeeded = bool(malloc_trim(0))
+            except Exception:
+                succeeded = False
+            _allocator_trim_stats["last_latency_ms"] = round(
+                (time.perf_counter() - started) * 1000, 4
+            )
+            try:
+                rss_after = current_rss_bytes()
+            except Exception:
+                rss_after = None
+            _allocator_trim_stats["last_rss_after_bytes"] = rss_after
+            counter = "success_count" if succeeded else "failure_count"
+            _allocator_trim_stats[counter] = int(
+                _allocator_trim_stats[counter] or 0
+            ) + 1
+            return succeeded
+    except Exception:
+        return False
 
 
 def record_memory_phase(name: str, before_rss_bytes: int | None) -> None:
@@ -156,6 +266,8 @@ def runtime_memory_metrics(*, rss_ceiling_bytes: int) -> dict[str, Any]:
     rss = snapshot["rss_bytes"]
     ceiling = max(1, int(rss_ceiling_bytes))
     payloads = list(_transaction_payload_sizes)
+    with _allocator_trim_lock:
+        allocator_trim_stats = dict(_allocator_trim_stats)
     return {
         "monitor_memory_rss_bytes": rss,
         "monitor_memory_vms_bytes": snapshot["vms_bytes"],
@@ -181,4 +293,25 @@ def runtime_memory_metrics(*, rss_ceiling_bytes: int) -> dict[str, Any]:
         "monitor_transaction_payload_estimate_truncated_count": (
             _transaction_payload_truncated_count
         ),
+        "monitor_allocator_trim_attempt_count": allocator_trim_stats[
+            "attempt_count"
+        ],
+        "monitor_allocator_trim_success_count": allocator_trim_stats[
+            "success_count"
+        ],
+        "monitor_allocator_trim_failure_count": allocator_trim_stats[
+            "failure_count"
+        ],
+        "monitor_allocator_trim_last_at_epoch_seconds": allocator_trim_stats[
+            "last_at_epoch_seconds"
+        ],
+        "monitor_allocator_trim_last_rss_before_bytes": allocator_trim_stats[
+            "last_rss_before_bytes"
+        ],
+        "monitor_allocator_trim_last_rss_after_bytes": allocator_trim_stats[
+            "last_rss_after_bytes"
+        ],
+        "monitor_allocator_trim_last_latency_ms": allocator_trim_stats[
+            "last_latency_ms"
+        ],
     }
