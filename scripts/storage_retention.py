@@ -689,7 +689,11 @@ def plan_validated_backups(
         if not candidate.name.startswith("predeploy-"):
             continue
         match = BACKUP_PATTERN.fullmatch(candidate.name)
-        if match is None:
+        try:
+            if match is None:
+                raise ValueError
+            datetime.strptime(match.group(1), "%Y%m%dT%H%M%SZ")
+        except ValueError:
             candidates.append(Candidate(candidate, Classification.INVALID_DO_NOT_TOUCH, "invalid_name"))
             continue
         try:
@@ -735,7 +739,8 @@ def plan_validated_backups(
                 item.reason = "unknown_marker_state"
         return RetentionPlan(candidates)
 
-    latest_paths = {item.path for item in exact_named[:keep]}
+    latest_valid = [item for item in exact_named if item.revision]
+    latest_paths = {item.path for item in latest_valid[:keep]}
     for item in exact_named:
         if item.classification != Classification.SAFE_TO_DELETE:
             continue

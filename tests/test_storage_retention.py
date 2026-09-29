@@ -333,6 +333,8 @@ class BackupRetentionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             backups, deployed, active = self._fixture(root)
+            invalid_newest = root / "predeploy-20260930T010203Z-ffffffffffff"
+            invalid_newest.mkdir()
             plan = plan_validated_backups(
                 root, keep=3, deployed_sha=deployed, active_source_sha=active
             )
@@ -340,6 +342,20 @@ class BackupRetentionTests(unittest.TestCase):
             self.assertEqual(_reason(plan, backups[1][0].name)[1], "protected_successful")
             self.assertEqual(_reason(plan, backups[5][0].name)[1], "protected_active")
             self.assertEqual(_reason(plan, backups[4][0].name)[1], "protected_latest")
+            self.assertEqual(_reason(plan, backups[3][0].name)[1], "protected_latest")
+            self.assertEqual(_reason(plan, invalid_newest.name)[1], "manifest_missing")
+
+    def test_impossible_backup_timestamp_is_invalid_name(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            _, deployed = _make_backup(root, day=8, sha_digit="8")
+            _, active = _make_backup(root, day=9, sha_digit="9")
+            invalid = root / "predeploy-20261399T256199Z-ffffffffffff"
+            invalid.mkdir()
+            plan = plan_validated_backups(
+                root, keep=1, deployed_sha=deployed, active_source_sha=active
+            )
+            self.assertEqual(_reason(plan, invalid.name)[1], "invalid_name")
 
     def test_dry_run_and_real_run_remove_only_same_safe_set(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
