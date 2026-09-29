@@ -408,6 +408,153 @@ class StateLockDiagnosticContractTests(unittest.TestCase):
                 )
             self.assertEqual(operations, ["sample_attempt"])
 
+    def test_explicit_noop_preserves_version_and_file_bytes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            target = Path(temporary) / "state.json"
+            state_store.atomic_write_json(target, {"version": 7, "value": "stable"})
+            before = target.read_bytes()
+            with patch.object(state_store, "atomic_write_json") as write:
+                result, document = state_store.update_json(
+                    target,
+                    {"version": 0},
+                    lambda current: state_store.MutationResult("noop", False),
+                    operation="explicit_noop",
+                )
+            self.assertEqual(result, "noop")
+            self.assertEqual(document["version"], 7)
+            self.assertEqual(target.read_bytes(), before)
+            write.assert_not_called()
+
+    def test_explicit_noop_still_enforces_expected_version(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            target = Path(temporary) / "state.json"
+            state_store.atomic_write_json(target, {"version": 7, "value": "stable"})
+            mutator_called = False
+
+            def mutate(document: dict[str, object]) -> state_store.MutationResult[None]:
+                nonlocal mutator_called
+                mutator_called = True
+                return state_store.MutationResult(None, False)
+
+            with self.assertRaises(state_store.VersionConflict):
+                state_store.update_json(
+                    target,
+                    {"version": 0},
+                    mutate,
+                    expected_version=6,
+                    operation="explicit_noop_conflict",
+                )
+            self.assertFalse(mutator_called)
+            self.assertEqual(
+                state_store.read_json(target, {}),
+                {"version": 7, "value": "stable"},
+            )
+
+    def test_legacy_mutator_return_shapes_keep_write_semantics(self) -> None:
+        class CustomResult:
+            pass
+
+        sentinels = (None, False, {"result": "dict"}, ("tuple",), CustomResult())
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for index, sentinel in enumerate(sentinels):
+                with self.subTest(return_type=type(sentinel).__name__):
+                    target = root / f"state-{index}.json"
+                    state_store.atomic_write_json(target, {"version": 0})
+
+                    def mutate(
+                        document: dict[str, object],
+                        value: object = sentinel,
+                    ) -> object:
+                        document["changed"] = True
+                        return value
+
+                    result, document = state_store.update_json(
+                        target,
+                        {"version": 0},
+                        mutate,
+                        operation="legacy_return_shape",
+                    )
+                    self.assertIs(result, sentinel)
+                    self.assertEqual(document["version"], 1)
+                    self.assertTrue(state_store.read_json(target, {})["changed"])
+
+    def test_explicit_noop_and_concurrent_writer_preserve_real_change(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            target = Path(temporary) / "state.json"
+            state_store.atomic_write_json(target, {"version": 0, "value": 0})
+            barrier = threading.Barrier(2)
+
+            def noop() -> None:
+                barrier.wait()
+                state_store.update_json(
+                    target,
+                    {"version": 0},
+                    lambda document: state_store.MutationResult(None, False),
+                    operation="concurrent_noop",
+                )
+
+            def change() -> None:
+                barrier.wait()
+
+                def mutate(document: dict[str, object]) -> None:
+                    document["value"] = 1
+
+                state_store.update_json(
+                    target,
+                    {"version": 0},
+                    mutate,
+                    operation="concurrent_change",
+                )
+
+            threads = [threading.Thread(target=noop), threading.Thread(target=change)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(2)
+                self.assertFalse(thread.is_alive())
+            saved = state_store.read_json(target, {})
+            self.assertEqual(saved, {"version": 1, "value": 1})
+
+    def test_competing_identical_mutations_use_fresh_document_for_noop(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            target = Path(temporary) / "state.json"
+            state_store.atomic_write_json(target, {"version": 0, "applied": False})
+            barrier = threading.Barrier(2)
+            outcomes: list[bool] = []
+
+            def apply_once() -> None:
+                barrier.wait()
+
+                def mutate(
+                    document: dict[str, object],
+                ) -> state_store.MutationResult[bool]:
+                    if document.get("applied") is True:
+                        return state_store.MutationResult(False, False)
+                    document["applied"] = True
+                    return state_store.MutationResult(True, True)
+
+                changed, _ = state_store.update_json(
+                    target,
+                    {"version": 0, "applied": False},
+                    mutate,
+                    operation="competing_identical_mutation",
+                )
+                outcomes.append(changed)
+
+            threads = [threading.Thread(target=apply_once) for _ in range(2)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(2)
+                self.assertFalse(thread.is_alive())
+
+            self.assertCountEqual(outcomes, [True, False])
+            self.assertEqual(
+                state_store.read_json(target, {}),
+                {"version": 1, "applied": True},
+            )
+
 
 @unittest.skipUnless(LINUX, "requires Linux flock and /proc/locks")
 class LinuxStateLockDiagnosticTests(unittest.TestCase):

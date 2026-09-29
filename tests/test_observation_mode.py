@@ -84,7 +84,11 @@ class ObservationLedgerTests(unittest.TestCase):
 
     def test_observation_is_idempotent_and_does_not_create_position(self) -> None:
         self.assertTrue(self.record())
-        self.assertFalse(self.record())
+        before = observation_tracker.OBSERVATION_PATH.read_bytes()
+        with patch.object(state_store, "atomic_write_json") as write:
+            self.assertFalse(self.record())
+        write.assert_not_called()
+        self.assertEqual(observation_tracker.OBSERVATION_PATH.read_bytes(), before)
         document = observation_tracker.read_json(
             observation_tracker.OBSERVATION_PATH,
             observation_tracker.empty_observations(),
@@ -109,6 +113,84 @@ class ObservationLedgerTests(unittest.TestCase):
             document["observations"][0]["safety_metrics"]["lp_locked_percent"],
             82.5,
         )
+        self.assertEqual(document["version"], 1)
+
+    def test_duplicate_candidate_discovery_does_not_rewrite_ledger(self) -> None:
+        arguments = {
+            "mint": "MINT",
+            "route_type": "A",
+            "source_wallet": "WALLET",
+            "source_signature": "SIGNATURE",
+            "token_amount_raw": 100,
+            "token_decimals": 6,
+            "signal_detected_at": "2026-07-30T00:00:00+00:00",
+        }
+        first = asyncio.run(
+            observation_tracker.record_candidate_discovery(**arguments)
+        )
+        before = observation_tracker.OBSERVATION_PATH.read_bytes()
+        with patch.object(state_store, "atomic_write_json") as write:
+            second = asyncio.run(
+                observation_tracker.record_candidate_discovery(**arguments)
+            )
+        self.assertTrue(first.created)
+        self.assertFalse(second.created)
+        write.assert_not_called()
+        self.assertEqual(observation_tracker.OBSERVATION_PATH.read_bytes(), before)
+
+    def test_stale_sample_operations_do_not_rewrite_ledger(self) -> None:
+        self.record()
+        row = observation_tracker.read_json(
+            observation_tracker.OBSERVATION_PATH,
+            observation_tracker.empty_observations(),
+        )["observations"][0]
+        self.assertTrue(observation_tracker.record_sample(
+            row["observation_id"],
+            "1m",
+            proceeds_lamports=1_100,
+        ))
+        before = observation_tracker.OBSERVATION_PATH.read_bytes()
+        with patch.object(state_store, "atomic_write_json") as write:
+            self.assertFalse(observation_tracker.record_sample(
+                row["observation_id"],
+                "1m",
+                proceeds_lamports=1_100,
+            ))
+            self.assertEqual(
+                observation_tracker.record_sample_attempt(
+                    row["observation_id"],
+                    "1m",
+                    error="stale",
+                ),
+                0,
+            )
+        write.assert_not_called()
+        self.assertEqual(observation_tracker.OBSERVATION_PATH.read_bytes(), before)
+
+    def test_replayed_archive_marker_does_not_rewrite_ledger(self) -> None:
+        self.record()
+        document = observation_tracker.read_json(
+            observation_tracker.OBSERVATION_PATH,
+            observation_tracker.empty_observations(),
+        )
+        row = document["observations"][0]
+        snapshot = {
+            "observation_id": row["observation_id"],
+            "archive_schema_version": 1,
+            "archived_at": "2026-09-28T00:00:00+00:00",
+        }
+        self.assertEqual(
+            observation_tracker._persist_archive_markers([snapshot]),
+            1,
+        )
+        before = observation_tracker.OBSERVATION_PATH.read_bytes()
+        with patch.object(state_store, "atomic_write_json") as write:
+            self.assertEqual(
+                observation_tracker._persist_archive_markers([snapshot]),
+                1,
+            )
+        write.assert_not_called()
+        self.assertEqual(observation_tracker.OBSERVATION_PATH.read_bytes(), before)
 
     def test_canonical_research_event_serializes_signal_type_and_shadow(self) -> None:
         self.assertTrue(self.record(route="B"))

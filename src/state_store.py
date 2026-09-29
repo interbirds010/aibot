@@ -12,8 +12,9 @@ import os
 import tempfile
 import time
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Iterator, TypeVar
+from typing import Any, Callable, Generic, Iterator, TypeVar
 
 from src import state_lock_diagnostics
 
@@ -23,7 +24,16 @@ else:  # pragma: no cover - exercised by the Linux deployment.
     import fcntl
 
 T = TypeVar("T")
-Mutator = Callable[[dict[str, Any]], T]
+
+@dataclass(frozen=True, slots=True)
+class MutationResult(Generic[T]):
+    """Explicitly report whether a mutator changed persistent state."""
+
+    value: T
+    changed: bool
+
+
+Mutator = Callable[[dict[str, Any]], T | MutationResult[T]]
 VALID_ROUTE_TYPES = frozenset({"A", "B"})
 ROOT = Path(__file__).resolve().parents[1]
 PAPER_TRADES_PATH = ROOT / "data" / "paper_trades.json"
@@ -253,7 +263,14 @@ def update_json(
                 f"{path.name} version changed: expected={expected_version}, "
                 f"actual={current_version}"
             )
-        result = mutator(document)
+        _set_holder_phase(diagnostic_attempt, "MUTATION")
+        mutation = mutator(document)
+        if isinstance(mutation, MutationResult):
+            result = mutation.value
+            if not mutation.changed:
+                return result, document
+        else:
+            result = mutation
         document["version"] = current_version + 1
         atomic_write_json(path, document, diagnostic_attempt=diagnostic_attempt)
         return result, document

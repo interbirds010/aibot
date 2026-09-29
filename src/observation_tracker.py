@@ -23,6 +23,7 @@ from src.research.prospective_features import (
 from src.research.coverage_telemetry import record_funnel_stage
 from src.runtime_memory import current_rss_bytes, record_memory_phase
 from src.state_store import (
+    MutationResult,
     StateLockTimeout,
     migrate_json,
     read_json,
@@ -542,9 +543,10 @@ def _persist_archive_markers(snapshots: list[dict[str, Any]]) -> int:
     if not markers:
         return 0
 
-    def mutate(document: dict[str, Any]) -> int:
-        migrate_observation_document(document)
+    def mutate(document: dict[str, Any]) -> MutationResult[int]:
+        migrated = migrate_observation_document(document)
         persisted = 0
+        marker_changed = False
         rows = document.get("observations", [])
         for row in rows:
             if not isinstance(row, dict):
@@ -552,12 +554,25 @@ def _persist_archive_markers(snapshots: list[dict[str, Any]]) -> int:
             archived_at = markers.get(str(row.get("observation_id") or ""))
             if not archived_at:
                 continue
-            row["archive_schema_version"] = 1
-            row["archived_at"] = archived_at
+            if (
+                row.get("archive_schema_version") != 1
+                or row.get("archived_at") != archived_at
+            ):
+                row["archive_schema_version"] = 1
+                row["archived_at"] = archived_at
+                marker_changed = True
             persisted += 1
-        document["observations"] = archive_and_retain_observations(rows)
-        document["updated_at"] = datetime.now(timezone.utc).isoformat()
-        return persisted
+        retained = archive_and_retain_observations(rows)
+        retention_changed = len(retained) != len(rows) or any(
+            before is not after for before, after in zip(rows, retained)
+        )
+        if marker_changed or retention_changed:
+            document["observations"] = retained
+            document["updated_at"] = datetime.now(timezone.utc).isoformat()
+        return MutationResult(
+            persisted,
+            migrated or marker_changed or retention_changed,
+        )
 
     persisted, _ = update_json(
         OBSERVATION_PATH,
@@ -701,19 +716,22 @@ async def record_candidate_discovery(
     score = _float_or_zero(dex_momentum_score)
     variants = strategy_variants(route_type, score)
 
-    def mutate(document: dict[str, Any]) -> ObservationDecision:
-        migrate_observation_document(document)
+    def mutate(document: dict[str, Any]) -> MutationResult[ObservationDecision]:
+        migrated = migrate_observation_document(document)
         rows = document.setdefault("observations", [])
         existing = next((
             row for row in rows
             if isinstance(row, dict) and row.get("observation_id") == observation_id
         ), None)
         if isinstance(existing, dict):
-            return ObservationDecision(
-                False,
-                observation_id,
-                existing.get("candidate_v2_eligible") is True,
-                tuple(existing.get("strategy_variants") or variants),
+            return MutationResult(
+                ObservationDecision(
+                    False,
+                    observation_id,
+                    existing.get("candidate_v2_eligible") is True,
+                    tuple(existing.get("strategy_variants") or variants),
+                ),
+                migrated,
             )
         payload = {
             "observation_id": observation_id,
@@ -771,7 +789,10 @@ async def record_candidate_discovery(
         document["observations"] = archive_and_retain_observations(rows)
         document["schema_version"] = OBSERVATION_SCHEMA_VERSION
         document["updated_at"] = datetime.now(timezone.utc).isoformat()
-        return ObservationDecision(True, observation_id, False, variants)
+        return MutationResult(
+            ObservationDecision(True, observation_id, False, variants),
+            True,
+        )
 
     decision, _ = await asyncio.to_thread(
         update_json,
@@ -903,8 +924,8 @@ async def record_observation_decision(
     observation_id = f"{source_signature}:{source_wallet}:{mint}"
     started_at = time.time()
 
-    def mutate(document: dict[str, Any]) -> ObservationDecision:
-        migrate_observation_document(document)
+    def mutate(document: dict[str, Any]) -> MutationResult[ObservationDecision]:
+        migrated = migrate_observation_document(document)
         rows = document.setdefault("observations", [])
         if not isinstance(rows, list):
             raise RuntimeError("signal observation ledger is malformed")
@@ -913,11 +934,14 @@ async def record_observation_decision(
             if isinstance(row, dict) and row.get("observation_id") == observation_id
         ), None)
         if isinstance(existing, dict) and existing.get("quote_status") == "EXECUTABLE":
-            return ObservationDecision(
-                False,
-                observation_id,
-                existing.get("candidate_v2_eligible") is True,
-                tuple(existing.get("strategy_variants") or ("baseline_v1",)),
+            return MutationResult(
+                ObservationDecision(
+                    False,
+                    observation_id,
+                    existing.get("candidate_v2_eligible") is True,
+                    tuple(existing.get("strategy_variants") or ("baseline_v1",)),
+                ),
+                migrated,
             )
         score = _float_or_zero(dex_momentum_score)
         normalized_decision = str(decision_status).upper()
@@ -1025,7 +1049,10 @@ async def record_observation_decision(
         document["observations"] = archive_and_retain_observations(rows)
         document["schema_version"] = OBSERVATION_SCHEMA_VERSION
         document["updated_at"] = datetime.now(timezone.utc).isoformat()
-        return ObservationDecision(True, observation_id, candidate_eligible, variants)
+        return MutationResult(
+            ObservationDecision(True, observation_id, candidate_eligible, variants),
+            True,
+        )
 
     decision, _ = await asyncio.to_thread(
         update_json,
@@ -1285,27 +1312,27 @@ def record_sample_attempt(
     if interval not in allowed:
         raise ValueError("unsupported observation interval")
 
-    def mutate(document: dict[str, Any]) -> int:
-        migrate_observation_document(document)
+    def mutate(document: dict[str, Any]) -> MutationResult[int]:
+        migrated = migrate_observation_document(document)
         target = next((
             row for row in document.get("observations", [])
             if isinstance(row, dict)
             and row.get("observation_id") == observation_id
         ), None)
         if not isinstance(target, dict):
-            return 0
+            return MutationResult(0, migrated)
         if any(
             isinstance(sample, dict) and sample.get("interval") == interval
             for sample in target.get("samples", [])
         ):
-            return 0
+            return MutationResult(0, migrated)
         attempts = target.setdefault("sample_attempts", {})
         count = int(attempts.get(interval, 0) or 0) + 1
         attempts[interval] = count
         target["sample_last_error"] = error[:500]
         target["sample_last_attempt_at"] = datetime.now(timezone.utc).isoformat()
         document["updated_at"] = datetime.now(timezone.utc).isoformat()
-        return count
+        return MutationResult(count, True)
 
     count, _ = update_json(
         OBSERVATION_PATH,
@@ -1446,20 +1473,20 @@ def record_sample_batch(results: list[SampleResult]) -> int:
     if any(result.interval not in allowed for result in results):
         raise ValueError("unsupported observation interval")
 
-    def mutate(document: dict[str, Any]) -> list[_AppliedSample]:
-        migrate_observation_document(document)
+    def mutate(document: dict[str, Any]) -> MutationResult[list[_AppliedSample]]:
+        migrated = migrate_observation_document(document)
         applied_targets: list[tuple[SampleResult, dict[str, Any]]] = []
         for result in results:
             target = _apply_sample_to_document(document, result)
             if target is not None:
                 applied_targets.append((result, target))
         if not applied_targets:
-            return []
+            return MutationResult([], migrated)
         rows = document.get("observations", [])
         expire_observation_backlog(rows)
         document["observations"] = archive_and_retain_observations(rows)
         document["updated_at"] = datetime.now(timezone.utc).isoformat()
-        return [
+        return MutationResult([
             _AppliedSample(
                 result=result,
                 mint=str(target.get("mint", "")),
@@ -1471,7 +1498,7 @@ def record_sample_batch(results: list[SampleResult]) -> int:
                 ),
             )
             for result, target in applied_targets
-        ]
+        ], True)
 
     applied, _ = update_json(
         OBSERVATION_PATH,
