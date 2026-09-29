@@ -34,9 +34,11 @@ class DeployTriggerDecision:
 NON_DEPLOY_EXACT_PATHS = frozenset(
     {
         ".github/workflows/deploy.yml",
+        ".github/workflows/retention-tool-rollout.yml",
         "scripts/deploy_contract.py",
     }
 )
+RETENTION_TOOL_PATH = "scripts/storage_retention.py"
 KNOWN_SINGLE_PATH_STATUSES = frozenset(
     {"A", "M", "D", "T", "U", "X", "B"}
 )
@@ -74,6 +76,11 @@ def is_known_non_runtime_path(path: str) -> bool:
 def classify_changed_paths(paths: tuple[str, ...]) -> DeployTriggerDecision:
     if not paths:
         return DeployTriggerDecision(False, "empty_diff")
+    if RETENTION_TOOL_PATH in paths and all(
+        path == RETENTION_TOOL_PATH or is_known_non_runtime_path(path)
+        for path in paths
+    ):
+        return DeployTriggerDecision(False, "retention_tool_only")
     if all(is_known_non_runtime_path(path) for path in paths):
         return DeployTriggerDecision(False, "non_runtime_only")
     return DeployTriggerDecision(True, "runtime_or_unknown")

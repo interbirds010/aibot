@@ -138,6 +138,9 @@ class DeployWorkflowTests(unittest.TestCase):
         )
         self.assertIn('paths-ignore:', workflow)
         self.assertIn('- ".github/workflows/deploy.yml"', workflow)
+        self.assertIn(
+            '- ".github/workflows/retention-tool-rollout.yml"', workflow
+        )
         self.assertIn('- "scripts/deploy_contract.py"', workflow)
         self.assertIn('- "tests/test_deploy_contract.py"', workflow)
         self.assertIn('- "tests/test_deploy_workflows.py"', workflow)
@@ -351,6 +354,89 @@ class DeployWorkflowTests(unittest.TestCase):
         self.assertGreater(len(blocks), 5)
         for sequence, block in enumerate(blocks):
             compile(block, f"deploy.yml:python-heredoc-{sequence}", "exec")
+
+    def test_retention_tool_rollout_is_manual_fixed_and_runtime_free(self) -> None:
+        workflow = (
+            ROOT / ".github" / "workflows" / "retention-tool-rollout.yml"
+        ).read_text(encoding="utf-8")
+        self.assertIn("workflow_dispatch:", workflow)
+        self.assertNotIn("\n  push:", workflow)
+        self.assertNotIn("inputs:", workflow)
+        self.assertIn("github.ref == 'refs/heads/main'", workflow)
+        self.assertIn("environment: production", workflow)
+        self.assertIn("contents: read", workflow)
+        self.assertIn("secrets.SSH_FINGERPRINT", workflow)
+        self.assertIn("fingerprint: ${{ secrets.SSH_FINGERPRINT }}", workflow)
+        self.assertEqual(
+            workflow.count('source: "scripts/storage_retention.py"'), 1
+        )
+        self.assertIn(
+            'target: "/home/deploy/aibot-retention-tool-stage"', workflow
+        )
+        self.assertIn("strip_components: 1", workflow)
+        self.assertIn(
+            'destination="/var/www/aibot/scripts/storage_retention.py"',
+            workflow,
+        )
+        self.assertIn("sha256sum", workflow)
+        self.assertIn("runpy.run_path", workflow)
+        self.assertIn("--dry-run", workflow)
+        self.assertIn("mv -fT", workflow)
+        self.assertIn("RETENTION_TOOL_ROLLBACK", workflow)
+        self.assertNotIn("actions/checkout@v", workflow)
+        self.assertNotIn("appleboy/scp-action@v", workflow)
+        self.assertNotIn("appleboy/ssh-action@v", workflow)
+        for forbidden in (
+            "pm2 ",
+            "startOrReload",
+            "predeploy-",
+            ".deployed-sha",
+            "--data-root",
+            "--backup-root",
+            "scripts/storage_retention.py --dry-run",
+            'source: "src',
+        ):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, workflow)
+
+    def test_retention_tool_rollout_fails_closed_before_atomic_replace(self) -> None:
+        workflow = (
+            ROOT / ".github" / "workflows" / "retention-tool-rollout.yml"
+        ).read_text(encoding="utf-8")
+        checksum_gate = 'test "$staged_checksum" = "$TOOL_SHA256"'
+        compile_gate = 'validate_tool "$staged"'
+        replace = 'mv -fT "$install_temporary" "$destination"'
+        self.assertLess(workflow.index(checksum_gate), workflow.index(replace))
+        self.assertLess(workflow.index(compile_gate), workflow.index(replace))
+        self.assertIn("set -Eeuo pipefail", workflow)
+        self.assertIn("trap restore_on_error ERR", workflow)
+
+    def test_retention_tool_rollout_embedded_python_blocks_compile(self) -> None:
+        workflow = (
+            ROOT / ".github" / "workflows" / "retention-tool-rollout.yml"
+        ).read_text(encoding="utf-8")
+        lines = workflow.splitlines()
+        blocks: list[str] = []
+        index = 0
+        while index < len(lines):
+            if "<<'PY'" not in lines[index]:
+                index += 1
+                continue
+            block: list[str] = []
+            index += 1
+            while index < len(lines) and lines[index].strip() != "PY":
+                block.append(lines[index])
+                index += 1
+            self.assertLess(index, len(lines), "unterminated Python heredoc")
+            blocks.append(textwrap.dedent("\n".join(block)))
+            index += 1
+        self.assertEqual(len(blocks), 2)
+        for sequence, block in enumerate(blocks):
+            compile(
+                block,
+                f"retention-tool-rollout.yml:python-heredoc-{sequence}",
+                "exec",
+            )
 
     def test_extended_observation_is_manual_and_bounded(self) -> None:
         workflow = (

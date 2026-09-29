@@ -6,6 +6,7 @@ on:
       - main
     paths-ignore:
       - ".github/workflows/deploy.yml"
+      - ".github/workflows/retention-tool-rollout.yml"
       - "scripts/deploy_contract.py"
       - "tests/test_deploy_contract.py"
       - "tests/test_deploy_workflows.py"

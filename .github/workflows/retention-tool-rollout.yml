@@ -1,0 +1,239 @@
+name: Roll out retention tool
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-aibot-production
+  cancel-in-progress: false
+
+jobs:
+  rollout:
+    name: Roll out storage retention tool only
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out main
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Validate fixed rollout artifact
+        id: artifact
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          test "$GITHUB_REF" = "refs/heads/main"
+          test -f scripts/storage_retention.py
+          test ! -L scripts/storage_retention.py
+          python3 - <<'PY'
+          import runpy
+          from pathlib import Path
+
+          path = Path("scripts/storage_retention.py")
+          namespace = runpy.run_path(str(path), run_name="retention_tool_smoke")
+          if not callable(namespace.get("main")):
+              raise SystemExit("retention tool main entry point is missing")
+          if namespace.get("PRODUCTION_DATA_ROOT") != Path("/var/www/aibot/data"):
+              raise SystemExit("retention data root contract changed")
+          if namespace.get("PRODUCTION_BACKUP_ROOT") != Path(
+              "/home/deploy/aibot-backups"
+          ):
+              raise SystemExit("retention backup root contract changed")
+          PY
+          help="$(python3 -B scripts/storage_retention.py --help)"
+          grep -F -- '--dry-run' <<<"$help" >/dev/null
+          grep -F -- '--deployed-sha' <<<"$help" >/dev/null
+          grep -F -- '--active-source-sha' <<<"$help" >/dev/null
+          checksum="$(sha256sum scripts/storage_retention.py | cut -d' ' -f1)"
+          [[ "$checksum" =~ ^[0-9a-f]{64}$ ]]
+          printf 'sha256=%s\n' "$checksum" >> "$GITHUB_OUTPUT"
+
+      - name: Require pinned Production SSH host
+        shell: bash
+        env:
+          SSH_FINGERPRINT: ${{ secrets.SSH_FINGERPRINT }}
+        run: |
+          set -Eeuo pipefail
+          [[ "$SSH_FINGERPRINT" =~ ^SHA256:[A-Za-z0-9+/]{43}$ ]]
+
+      - name: Prepare fixed retention tool staging directory
+        uses: appleboy/ssh-action@0ff4204d59e8e51228ff73bce53f80d53301dee2 # v1.2.5
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: deploy
+          password: ${{ secrets.SSH_PASSWORD }}
+          fingerprint: ${{ secrets.SSH_FINGERPRINT }}
+          port: 22
+          timeout: 30s
+          command_timeout: 2m
+          script: |
+            set -Eeuo pipefail
+            stage_root="/home/deploy/aibot-retention-tool-stage"
+            staged="$stage_root/storage_retention.py"
+            if [[ ! -e "$stage_root" ]]; then
+              mkdir "$stage_root"
+            fi
+            test ! -L "$stage_root"
+            test -d "$stage_root"
+            test "$(readlink -f "$stage_root")" = "$stage_root"
+            test "$(stat -c '%U:%G' "$stage_root")" = "deploy:deploy"
+            chmod 700 "$stage_root"
+            if [[ -e "$staged" || -L "$staged" ]]; then
+              test ! -L "$staged"
+              test -f "$staged"
+              test "$(stat -c '%U:%G' "$staged")" = "deploy:deploy"
+              test "$(stat -c '%h' "$staged")" = "1"
+            fi
+
+      - name: Upload fixed retention tool artifact
+        uses: appleboy/scp-action@ff85246acaad7bdce478db94a363cd2bf7c90345 # v1.0.0
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: deploy
+          password: ${{ secrets.SSH_PASSWORD }}
+          fingerprint: ${{ secrets.SSH_FINGERPRINT }}
+          port: 22
+          timeout: 30s
+          command_timeout: 2m
+          source: "scripts/storage_retention.py"
+          target: "/home/deploy/aibot-retention-tool-stage"
+          strip_components: 1
+          overwrite: true
+          rm: false
+
+      - name: Verify and atomically install retention tool
+        uses: appleboy/ssh-action@0ff4204d59e8e51228ff73bce53f80d53301dee2 # v1.2.5
+        env:
+          TOOL_GIT_SHA: ${{ github.sha }}
+          TOOL_SHA256: ${{ steps.artifact.outputs.sha256 }}
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: deploy
+          password: ${{ secrets.SSH_PASSWORD }}
+          fingerprint: ${{ secrets.SSH_FINGERPRINT }}
+          port: 22
+          timeout: 30s
+          command_timeout: 5m
+          envs: TOOL_GIT_SHA,TOOL_SHA256
+          script: |
+            set -Eeuo pipefail
+
+            [[ "$TOOL_GIT_SHA" =~ ^[0-9a-f]{40}$ ]]
+            [[ "$TOOL_SHA256" =~ ^[0-9a-f]{64}$ ]]
+
+            app_root="/var/www/aibot"
+            scripts_root="/var/www/aibot/scripts"
+            destination="/var/www/aibot/scripts/storage_retention.py"
+            stage_root="/home/deploy/aibot-retention-tool-stage"
+            staged="/home/deploy/aibot-retention-tool-stage/storage_retention.py"
+            rollback_root="/home/deploy/aibot-retention-tool-rollbacks"
+            rollback_file="$rollback_root/storage_retention.py.previous"
+            rollback_checksum_file="$rollback_root/storage_retention.py.previous.sha256"
+            install_temporary="$scripts_root/.storage_retention.py.rollout-$TOOL_GIT_SHA"
+            restore_temporary="$scripts_root/.storage_retention.py.restore-$TOOL_GIT_SHA"
+
+            test "$(readlink -f "$app_root")" = "$app_root"
+            test "$(readlink -f "$scripts_root")" = "$scripts_root"
+            test "$(readlink -f "$stage_root")" = "$stage_root"
+            test ! -L "$destination"
+            test -f "$destination"
+            test ! -L "$staged"
+            test -f "$staged"
+            test "$(stat -c '%U:%G' "$scripts_root")" = "deploy:deploy"
+            test "$(stat -c '%U:%G' "$destination")" = "deploy:deploy"
+            test "$(stat -c '%U:%G' "$staged")" = "deploy:deploy"
+            test "$(stat -c '%h' "$staged")" = "1"
+
+            staged_checksum="$(sha256sum "$staged" | cut -d' ' -f1)"
+            test "$staged_checksum" = "$TOOL_SHA256"
+
+            validate_tool() {
+              local path="$1"
+              local help
+              PYTHONDONTWRITEBYTECODE=1 python3 - "$path" <<'PY'
+            import runpy
+            import sys
+            from pathlib import Path
+
+            path = Path(sys.argv[1])
+            namespace = runpy.run_path(str(path), run_name="retention_tool_smoke")
+            if not callable(namespace.get("main")):
+                raise SystemExit("retention tool main entry point is missing")
+            if namespace.get("PRODUCTION_DATA_ROOT") != Path("/var/www/aibot/data"):
+                raise SystemExit("retention data root contract changed")
+            if namespace.get("PRODUCTION_BACKUP_ROOT") != Path(
+                "/home/deploy/aibot-backups"
+            ):
+                raise SystemExit("retention backup root contract changed")
+            PY
+              help="$(PYTHONDONTWRITEBYTECODE=1 python3 -B "$path" --help)"
+              grep -F -- '--dry-run' <<<"$help" >/dev/null
+              grep -F -- '--deployed-sha' <<<"$help" >/dev/null
+              grep -F -- '--active-source-sha' <<<"$help" >/dev/null
+            }
+
+            validate_tool "$staged"
+
+            mkdir -p "$rollback_root"
+            test "$(readlink -f "$rollback_root")" = "$rollback_root"
+            test "$(stat -c '%U:%G' "$rollback_root")" = "deploy:deploy"
+            chmod 700 "$rollback_root"
+
+            previous_checksum="$(sha256sum "$destination" | cut -d' ' -f1)"
+            rollback_temporary="$rollback_root/.storage_retention.py.previous-$TOOL_GIT_SHA"
+            checksum_temporary="$rollback_root/.storage_retention.py.previous.sha256-$TOOL_GIT_SHA"
+            install -m 0600 "$destination" "$rollback_temporary"
+            test "$(sha256sum "$rollback_temporary" | cut -d' ' -f1)" = \
+              "$previous_checksum"
+            printf '%s  storage_retention.py.previous\n' "$previous_checksum" > \
+              "$checksum_temporary"
+            mv -fT "$rollback_temporary" "$rollback_file"
+            mv -fT "$checksum_temporary" "$rollback_checksum_file"
+
+            installed=false
+            restore_on_error() {
+              local status="$?"
+              trap - ERR
+              if [[ "$installed" == "true" ]]; then
+                set +e
+                install -m 0644 "$rollback_file" "$restore_temporary"
+                if [[ "$(sha256sum "$restore_temporary" | cut -d' ' -f1)" == \
+                      "$previous_checksum" ]]; then
+                  mv -fT "$restore_temporary" "$destination"
+                  if [[ "$(sha256sum "$destination" | cut -d' ' -f1)" == \
+                        "$previous_checksum" ]]; then
+                    echo "RETENTION_TOOL_ROLLBACK restored_sha256=$previous_checksum"
+                  else
+                    echo "RETENTION_TOOL_ROLLBACK_FAILED post_restore_checksum" >&2
+                  fi
+                else
+                  echo "RETENTION_TOOL_ROLLBACK_FAILED checksum_mismatch" >&2
+                fi
+                set -e
+              fi
+              rm -f -- "$install_temporary" "$restore_temporary"
+              exit "$status"
+            }
+            trap restore_on_error ERR
+
+            install -m 0644 "$staged" "$install_temporary"
+            test "$(sha256sum "$install_temporary" | cut -d' ' -f1)" = \
+              "$TOOL_SHA256"
+            mv -fT "$install_temporary" "$destination"
+            installed=true
+
+            test ! -L "$destination"
+            test -f "$destination"
+            test "$(stat -c '%U:%G' "$destination")" = "deploy:deploy"
+            test "$(stat -c '%a' "$destination")" = "644"
+            test "$(sha256sum "$destination" | cut -d' ' -f1)" = \
+              "$TOOL_SHA256"
+            validate_tool "$destination"
+
+            trap - ERR
+            echo "RETENTION_TOOL_ROLLOUT sha256=$TOOL_SHA256 runtime_reload=false"

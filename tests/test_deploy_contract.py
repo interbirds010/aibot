@@ -191,6 +191,36 @@ class DeployTriggerContractTests(unittest.TestCase):
         self.assertEqual(len(self.DIAGNOSTICS_PATHS), 21)
         self.assert_deploy(True, *self.DIAGNOSTICS_PATHS)
 
+    def test_retention_tool_only_shapes_skip_runtime_deploy(self) -> None:
+        cases = (
+            ("scripts/storage_retention.py",),
+            ("scripts/storage_retention.py", "tests/test_storage_retention.py"),
+            (
+                "scripts/storage_retention.py",
+                ".github/workflows/deploy.yml",
+                ".github/workflows/retention-tool-rollout.yml",
+                "scripts/deploy_contract.py",
+                "tests/test_deploy_contract.py",
+                "tests/test_deploy_workflows.py",
+            ),
+        )
+        for paths in cases:
+            with self.subTest(paths=paths):
+                decision = classify_changed_paths(paths)
+                self.assertFalse(decision.deploy)
+                self.assertEqual(decision.reason, "retention_tool_only")
+
+    def test_mixed_retention_tool_and_runtime_or_unknown_path_deploys(self) -> None:
+        cases = (
+            ("scripts/storage_retention.py", "src/foo.py"),
+            ("scripts/storage_retention.py", "unknown/file.txt"),
+        )
+        for paths in cases:
+            with self.subTest(paths=paths):
+                decision = classify_changed_paths(paths)
+                self.assertTrue(decision.deploy)
+                self.assertEqual(decision.reason, "runtime_or_unknown")
+
     def test_baseline_fix_shape_skips_deploy(self) -> None:
         self.assert_deploy(False, "tests/test_observation_mode.py")
 
