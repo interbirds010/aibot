@@ -66,6 +66,95 @@ def completed_row(observation_id: str = "OBS-1") -> dict:
 
 
 class ShadowTradeLedgerTests(unittest.TestCase):
+    def test_trim_runs_after_record_document_release_and_lock_return(self) -> None:
+        events = []
+
+        class TrackedDocument(dict):
+            def __del__(self) -> None:
+                events.append("document_released")
+
+        def locked_update(path, fallback, mutator, *, operation):
+            self.assertEqual(operation, "shadow_trade_record")
+            document = TrackedDocument(shadow_trade_ledger.empty_shadow_trades())
+            result = mutator(document)
+            events.append("lock_released")
+            return result, document
+
+        def trim() -> bool:
+            self.assertEqual(events, ["lock_released", "document_released"])
+            events.append("trim")
+            return True
+
+        with (
+            patch.object(shadow_trade_ledger, "update_json", side_effect=locked_update),
+            patch.object(shadow_trade_ledger, "maybe_trim_allocator", side_effect=trim),
+        ):
+            self.assertTrue(
+                shadow_trade_ledger.record_completed_shadow_trade(completed_row())
+            )
+        self.assertEqual(events[-1], "trim")
+
+    def test_current_ids_trim_runs_after_document_release(self) -> None:
+        events = []
+        source_id = "".join(["OBS", "-", "DETACHED", "-", "IDENTITY"])
+
+        class TrackedDocument(dict):
+            def __del__(self) -> None:
+                events.append("document_released")
+
+        def migrated_document():
+            return TrackedDocument({
+                "trades": [{"shadow_trade_id": source_id}],
+            })
+
+        with (
+            patch.object(
+                shadow_trade_ledger,
+                "ensure_shadow_trades_migrated",
+                side_effect=migrated_document,
+            ),
+            patch.object(
+                shadow_trade_ledger,
+                "maybe_trim_allocator",
+                side_effect=lambda: events.append("trim"),
+            ),
+        ):
+            identities = shadow_trade_ledger.current_shadow_trade_ids()
+            self.assertEqual(identities, {source_id})
+            self.assertIsNot(next(iter(identities)), source_id)
+        self.assertEqual(events, ["document_released", "trim"])
+
+    def test_backfill_trim_runs_after_document_release(self) -> None:
+        events = []
+
+        class TrackedDocument(dict):
+            def __del__(self) -> None:
+                events.append("document_released")
+
+        def locked_update(path, fallback, mutator, *, operation):
+            self.assertEqual(operation, "shadow_trade_backfill")
+            document = TrackedDocument(shadow_trade_ledger.empty_shadow_trades())
+            result = mutator(document)
+            events.append("lock_released")
+            return result, document
+
+        def trim() -> bool:
+            self.assertEqual(events, ["lock_released", "document_released"])
+            events.append("trim")
+            return True
+
+        with (
+            patch.object(shadow_trade_ledger, "update_json", side_effect=locked_update),
+            patch.object(shadow_trade_ledger, "maybe_trim_allocator", side_effect=trim),
+        ):
+            self.assertEqual(
+                shadow_trade_ledger.backfill_completed_shadow_trades(
+                    [completed_row()], existing_ids=set()
+                ),
+                1,
+            )
+        self.assertEqual(events[-1], "trim")
+
     def test_completed_executable_observation_becomes_closed_shadow_trade(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "shadow_trades.json"
