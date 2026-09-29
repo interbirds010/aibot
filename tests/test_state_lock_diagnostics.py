@@ -102,6 +102,22 @@ class StateLockDiagnosticContractTests(unittest.TestCase):
                     target.write_text("{}", encoding="utf-8")
             self.assertTrue(target.exists())
 
+    def test_holder_phase_failure_is_non_fatal_for_state_write(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            target = Path(temporary) / "state.json"
+            with patch.object(
+                state_lock_diagnostics,
+                "holder_phase",
+                side_effect=RuntimeError("diagnostic phase failed"),
+            ):
+                state_store.update_json(
+                    target,
+                    {"version": 0},
+                    lambda document: document.update({"value": 1}),
+                    operation="phase_failure",
+                )
+            self.assertEqual(state_store.read_json(target, {})["value"], 1)
+
     def test_traceback_and_encoded_snapshot_are_bounded(self) -> None:
         secret = "SECRET_SENTINEL_MUST_NOT_APPEAR"
         self.assertTrue(secret)
@@ -147,8 +163,94 @@ class StateLockDiagnosticContractTests(unittest.TestCase):
                     })
             saved = json.loads(snapshot.read_text(encoding="utf-8"))
             self.assertEqual(saved["latest_timeout"]["sequence"], 4)
+            self.assertEqual(
+                [item["sequence"] for item in saved["timeout_history"]],
+                [1, 2, 3, 4],
+            )
             total = sum(path.stat().st_size for path in snapshot.parent.iterdir())
-            self.assertLessEqual(total, (2 * 64 * 1024) + 1)
+            self.assertLessEqual(
+                total,
+                state_lock_diagnostics.MAX_DIAGNOSTIC_STORAGE_BYTES,
+            )
+
+    def test_timeout_history_rotates_four_records_with_timestamps(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            snapshot = Path(temporary) / "diagnostic.json"
+            with patch.object(state_lock_diagnostics, "SNAPSHOT_PATH", snapshot):
+                for sequence in range(6):
+                    self.assertTrue(state_lock_diagnostics._write_snapshot({
+                        "event": "TIMEOUT",
+                        "sequence": sequence,
+                    }))
+            saved = json.loads(snapshot.read_text(encoding="utf-8"))
+            self.assertEqual(saved["schema_version"], 2)
+            self.assertEqual(
+                [item["sequence"] for item in saved["timeout_history"]],
+                [2, 3, 4, 5],
+            )
+            for record in saved["timeout_history"]:
+                self.assertRegex(
+                    record["occurred_at"],
+                    r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$",
+                )
+
+    def test_timeout_context_is_frozen_when_recent_ring_advances(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            snapshot = Path(temporary) / "diagnostic.json"
+            with patch.object(state_lock_diagnostics, "SNAPSHOT_PATH", snapshot):
+                state_lock_diagnostics._write_snapshot({
+                    "event": "ACQUIRED",
+                    "attempt_id": "before",
+                })
+                state_lock_diagnostics._write_snapshot({
+                    "event": "TIMEOUT",
+                    "attempt_id": "timeout",
+                })
+                state_lock_diagnostics._write_snapshot({
+                    "event": "RELEASED",
+                    "attempt_id": "after",
+                })
+            saved = json.loads(snapshot.read_text(encoding="utf-8"))
+            timeout_record = saved["timeout_history"][-1]
+            self.assertEqual(
+                [event["attempt_id"] for event in timeout_record["recent_events_at_timeout"]],
+                ["before"],
+            )
+            self.assertEqual(
+                [event["attempt_id"] for event in saved["recent_events"]],
+                ["before", "after"],
+            )
+
+    def test_schema_one_snapshot_is_migrated_without_losing_timeout(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            snapshot = Path(temporary) / "diagnostic.json"
+            snapshot.write_text(json.dumps({
+                "schema_version": 1,
+                "latest_timeout": {"event": "TIMEOUT", "attempt_id": "legacy"},
+                "recent_events": [],
+            }), encoding="utf-8")
+            with patch.object(state_lock_diagnostics, "SNAPSHOT_PATH", snapshot):
+                state_lock_diagnostics._write_snapshot({
+                    "event": "TIMEOUT",
+                    "attempt_id": "current",
+                })
+            saved = json.loads(snapshot.read_text(encoding="utf-8"))
+            self.assertEqual(
+                [item["attempt_id"] for item in saved["timeout_history"]],
+                ["legacy", "current"],
+            )
+
+    def test_malformed_snapshot_is_replaced_by_valid_bounded_document(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            snapshot = Path(temporary) / "diagnostic.json"
+            snapshot.write_text("{malformed", encoding="utf-8")
+            with patch.object(state_lock_diagnostics, "SNAPSHOT_PATH", snapshot):
+                self.assertTrue(state_lock_diagnostics._write_snapshot({
+                    "event": "TIMEOUT",
+                    "attempt_id": "recovered",
+                }))
+            saved = json.loads(snapshot.read_text(encoding="utf-8"))
+            self.assertEqual(saved["timeout_history"][-1]["attempt_id"], "recovered")
 
     def test_snapshot_process_guard_wait_is_bounded(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -452,6 +554,38 @@ class LinuxStateLockDiagnosticTests(unittest.TestCase):
             self.assertLessEqual(
                 len(snapshot["same_process_traceback"]),
                 state_lock_diagnostics.MAX_TRACE_THREADS,
+            )
+        finally:
+            release.set()
+            thread.join(2)
+
+    def test_same_process_timeout_captures_explicit_holder_phase(self) -> None:
+        acquired = threading.Event()
+        release = threading.Event()
+
+        def hold() -> None:
+            with state_store.exclusive_file_lock(
+                self.target, operation="observation_decision"
+            ) as attempt:
+                state_lock_diagnostics.holder_phase(attempt, "SERIALIZE")
+                acquired.set()
+                release.wait(5)
+
+        thread = threading.Thread(target=hold, daemon=True)
+        thread.start()
+        self.assertTrue(acquired.wait(2))
+        try:
+            with self.assertRaises(state_store.StateLockTimeout) as raised:
+                with state_store.exclusive_file_lock(
+                    self.target,
+                    timeout_seconds=0.08,
+                    poll_seconds=0.01,
+                    operation="archive_marker_persist",
+                ):
+                    pass
+            self.assertEqual(
+                raised.exception.diagnostics["holder_phase"],
+                "SERIALIZE",
             )
         finally:
             release.set()

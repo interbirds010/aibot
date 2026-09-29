@@ -10,6 +10,7 @@ import sys
 import threading
 import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, BinaryIO
 
@@ -25,6 +26,8 @@ MAX_SNAPSHOT_BYTES = 64 * 1024
 MAX_TRACE_THREADS = 32
 MAX_TRACE_FRAMES = 32
 MAX_RECENT_EVENTS = 8
+MAX_TIMEOUT_HISTORY = 4
+MAX_DIAGNOSTIC_STORAGE_BYTES = (2 * MAX_SNAPSHOT_BYTES) + 1
 MAX_PROC_LOCK_LINES = 4096
 MAX_PROC_LOCK_BYTES = 512 * 1024
 MAX_PROC_LOCK_LINE_BYTES = 4096
@@ -250,6 +253,7 @@ def _inspect_linux_holder(
         "holder_operation": "external_or_unknown",
         "holder_thread": None,
         "holder_hold_ms": None,
+        "holder_phase": None,
         "verified": False,
         "released_during_diagnosis": False,
         "pid_reused": False,
@@ -313,6 +317,7 @@ def _inspect_linux_holder(
                 "operation", "external_or_unknown"
             )
             result["holder_thread"] = local_holder.get("thread")
+            result["holder_phase"] = local_holder.get("phase")
             started_ns = int(local_holder.get("hold_started_ns", 0) or 0)
             if started_ns > 0:
                 result["holder_hold_ms"] = round(
@@ -347,8 +352,20 @@ def _capture_same_process_traceback(
     return snapshots
 
 
+def _timeout_records(candidate: dict[str, Any]) -> list[dict[str, Any]]:
+    records = [
+        record
+        for record in candidate.get("timeout_history", [])
+        if isinstance(record, dict)
+    ]
+    latest = candidate.get("latest_timeout")
+    if isinstance(latest, dict):
+        records.append(latest)
+    return records
+
+
 def _bounded_diagnostic_bytes(payload: dict[str, Any]) -> bytes:
-    """Encode valid JSON while trimming traceback frames to the fixed ceiling."""
+    """Encode valid JSON while retaining four timeout summaries under 64 KiB."""
     candidate = copy.deepcopy(payload)
     while True:
         encoded = (
@@ -360,19 +377,41 @@ def _bounded_diagnostic_bytes(payload: dict[str, Any]) -> bytes:
         if isinstance(recent_events, list) and recent_events:
             recent_events.pop(0)
             continue
-        timeout_record = candidate.get("latest_timeout")
-        stacks = (
-            timeout_record.get("same_process_traceback")
-            if isinstance(timeout_record, dict)
-            else candidate.get("same_process_traceback")
-        )
-        if not isinstance(stacks, list) or not stacks:
-            if isinstance(timeout_record, dict):
-                timeout_record.pop("same_process_traceback", None)
+        timeout_records = _timeout_records(candidate)
+        trace_trimmed = False
+        for timeout_record in timeout_records:
+            stacks = timeout_record.get("same_process_traceback")
+            if not isinstance(stacks, list) or not stacks:
+                continue
+            if len(stacks) > 1:
+                stacks.pop()
+                trace_trimmed = True
+                break
+            last_stack = stacks[-1]
+            frames = last_stack.get("frames") if isinstance(last_stack, dict) else None
+            if isinstance(frames, list) and frames:
+                del frames[max(1, len(frames) // 2) :]
+                if len(frames) == 1:
+                    stacks.pop()
             else:
-                candidate.pop("same_process_traceback", None)
-            minimal_timeout = timeout_record if isinstance(timeout_record, dict) else candidate
+                stacks.pop()
+            trace_trimmed = True
+            break
+        if trace_trimmed:
+            continue
+        frozen_trimmed = False
+        for timeout_record in timeout_records:
+            frozen = timeout_record.get("recent_events_at_timeout")
+            if isinstance(frozen, list) and frozen:
+                frozen.pop(0)
+                frozen_trimmed = True
+                break
+        if frozen_trimmed:
+            continue
+        if timeout_records:
             safe_keys = (
+                "occurred_at",
+                "sequence",
                 "attempt_id",
                 "event",
                 "operation",
@@ -391,18 +430,28 @@ def _bounded_diagnostic_bytes(payload: dict[str, Any]) -> bytes:
                 "holder_operation",
                 "holder_thread",
                 "holder_hold_ms",
+                "holder_phase",
                 "verified",
                 "released_during_diagnosis",
                 "pid_reused",
                 "unavailable",
             )
-            candidate = {
-                "schema_version": 1,
-                "latest_timeout": {
-                    key: minimal_timeout.get(key)
+            summaries = [
+                {
+                    key: record.get(key)
                     for key in safe_keys
-                    if key in minimal_timeout
-                },
+                    if key in record
+                }
+                for record in timeout_records[:MAX_TIMEOUT_HISTORY]
+            ]
+            latest_summary = summaries[-1] if summaries else {
+                "event": "TIMEOUT",
+                "unavailable": True,
+            }
+            candidate = {
+                "schema_version": 2,
+                "latest_timeout": latest_summary,
+                "timeout_history": summaries,
                 "recent_events": [],
             }
             encoded = (
@@ -410,18 +459,14 @@ def _bounded_diagnostic_bytes(payload: dict[str, Any]) -> bytes:
             ).encode("utf-8")
             if len(encoded) <= MAX_SNAPSHOT_BYTES:
                 return encoded
-            return b'{"schema_version":1,"latest_timeout":{"event":"TIMEOUT","unavailable":true},"recent_events":[]}\n'
-        if len(stacks) > 1:
-            stacks.pop()
-            continue
-        last_stack = stacks[-1]
-        frames = last_stack.get("frames") if isinstance(last_stack, dict) else None
-        if isinstance(frames, list) and frames:
-            del frames[max(1, len(frames) // 2) :]
-            if len(frames) == 1:
-                stacks.pop()
-        else:
-            stacks.pop()
+            return b'{"schema_version":2,"latest_timeout":{"event":"TIMEOUT","unavailable":true},"timeout_history":[{"event":"TIMEOUT","unavailable":true}],"recent_events":[]}\n'
+        return b'{"schema_version":2,"latest_timeout":null,"timeout_history":[],"recent_events":[]}\n'
+
+
+def _utc_timestamp() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace(
+        "+00:00", "Z"
+    )
 
 
 def _write_snapshot(payload: dict[str, Any]) -> bool:
@@ -492,15 +537,37 @@ def _write_snapshot(payload: dict[str, Any]) -> bool:
                 existing_events = existing.get("recent_events")
                 if not isinstance(existing_events, list):
                     existing_events = []
+                existing_history = existing.get("timeout_history")
+                if not isinstance(existing_history, list):
+                    existing_history = []
+                history = [
+                    copy.deepcopy(record)
+                    for record in existing_history
+                    if isinstance(record, dict)
+                ][-MAX_TIMEOUT_HISTORY:]
+                if not history:
+                    legacy_latest = existing.get("latest_timeout")
+                    if isinstance(legacy_latest, dict):
+                        history = [copy.deepcopy(legacy_latest)]
+                event_payload = copy.deepcopy(payload)
+                event_payload.setdefault("occurred_at", _utc_timestamp())
                 document = {
-                    "schema_version": 1,
-                    "latest_timeout": existing.get("latest_timeout"),
+                    "schema_version": 2,
+                    "latest_timeout": copy.deepcopy(history[-1]) if history else None,
+                    "timeout_history": history,
                     "recent_events": list(existing_events)[-MAX_RECENT_EVENTS:],
                 }
-                if payload.get("event") == "TIMEOUT":
-                    document["latest_timeout"] = payload
+                if event_payload.get("event") == "TIMEOUT":
+                    event_payload["recent_events_at_timeout"] = copy.deepcopy(
+                        document["recent_events"]
+                    )
+                    document["timeout_history"].append(event_payload)
+                    document["timeout_history"] = document["timeout_history"][
+                        -MAX_TIMEOUT_HISTORY:
+                    ]
+                    document["latest_timeout"] = copy.deepcopy(event_payload)
                 else:
-                    document["recent_events"].append(payload)
+                    document["recent_events"].append(event_payload)
                     document["recent_events"] = document["recent_events"][
                         -MAX_RECENT_EVENTS:
                     ]
@@ -551,6 +618,7 @@ def _event(
 ) -> dict[str, Any]:
     process_start, _ = _process_start_identity(attempt.waiter_pid)
     record: dict[str, Any] = {
+        "occurred_at": _utc_timestamp(),
         "attempt_id": attempt.attempt_id,
         "event": event,
         "operation": attempt.operation,
@@ -582,9 +650,35 @@ def acquired(attempt: LockAttempt, handle: BinaryIO) -> None:
                 "thread": attempt.waiter_thread,
                 "operation": attempt.operation,
                 "hold_started_ns": acquired_ns,
+                "phase": "READ_PARSE",
             }
     except Exception:
         # Registry and timing are advisory and cannot block a successful lock.
+        pass
+
+
+def holder_phase(attempt: LockAttempt | None, phase: str) -> None:
+    """Update diagnostics-only holder phase without touching state payloads."""
+    if attempt is None or attempt.holder_key is None:
+        return
+    if phase not in {
+        "READ_PARSE",
+        "SCHEMA_SCAN",
+        "MUTATION",
+        "SERIALIZE",
+        "TEMP_WRITE",
+        "FLUSH",
+        "FSYNC",
+        "ATOMIC_REPLACE",
+        "TEMP_CLEANUP",
+    }:
+        return
+    try:
+        with _LOCAL_HOLDER_GUARD:
+            local_holder = _LOCAL_HOLDERS.get(attempt.holder_key)
+            if local_holder and local_holder.get("attempt_id") == attempt.attempt_id:
+                local_holder["phase"] = phase
+    except Exception:
         pass
 
 

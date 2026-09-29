@@ -49,6 +49,16 @@ class StateLockTimeout(TimeoutError):
         self.diagnostics = dict(diagnostics or {})
 
 
+def _set_holder_phase(
+    attempt: state_lock_diagnostics.LockAttempt | None,
+    phase: str,
+) -> None:
+    try:
+        state_lock_diagnostics.holder_phase(attempt, phase)
+    except Exception:
+        pass
+
+
 def normalized_route_metadata(
     route_type: str, dex_momentum_score: float = 0.0
 ) -> dict[str, str | float]:
@@ -82,7 +92,7 @@ def exclusive_file_lock(
     timeout_seconds: float = 15.0,
     poll_seconds: float = 0.05,
     operation: str = "external_or_unknown",
-) -> Iterator[None]:
+) -> Iterator[state_lock_diagnostics.LockAttempt | None]:
     """Acquire an OS-visible exclusive lock using a stable sidecar file."""
     lock_path = path.with_name(f"{path.name}.lock")
     lock_path.parent.mkdir(parents=True, exist_ok=True)
@@ -128,7 +138,7 @@ def exclusive_file_lock(
                         diagnostics=diagnostic,
                     ) from exc
                 time.sleep(poll_seconds)
-        yield
+        yield diagnostic_attempt
     finally:
         if locked:
             try:
@@ -152,6 +162,7 @@ def atomic_write_json(
     document: dict[str, Any],
     *,
     lifecycle_observer: Callable[[str, int], None] | None = None,
+    diagnostic_attempt: state_lock_diagnostics.LockAttempt | None = None,
 ) -> None:
     def observe(stage: str, size_bytes: int) -> None:
         if lifecycle_observer is None:
@@ -162,6 +173,7 @@ def atomic_write_json(
             pass
 
     path.parent.mkdir(parents=True, exist_ok=True)
+    _set_holder_phase(diagnostic_attempt, "TEMP_CLEANUP")
     temporary_prefix = f".{path.name}."
     temporary_suffix = ".tmp"
     stale_before = time.time() - (6 * 60 * 60)
@@ -195,6 +207,7 @@ def atomic_write_json(
             # Compact encoding shortens fsync and therefore the cross-process
             # lock hold time on the 1 GB production VPS.
             observe("serialize", 0)
+            _set_holder_phase(diagnostic_attempt, "SERIALIZE")
             json.dump(
                 document,
                 file,
@@ -208,9 +221,13 @@ def atomic_write_json(
                 except Exception:
                     serialized_size = 0
             observe("serialized", serialized_size)
+            _set_holder_phase(diagnostic_attempt, "TEMP_WRITE")
+            _set_holder_phase(diagnostic_attempt, "FLUSH")
             file.flush()
+            _set_holder_phase(diagnostic_attempt, "FSYNC")
             os.fsync(file.fileno())
             observe("flushed", serialized_size)
+        _set_holder_phase(diagnostic_attempt, "ATOMIC_REPLACE")
         os.replace(temporary, path)
         observe("replaced", serialized_size)
     finally:
@@ -227,7 +244,8 @@ def update_json(
     operation: str = "state_update",
 ) -> tuple[T, dict[str, Any]]:
     """Lock, reread, CAS-check, mutate, increment version, and atomically save."""
-    with exclusive_file_lock(path, operation=operation):
+    with exclusive_file_lock(path, operation=operation) as diagnostic_attempt:
+        _set_holder_phase(diagnostic_attempt, "READ_PARSE")
         document = read_json(path, fallback)
         current_version = int(document.get("version", 0) or 0)
         if expected_version is not None and current_version != expected_version:
@@ -237,7 +255,7 @@ def update_json(
             )
         result = mutator(document)
         document["version"] = current_version + 1
-        atomic_write_json(path, document)
+        atomic_write_json(path, document, diagnostic_attempt=diagnostic_attempt)
         return result, document
 
 
@@ -249,12 +267,14 @@ def migrate_json(
     operation: str = "state_migration",
 ) -> dict[str, Any]:
     """Run an idempotent migration while holding the cross-process lock."""
-    with exclusive_file_lock(path, operation=operation):
+    with exclusive_file_lock(path, operation=operation) as diagnostic_attempt:
+        _set_holder_phase(diagnostic_attempt, "READ_PARSE")
         document = read_json(path, fallback)
+        _set_holder_phase(diagnostic_attempt, "SCHEMA_SCAN")
         changed = migrator(document)
         if changed:
             document["version"] = int(document.get("version", 0) or 0) + 1
-            atomic_write_json(path, document)
+            atomic_write_json(path, document, diagnostic_attempt=diagnostic_attempt)
         return document
 
 
