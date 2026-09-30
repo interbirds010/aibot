@@ -39,6 +39,7 @@ from src.solana_rpc import (
 from src.logging_utils import configure_safe_logging, redact_sensitive_text
 from src.runtime_memory import (
     current_rss_bytes,
+    maybe_trim_allocator,
     record_memory_phase,
     record_transaction_payload,
     runtime_memory_metrics,
@@ -1999,7 +2000,13 @@ async def fetch_momentum_candidate_cohorts(
     ) as scope:
         approved, shadows = await _fetch_momentum_candidate_cohorts(session)
         scope.add_metadata(candidate_count=len(approved) + len(shadows))
-        return approved, shadows
+    # Raw HTTP/JSON payloads belong to the inner coroutine and are dead here;
+    # only compact dataclass projections remain.
+    maybe_trim_allocator(
+        phase="momentum_candidate_fetch",
+        reason="raw_candidate_payload_released",
+    )
+    return approved, shadows
 
 
 async def fetch_momentum_candidates(
@@ -2312,7 +2319,14 @@ async def _confirm_unknown_whales_with_telemetry(
             session, http_url, candidate, watched_wallets
         )
         scope.add_metadata(success_count=len(whales))
-        return whales
+    # Confirmation returns compact UnknownWhaleBuy rows.  Signature/RPC raw
+    # graphs from the inner coroutine have left scope and are eligible for
+    # allocator release before the next five-second route tick.
+    maybe_trim_allocator(
+        phase="momentum_whale_confirmation",
+        reason="raw_confirmation_payload_released",
+    )
+    return whales
 
 
 def schedule_market_shadow(
@@ -2786,6 +2800,14 @@ async def monitor_standard_once(
                     record_transaction_restore_failure(
                         DISCOVERY_SOURCE_SOLANA, None
                     )
+                # The restored transaction is not needed after synchronous
+                # projection/scheduling.  Drop the final raw graph reference
+                # before asking glibc to release idle arenas.
+                transaction = None
+                maybe_trim_allocator(
+                    phase="smart_get_transaction",
+                    reason="restored_transaction_consumed",
+                )
 
 
 async def monitor_once(settings: MonitorSettings, wallets: tuple[str, ...]) -> None:
