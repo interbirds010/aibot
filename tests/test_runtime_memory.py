@@ -194,6 +194,67 @@ class RuntimeMemoryTests(unittest.TestCase):
         self.assertIsInstance(result, bool)
         self.assertEqual(runtime_memory._allocator_trim_stats["attempt_count"], 1)
 
+    def test_trim_events_are_persisted_to_logs_with_phase_and_reason(self) -> None:
+        malloc_trim = mock.Mock(return_value=1)
+        with (
+            mock.patch.object(runtime_memory.sys, "platform", "linux"),
+            mock.patch.object(
+                runtime_memory,
+                "current_rss_bytes",
+                side_effect=[220 * 1024 * 1024, 180 * 1024 * 1024],
+            ),
+            mock.patch.object(
+                runtime_memory, "_load_malloc_trim", return_value=malloc_trim
+            ),
+            mock.patch.object(runtime_memory.logger, "info") as info,
+        ):
+            self.assertTrue(
+                runtime_memory.maybe_trim_allocator(
+                    minimum_interval_seconds=0,
+                    phase="momentum_whale_confirmation",
+                    reason="raw_confirmation_payload_released",
+                )
+            )
+        rendered = " ".join(
+            str(part)
+            for call in info.call_args_list
+            for part in call.args
+        )
+        self.assertIn("memory_trim_attempt", rendered)
+        self.assertIn("memory_trim_success", rendered)
+        self.assertIn("momentum_whale_confirmation", rendered)
+        self.assertIn("raw_confirmation_payload_released", rendered)
+
+    def test_candidate_fetch_trims_only_after_raw_payload_scope_ends(self) -> None:
+        source = inspect.getsource(monitor.fetch_momentum_candidate_cohorts)
+        fetch_index = source.index("_fetch_momentum_candidate_cohorts")
+        trim_index = source.index("maybe_trim_allocator")
+        return_index = source.rindex("return approved, shadows")
+        self.assertLess(fetch_index, trim_index)
+        self.assertLess(trim_index, return_index)
+        self.assertIn("raw_candidate_payload_released", source)
+
+    def test_whale_confirmation_trims_after_compact_projection(self) -> None:
+        source = inspect.getsource(monitor._confirm_unknown_whales_with_telemetry)
+        confirmation_index = source.index(
+            "_confirm_unknown_whales_with_funnel_telemetry"
+        )
+        trim_index = source.index("maybe_trim_allocator")
+        return_index = source.rindex("return whales")
+        self.assertLess(confirmation_index, trim_index)
+        self.assertLess(trim_index, return_index)
+        self.assertIn("raw_confirmation_payload_released", source)
+
+    def test_standard_get_transaction_drops_final_raw_reference_before_trim(self) -> None:
+        source = inspect.getsource(monitor.monitor_standard_once)
+        release_index = source.index("transaction = None")
+        trim_index = source.index(
+            'phase="smart_get_transaction"',
+            release_index,
+        )
+        self.assertLess(release_index, trim_index)
+        self.assertIn("restored_transaction_consumed", source)
+
     def test_completed_tracked_task_is_removed_from_both_registries(self) -> None:
         async def scenario() -> None:
             with (
