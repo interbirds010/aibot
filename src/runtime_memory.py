@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import ctypes
+import logging
 import math
+import os
 import sys
 import threading
 import time
@@ -28,6 +30,9 @@ ALLOCATOR_TRIM_RSS_THRESHOLD_BYTES = 200 * 1024 * 1024
 # PM2 samples RSS every 30 seconds; one attempt per minute is soon enough to be
 # visible by the next samples without putting malloc_trim on every ledger call.
 ALLOCATOR_TRIM_MIN_INTERVAL_SECONDS = 60.0
+
+logger = logging.getLogger("runtime-memory")
+_PROCESS_START_ID = f"{os.getpid()}-{int(time.time())}"
 
 _phase_stats: dict[str, dict[str, int]] = {}
 _transaction_payload_sizes: deque[int] = deque(maxlen=PAYLOAD_SIZE_WINDOW)
@@ -125,18 +130,31 @@ def _load_malloc_trim() -> Any:
     return malloc_trim
 
 
+def _trim_label(value: str) -> str:
+    normalized = "".join(
+        character
+        for character in str(value)[:80]
+        if character.isalnum() or character in {"_", "-", "."}
+    )
+    return normalized or "unknown"
+
+
 def maybe_trim_allocator(
     *,
     rss_threshold_bytes: int = ALLOCATOR_TRIM_RSS_THRESHOLD_BYTES,
     minimum_interval_seconds: float = ALLOCATOR_TRIM_MIN_INTERVAL_SECONDS,
+    reason: str = "unspecified",
+    phase: str = "unspecified",
 ) -> bool:
-    """Rate-limited, fail-open glibc heap release after a large document dies.
+    """Rate-limited, fail-open glibc heap release after large objects die.
 
-    Callers must invoke this only after releasing their state lock and final
-    full-document reference.  Unsupported platforms and every diagnostic or
-    allocator failure are deliberately treated as a no-op.
+    Callers must invoke this only after releasing the final large-object
+    reference.  Every actual attempt is logged so evidence survives PM2 process
+    replacement even though in-process counters reset.
     """
     global _allocator_trim_last_attempt_monotonic
+    normalized_reason = _trim_label(reason)
+    normalized_phase = _trim_label(phase)
     try:
         if not sys.platform.startswith("linux"):
             return False
@@ -156,25 +174,45 @@ def maybe_trim_allocator(
             _allocator_trim_stats["attempt_count"] = int(
                 _allocator_trim_stats["attempt_count"] or 0
             ) + 1
+            attempt_count = int(_allocator_trim_stats["attempt_count"] or 0)
             _allocator_trim_stats["last_at_epoch_seconds"] = time.time()
             _allocator_trim_stats["last_rss_before_bytes"] = rss_before
+            logger.info(
+                "memory_trim_attempt process_start_id=%s phase=%s reason=%s "
+                "attempt_count=%d rss_before_bytes=%d threshold_bytes=%d",
+                _PROCESS_START_ID,
+                normalized_phase,
+                normalized_reason,
+                attempt_count,
+                rss_before,
+                threshold,
+            )
             started = time.perf_counter()
             malloc_trim = _load_malloc_trim()
             if malloc_trim is None:
+                latency_ms = round((time.perf_counter() - started) * 1000, 4)
                 _allocator_trim_stats["failure_count"] = int(
                     _allocator_trim_stats["failure_count"] or 0
                 ) + 1
-                _allocator_trim_stats["last_latency_ms"] = round(
-                    (time.perf_counter() - started) * 1000, 4
+                _allocator_trim_stats["last_latency_ms"] = latency_ms
+                logger.warning(
+                    "memory_trim_failure process_start_id=%s phase=%s reason=%s "
+                    "attempt_count=%d rss_before_bytes=%d rss_after_bytes=unknown "
+                    "delta_bytes=unknown duration_ms=%.4f failure=unsupported",
+                    _PROCESS_START_ID,
+                    normalized_phase,
+                    normalized_reason,
+                    attempt_count,
+                    rss_before,
+                    latency_ms,
                 )
                 return False
             try:
                 succeeded = bool(malloc_trim(0))
             except Exception:
                 succeeded = False
-            _allocator_trim_stats["last_latency_ms"] = round(
-                (time.perf_counter() - started) * 1000, 4
-            )
+            latency_ms = round((time.perf_counter() - started) * 1000, 4)
+            _allocator_trim_stats["last_latency_ms"] = latency_ms
             try:
                 rss_after = current_rss_bytes()
             except Exception:
@@ -184,6 +222,27 @@ def maybe_trim_allocator(
             _allocator_trim_stats[counter] = int(
                 _allocator_trim_stats[counter] or 0
             ) + 1
+            delta = (
+                rss_after - rss_before
+                if rss_after is not None
+                else None
+            )
+            event = "memory_trim_success" if succeeded else "memory_trim_failure"
+            log = logger.info if succeeded else logger.warning
+            log(
+                "%s process_start_id=%s phase=%s reason=%s attempt_count=%d "
+                "rss_before_bytes=%d rss_after_bytes=%s delta_bytes=%s "
+                "duration_ms=%.4f",
+                event,
+                _PROCESS_START_ID,
+                normalized_phase,
+                normalized_reason,
+                attempt_count,
+                rss_before,
+                rss_after if rss_after is not None else "unknown",
+                delta if delta is not None else "unknown",
+                latency_ms,
+            )
             return succeeded
     except Exception:
         return False
