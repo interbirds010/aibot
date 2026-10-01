@@ -24,6 +24,12 @@ from websockets.asyncio.client import ClientConnection, connect
 from websockets.exceptions import ConnectionClosed, InvalidHandshake, InvalidStatus
 
 from src import state_store
+from src.failure_memory_diagnostics import (
+    diagnostic_phase,
+    mark_current_phase,
+    start_failure_sampler,
+    update_runtime_counts,
+)
 from src.phase_memory_telemetry import (
     add_current_phase_metadata,
     flush_phase_memory_telemetry,
@@ -1804,16 +1810,27 @@ def _search_pair_projections(payload: Any) -> list[_MomentumPairProjection]:
     projections: list[_MomentumPairProjection] = []
     if not isinstance(payload, dict):
         return projections
+    mark_current_phase(
+        "raw_materialized", raw_item_count=len(payload.get("pairs") or []),
+        raw_graph_live=True, response_body_live=False, raw_payload_live_count=1,
+    )
     for pair in payload.get("pairs") or []:
         if isinstance(pair, dict):
             projections.append(_momentum_pair_projection(pair))
         if len(projections) >= MOMENTUM_MAX_RAW_PAIRS:
             break
+    mark_current_phase(
+        "compact_projected", projected_count=len(projections), raw_graph_live=True,
+    )
     return projections
 
 
 def _extend_discovered_mints(payload: Any, discovered_mints: list[str]) -> None:
     rows = payload if isinstance(payload, list) else [payload]
+    mark_current_phase(
+        "raw_materialized", raw_item_count=len(rows), raw_graph_live=True,
+        response_body_live=False, raw_payload_live_count=1,
+    )
     for row in rows:
         if not isinstance(row, dict) or row.get("chainId") != "solana":
             continue
@@ -1822,6 +1839,10 @@ def _extend_discovered_mints(payload: Any, discovered_mints: list[str]) -> None:
             discovered_mints.append(mint)
         if len(discovered_mints) >= MOMENTUM_MAX_DISCOVERY_TOKENS:
             break
+    mark_current_phase(
+        "compact_projected", discovered_mint_count=len(discovered_mints),
+        raw_graph_live=True,
+    )
 
 
 def _token_pair_projections(
@@ -1831,11 +1852,19 @@ def _token_pair_projections(
 ) -> list[_MomentumPairProjection]:
     if not isinstance(payload, list):
         return []
-    return [
+    mark_current_phase(
+        "raw_materialized", raw_item_count=len(payload), raw_graph_live=True,
+        response_body_live=False, raw_payload_live_count=1,
+    )
+    projections = [
         _momentum_pair_projection(pair)
         for pair in payload[:max(0, int(limit))]
         if isinstance(pair, dict)
     ]
+    mark_current_phase(
+        "compact_projected", projected_count=len(projections), raw_graph_live=True,
+    )
+    return projections
 
 
 async def _dexscreener_json(
@@ -1857,7 +1886,16 @@ async def _dexscreener_json(
             content_length_known=content_length_known,
         )
         response.raise_for_status()
-        return await response.json()
+        payload = await response.json()
+        # 이미 읽힌 body만 측정한다. 추가 read나 원본 보존은 하지 않는다.
+        body = getattr(response, "_body", None)
+        mark_current_phase(
+            "http_body_decoded",
+            response_body_bytes=len(body) if isinstance(body, bytes) else 0,
+            raw_graph_live=True, raw_payload_live_count=1,
+            response_body_live=isinstance(body, bytes),
+        )
+        return payload
 
 
 async def _fetch_momentum_candidate_cohorts(
@@ -1869,11 +1907,20 @@ async def _fetch_momentum_candidate_cohorts(
             session, DEX_SCREENER_SEARCH_URL, q="solana"
         )
     )
+    # projection 함수 프레임이 반환된 뒤에만 해당 raw graph 해제를 표시한다.
+    mark_current_phase(
+        "raw_released", raw_graph_live=False, response_body_live=False,
+        projected_count=len(pair_projections), raw_payload_live_count=0,
+    )
     discovered_mints: list[str] = []
     for url in (DEX_SCREENER_PROFILES_URL, DEX_SCREENER_BOOSTS_URL):
         _extend_discovered_mints(
             await _dexscreener_json(session, url),
             discovered_mints,
+        )
+        mark_current_phase(
+            "raw_released", raw_graph_live=False, response_body_live=False,
+            discovered_mint_count=len(discovered_mints), raw_payload_live_count=0,
         )
     if discovered_mints:
         remaining = max(
@@ -1887,6 +1934,10 @@ async def _fetch_momentum_candidate_cohorts(
                 ),
                 limit=remaining,
             )
+        )
+        mark_current_phase(
+            "raw_released", raw_graph_live=False, response_body_live=False,
+            projected_count=len(pair_projections), raw_payload_live_count=0,
         )
 
     best_by_mint: dict[str, MomentumCandidate] = {}
@@ -1927,6 +1978,11 @@ async def _fetch_momentum_candidate_cohorts(
             best_by_mint[candidate.mint] = candidate
     for mint in best_by_mint:
         shadow_by_mint.pop(mint, None)
+    mark_current_phase(
+        "compact_projected", projected_count=len(pair_projections),
+        approved_count=len(best_by_mint), shadow_count=len(shadow_by_mint),
+        discovered_mint_count=len(discovered_mints), raw_graph_live=False,
+    )
     projected_candidates = list(best_by_mint.values()) + [
         item.candidate for item in shadow_by_mint.values()
     ]
@@ -1958,6 +2014,11 @@ async def _fetch_momentum_candidate_cohorts(
             -item.candidate.volume_m5_usd,
         ),
     )[:MOMENTUM_MAX_SHADOW_CANDIDATES]
+    mark_current_phase(
+        "sorted", candidate_count=len(approved) + len(shadows),
+        downstream_copy_count=len(projected_candidates),
+        approved_count=len(approved), shadow_count=len(shadows),
+    )
     for candidate in approved:
         record_funnel_stage(
             "candidate_considered",
@@ -1988,25 +2049,30 @@ async def fetch_momentum_candidate_cohorts(
     revalidation: bool = False,
 ) -> tuple[list[MomentumCandidate], list[MomentumShadowCandidate]]:
     """후보 fetch/parse/projection 전체의 sub-minute high-water를 기록한다."""
-    with phase_memory(
-        "candidate_fetch",
-        metadata={
-            "workload": "momentum",
-            "operation": "fetch",
-            "revalidation": bool(revalidation),
-        },
-        include_gc_counts=True,
-        include_object_count=True,
-    ) as scope:
-        approved, shadows = await _fetch_momentum_candidate_cohorts(session)
-        scope.add_metadata(candidate_count=len(approved) + len(shadows))
-    # Raw HTTP/JSON payloads belong to the inner coroutine and are dead here;
-    # only compact dataclass projections remain.
-    maybe_trim_allocator(
-        phase="momentum_candidate_fetch",
-        reason="raw_candidate_payload_released",
-    )
-    return approved, shadows
+    with diagnostic_phase("candidate_fetch"):
+        with phase_memory(
+            "candidate_fetch",
+            metadata={
+                "workload": "momentum",
+                "operation": "fetch",
+                "revalidation": bool(revalidation),
+            },
+            include_gc_counts=True,
+            include_object_count=True,
+        ) as scope:
+            approved, shadows = await _fetch_momentum_candidate_cohorts(session)
+            scope.add_metadata(candidate_count=len(approved) + len(shadows))
+            mark_current_phase(
+                "raw_released", raw_graph_live=False, response_body_live=False,
+                candidate_count=len(approved) + len(shadows), raw_payload_live_count=0,
+            )
+        # Raw HTTP/JSON payloads belong to the inner coroutine and are dead here;
+        # only compact dataclass projections remain.
+        maybe_trim_allocator(
+            phase="momentum_candidate_fetch",
+            reason="raw_candidate_payload_released",
+        )
+        return approved, shadows
 
 
 async def fetch_momentum_candidates(
@@ -2045,6 +2111,19 @@ def unknown_whale_buy_from_transaction(
     key_rows = message.get("accountKeys") or []
     signature = signature_of(transaction)
     results: list[UnknownWhaleBuy] = []
+    mark_current_phase(
+        "transaction_materialized", raw_graph_live=True,
+        account_count=len(key_rows),
+        pre_token_balance_count=(
+            len(meta["preTokenBalances"])
+            if isinstance(meta.get("preTokenBalances"), list) else 0
+        ),
+        post_token_balance_count=(
+            len(meta["postTokenBalances"])
+            if isinstance(meta.get("postTokenBalances"), list) else 0
+        ),
+        raw_payload_live_count=1, raw_transaction_count=1, transaction_fetch_active_count=0,
+    )
     for index, row in enumerate(key_rows):
         wallet = str(row.get("pubkey") or "") if isinstance(row, dict) else str(row)
         is_signer = bool(row.get("signer")) if isinstance(row, dict) else index == 0
@@ -2074,6 +2153,10 @@ def unknown_whale_buy_from_transaction(
                 token_decimals=decimals,
             )
         )
+    mark_current_phase(
+        "transaction_projected", projected_count=len(results), raw_graph_live=True,
+        raw_payload_live_count=1, raw_transaction_count=1, transaction_fetch_active_count=0,
+    )
     return results
 
 
@@ -2099,6 +2182,11 @@ async def confirm_unknown_whales(
                 },
             ],
         )
+    mark_current_phase(
+        "signatures_materialized", signature_count=len(signatures or []),
+        signatures_live=True, response_body_live=False,
+        raw_signature_count=len(signatures or []), raw_payload_live_count=1,
+    )
     with phase_memory(
         "whale_signature_projection",
         metadata={"workload": "momentum", "operation": "parse"},
@@ -2118,6 +2206,10 @@ async def confirm_unknown_whales(
             retained_count=len(transaction_signatures),
         )
     add_current_phase_metadata(signature_count=len(transaction_signatures))
+    mark_current_phase(
+        "signatures_projected", signature_count=len(signatures or []),
+        projected_signature_count=len(transaction_signatures), signatures_live=True,
+    )
     if not transaction_signatures:
         return []
     by_wallet: dict[str, UnknownWhaleBuy] = {}
@@ -2125,48 +2217,74 @@ async def confirm_unknown_whales(
     # Sequential early-exit reads keep peak memory flat and stop as soon as
     # three qualifying wallets exist.
     for signature in transaction_signatures:
-        add_current_phase_metadata(transaction_count=1)
-        with phase_memory(
-            "whale_transaction_fetch",
-            metadata={
-                "workload": "transaction",
-                "operation": "fetch",
-                "transaction_count": 1,
-                # 이전 raw transaction은 matching 직후 해제되어야 한다.
-                "retained_count": int(isinstance(transaction, dict)),
-            },
+        with diagnostic_phase(
+            "smart_get_transaction", transaction_fetch_active_count=1, signatures_live=True,
         ):
-            transaction = await _solana_rpc(
-                session,
-                http_url,
-                "getTransaction",
-                [
-                    signature,
-                    {
-                        "commitment": "confirmed",
-                        "encoding": "jsonParsed",
-                        "maxSupportedTransactionVersion": 0,
-                    },
-                ],
+            mark_current_phase(
+                "transaction_fetch", transaction_live=isinstance(transaction, dict),
+                signatures_live=True, transaction_fetch_active_count=1,
             )
-        if not isinstance(transaction, dict):
+            add_current_phase_metadata(transaction_count=1)
+            with phase_memory(
+                "whale_transaction_fetch",
+                metadata={
+                    "workload": "transaction",
+                    "operation": "fetch",
+                    "transaction_count": 1,
+                    # 이전 raw transaction은 matching 직후 해제되어야 한다.
+                    "retained_count": int(isinstance(transaction, dict)),
+                },
+            ):
+                transaction = await _solana_rpc(
+                    session,
+                    http_url,
+                    "getTransaction",
+                    [
+                        signature,
+                        {
+                            "commitment": "confirmed",
+                            "encoding": "jsonParsed",
+                            "maxSupportedTransactionVersion": 0,
+                        },
+                    ],
+                )
+            mark_current_phase(
+                "transaction_materialized", transaction_live=isinstance(transaction, dict),
+                signatures_live=True, response_body_live=False,
+                raw_transaction_count=int(isinstance(transaction, dict)),
+                raw_payload_live_count=int(transaction is not None),
+                transaction_fetch_active_count=0,
+            )
+            if not isinstance(transaction, dict):
+                transaction = None
+                continue
+            add_current_phase_metadata(retained_count=1)
+            with phase_memory(
+                "whale_transaction_matching",
+                metadata={
+                    "workload": "transaction",
+                    "operation": "analyze",
+                    "transaction_count": 1,
+                },
+            ) as matching_scope:
+                matched_buys = unknown_whale_buy_from_transaction(
+                    transaction, candidate.mint, watched_wallets
+                )
+                matching_scope.add_metadata(projected_count=len(matched_buys))
+            # 이후 단계는 compact projection만 사용하므로 raw graph를 해제한다.
             transaction = None
-            continue
-        add_current_phase_metadata(retained_count=1)
-        with phase_memory(
-            "whale_transaction_matching",
-            metadata={
-                "workload": "transaction",
-                "operation": "analyze",
-                "transaction_count": 1,
-            },
-        ) as matching_scope:
-            matched_buys = unknown_whale_buy_from_transaction(
-                transaction, candidate.mint, watched_wallets
+            mark_current_phase(
+                "transaction_released", transaction_live=False, raw_graph_live=False,
+                signatures_live=True, projected_count=len(matched_buys),
+                raw_payload_live_count=0, raw_transaction_count=0,
+                transaction_fetch_active_count=0, response_body_live=False,
             )
-            matching_scope.add_metadata(projected_count=len(matched_buys))
-        # 이후 단계는 compact projection만 사용하므로 raw graph를 해제한다.
-        transaction = None
+        mark_current_phase(
+            "transaction_released", transaction_live=False, raw_graph_live=False,
+            signatures_live=True, projected_count=len(matched_buys),
+            raw_transaction_count=0, raw_signature_count=len(signatures or []),
+            raw_payload_live_count=int(signatures is not None),
+        )
         with phase_memory(
             "whale_confirmation_aggregation",
             metadata={"workload": "momentum", "operation": "update"},
@@ -2309,24 +2427,30 @@ async def _confirm_unknown_whales_with_telemetry(
     watched_wallets: set[str],
 ) -> list[UnknownWhaleBuy]:
     """기존 funnel과 별도로 confirmation memory high-water를 기록한다."""
-    with phase_memory(
-        "whale_confirmation",
-        metadata={"workload": "momentum", "operation": "confirm"},
-        include_gc_counts=True,
-        include_object_count=True,
-    ) as scope:
-        whales = await _confirm_unknown_whales_with_funnel_telemetry(
-            session, http_url, candidate, watched_wallets
+    with diagnostic_phase("whale_confirmation"):
+        with phase_memory(
+            "whale_confirmation",
+            metadata={"workload": "momentum", "operation": "confirm"},
+            include_gc_counts=True,
+            include_object_count=True,
+        ) as scope:
+            whales = await _confirm_unknown_whales_with_funnel_telemetry(
+                session, http_url, candidate, watched_wallets
+            )
+            scope.add_metadata(success_count=len(whales))
+            mark_current_phase(
+                "raw_released", signatures_live=False, transaction_live=False,
+                raw_graph_live=False, projected_count=len(whales),
+                raw_payload_live_count=0, raw_transaction_count=0, raw_signature_count=0,
+            )
+        # Confirmation returns compact UnknownWhaleBuy rows.  Signature/RPC raw
+        # graphs from the inner coroutine have left scope and are eligible for
+        # allocator release before the next five-second route tick.
+        maybe_trim_allocator(
+            phase="momentum_whale_confirmation",
+            reason="raw_confirmation_payload_released",
         )
-        scope.add_metadata(success_count=len(whales))
-    # Confirmation returns compact UnknownWhaleBuy rows.  Signature/RPC raw
-    # graphs from the inner coroutine have left scope and are eligible for
-    # allocator release before the next five-second route tick.
-    maybe_trim_allocator(
-        phase="momentum_whale_confirmation",
-        reason="raw_confirmation_payload_released",
-    )
-    return whales
+        return whales
 
 
 def schedule_market_shadow(
@@ -2602,6 +2726,9 @@ async def fetch_transaction(
     session: aiohttp.ClientSession, http_url: str, signature: str
 ) -> dict[str, Any] | None:
     for _ in range(4):
+        mark_current_phase(
+            "transaction_fetch", transaction_live=False, transaction_fetch_active_count=1,
+        )
         transaction_memory_start = current_rss_bytes()
         try:
             result = await solana_rpc_call(
@@ -2618,9 +2745,16 @@ async def fetch_transaction(
                 workload="transaction_history",
             )
         finally:
+            mark_current_phase("transaction_fetch", transaction_fetch_active_count=0)
             record_memory_phase(
                 "smart_get_transaction", transaction_memory_start
             )
+        mark_current_phase(
+            "transaction_materialized", transaction_live=isinstance(result, dict),
+            raw_graph_live=result is not None, response_body_live=False,
+            raw_transaction_count=int(isinstance(result, dict)),
+            raw_payload_live_count=int(result is not None), transaction_fetch_active_count=0,
+        )
         if isinstance(result, dict):
             record_transaction_payload(result)
             return result
@@ -2770,44 +2904,59 @@ async def monitor_standard_once(
                     continue
                 record_wallet_ws_activity("dex_log_match", DISCOVERY_SOURCE_SOLANA)
                 record_wallet_ws_activity("transaction_fetch", DISCOVERY_SOURCE_SOLANA)
-                try:
-                    transaction = await fetch_transaction(
-                        session, settings.http_url, signature
+                with diagnostic_phase("smart_get_transaction"):
+                    try:
+                        transaction = await fetch_transaction(
+                            session, settings.http_url, signature
+                        )
+                    except Exception as exc:
+                        failure_reason = record_transaction_restore_failure(
+                            DISCOVERY_SOURCE_SOLANA, exc
+                        )
+                        logger.warning(
+                            "standard transaction restore failed category=%s",
+                            failure_reason,
+                        )
+                        continue
+                    mark_current_phase(
+                        "transaction_materialized", transaction_live=bool(transaction),
+                        raw_graph_live=bool(transaction),
+                        raw_transaction_count=int(isinstance(transaction, dict)),
+                        raw_payload_live_count=int(transaction is not None),
+                        transaction_fetch_active_count=0,
                     )
-                except Exception as exc:
-                    failure_reason = record_transaction_restore_failure(
-                        DISCOVERY_SOURCE_SOLANA, exc
+                    if transaction:
+                        record_wallet_ws_activity(
+                            "transaction_restore_success", DISCOVERY_SOURCE_SOLANA
+                        )
+                        record_wallet_ws_activity(
+                            "transaction_parsed", DISCOVERY_SOURCE_SOLANA
+                        )
+                        print_buys(
+                            transaction,
+                            dex_name,
+                            set(wallets),
+                            discovery_source=DISCOVERY_SOURCE_SOLANA,
+                        )
+                        mark_current_phase(
+                            "transaction_projected", transaction_live=True, raw_graph_live=True,
+                        )
+                    else:
+                        record_transaction_restore_failure(
+                            DISCOVERY_SOURCE_SOLANA, None
+                        )
+                    # The restored transaction is not needed after synchronous
+                    # projection/scheduling.  Drop the final raw graph reference
+                    # before asking glibc to release idle arenas.
+                    transaction = None
+                    mark_current_phase(
+                        "raw_released", transaction_live=False, raw_graph_live=False,
+                        raw_transaction_count=0, raw_payload_live_count=0,
                     )
-                    logger.warning(
-                        "standard transaction restore failed category=%s",
-                        failure_reason,
+                    maybe_trim_allocator(
+                        phase="smart_get_transaction",
+                        reason="restored_transaction_consumed",
                     )
-                    continue
-                if transaction:
-                    record_wallet_ws_activity(
-                        "transaction_restore_success", DISCOVERY_SOURCE_SOLANA
-                    )
-                    record_wallet_ws_activity(
-                        "transaction_parsed", DISCOVERY_SOURCE_SOLANA
-                    )
-                    print_buys(
-                        transaction,
-                        dex_name,
-                        set(wallets),
-                        discovery_source=DISCOVERY_SOURCE_SOLANA,
-                    )
-                else:
-                    record_transaction_restore_failure(
-                        DISCOVERY_SOURCE_SOLANA, None
-                    )
-                # The restored transaction is not needed after synchronous
-                # projection/scheduling.  Drop the final raw graph reference
-                # before asking glibc to release idle arenas.
-                transaction = None
-                maybe_trim_allocator(
-                    phase="smart_get_transaction",
-                    reason="restored_transaction_consumed",
-                )
 
 
 async def monitor_once(settings: MonitorSettings, wallets: tuple[str, ...]) -> None:
@@ -3128,6 +3277,28 @@ async def run_forever(settings: MonitorSettings) -> None:
             delay = min(delay * 2, 300)
 
 
+async def failure_memory_counter_loop() -> None:
+    """1초마다 event loop의 scalar 수량만 sampler에 전달한다."""
+    while True:
+        try:
+            update_runtime_counts(
+                asyncio_live_task_count=len(asyncio.all_tasks()),
+                signal_task_count=len(_signal_tasks),
+                shadow_task_count=len(_shadow_signal_tasks),
+                signature_window_size=_active_signature_window_size,
+                history_key_count=len(_whale_buy_history),
+                history_entry_count=sum(len(rows) for rows in _whale_buy_history.values()),
+                entry_cooldown_count=len(_market_entry_cooldowns),
+                shadow_cooldown_count=len(_market_shadow_cooldowns),
+                momentum_series_count=_momentum_snapshot_store.series_count,
+                momentum_snapshot_count=_momentum_snapshot_store.snapshot_count,
+            )
+        except Exception:
+            # 계측 수량 갱신 실패는 거래 흐름을 중단하지 않는다.
+            pass
+        await asyncio.sleep(1.0)
+
+
 async def run_service() -> None:
     from src.observation_tracker import (
         approved_signal_paper_mode_enabled,
@@ -3162,6 +3333,8 @@ async def run_service() -> None:
         paper_entries_enabled,
     )
     memory_sampler = start_memory_attribution_sampler()
+    failure_sampler = start_failure_sampler()
+    failure_counter_task = asyncio.create_task(failure_memory_counter_loop())
     try:
         await asyncio.gather(
             run_forever(settings),
@@ -3171,6 +3344,10 @@ async def run_service() -> None:
             observation_supervisor() if observation_mode else asyncio.Event().wait(),
         )
     finally:
+        failure_counter_task.cancel()
+        await asyncio.gather(failure_counter_task, return_exceptions=True)
+        if failure_sampler is not None:
+            failure_sampler.stop()
         if memory_sampler is not None:
             memory_sampler.stop()
 

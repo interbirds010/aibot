@@ -335,6 +335,20 @@ def _active_snapshot() -> list[dict[str, int | str]]:
     ]
 
 
+def active_phase_counts_snapshot() -> dict[str, int] | None:
+    """실패 sampler에 유한 phase 수량만 전달하며 락을 기다리지 않는다."""
+    if not _active_lock.acquire(blocking=False):
+        return None
+    try:
+        return {
+            phase: min(MAX_SCALAR_COUNT, max(0, int(count)))
+            for phase, count in _active_phase_counts.items()
+            if phase in ALLOWED_PHASES and count > 0
+        }
+    finally:
+        _active_lock.release()
+
+
 def _next_identity(*, context: bool = False) -> int:
     global _next_context_id
     global _next_phase_instance_id

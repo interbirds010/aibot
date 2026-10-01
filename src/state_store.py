@@ -15,7 +15,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Callable, Iterator, TypeVar
 
-from src import state_lock_diagnostics
+from src import failure_memory_diagnostics, state_lock_diagnostics
 
 if os.name == "nt":
     import msvcrt
@@ -65,13 +65,48 @@ def normalized_route_metadata(
     }
 
 
+def _observe_shadow_memory(
+    path: Path,
+    stage: str,
+    document: dict[str, Any] | None = None,
+    **counts: int | bool,
+) -> None:
+    """shadow 계측에는 문서 대신 스칼라만 전달한다."""
+    if path.name != "shadow_trades.json":
+        return
+    try:
+        if document is not None:
+            trades = document.get("trades")
+            counts["shadow_trade_count"] = len(trades) if isinstance(trades, list) else 0
+            # shadow schema v2는 trades를 저장하며 positions/events 배열이 없다.
+            for field in ("positions", "events"):
+                rows = document.get(field)
+                counts[f"shadow_{field[:-1]}_count"] = len(rows) if isinstance(rows, list) else 0
+            counts["ledger_document_live"] = True
+        if stage == "ledger_loaded":
+            try:
+                counts["input_file_size_bytes"] = path.stat().st_size
+            except OSError:
+                counts["input_file_size_bytes"] = 0
+        failure_memory_diagnostics.mark_current_phase(
+            stage, phase_name="shadow_ledger_write", **counts,
+        )
+    except Exception:
+        pass
+
+
 def read_json(path: Path, fallback: dict[str, Any]) -> dict[str, Any]:
     try:
         document = json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError:
-        return copy.deepcopy(fallback)
+        document = copy.deepcopy(fallback)
+        _observe_shadow_memory(path, "ledger_loaded", document)
+        return document
     if not isinstance(document, dict):
         raise RuntimeError(f"{path} must contain a JSON object")
+    # read_text 문자열과 decode 그래프는 loads 실행 중 겹친다. 이 경계는
+    # loads가 반환하고 임시 입력 문자열이 해제된 뒤의 상태만 관찰한다.
+    _observe_shadow_memory(path, "ledger_loaded", document)
     return document
 
 
@@ -154,6 +189,7 @@ def atomic_write_json(
     lifecycle_observer: Callable[[str, int], None] | None = None,
 ) -> None:
     def observe(stage: str, size_bytes: int) -> None:
+        _observe_shadow_memory(path, stage, serialized_size_bytes=size_bytes)
         if lifecycle_observer is None:
             return
         try:
@@ -182,6 +218,7 @@ def atomic_write_json(
             continue
     temporary: str | None = None
     serialized_size = 0
+    buffer_closed_observed = False
     try:
         with tempfile.NamedTemporaryFile(
             "w",
@@ -192,9 +229,12 @@ def atomic_write_json(
             delete=False,
         ) as file:
             temporary = file.name
+            _observe_shadow_memory(path, "tmp_write_start", file_buffer_live=True)
             # Compact encoding shortens fsync and therefore the cross-process
             # lock hold time on the 1 GB production VPS.
             observe("serialize", 0)
+            # dump는 encoder 조각을 파일에 바로 쓴다. 별도 전체 문자열이나
+            # bytes 버퍼가 없으므로 serialize와 tmp write는 같은 구간이다.
             json.dump(
                 document,
                 file,
@@ -202,7 +242,7 @@ def atomic_write_json(
                 separators=(",", ":"),
             )
             file.write("\n")
-            if lifecycle_observer is not None:
+            if lifecycle_observer is not None or path.name == "shadow_trades.json":
                 try:
                     serialized_size = max(0, int(file.tell()))
                 except Exception:
@@ -211,9 +251,22 @@ def atomic_write_json(
             file.flush()
             os.fsync(file.fileno())
             observe("flushed", serialized_size)
+        _observe_shadow_memory(path, "file_buffer_closed", file_buffer_live=False)
+        _observe_shadow_memory(path, "buffer_released", file_buffer_live=False)
+        buffer_closed_observed = True
+        _observe_shadow_memory(path, "rename_start", serialized_size_bytes=serialized_size)
         os.replace(temporary, path)
         observe("replaced", serialized_size)
     finally:
+        if temporary and not buffer_closed_observed:
+            # with의 예외 경로에서도 파일 close가 끝난 뒤에만 해제를 기록한다.
+            try:
+                closed = file.closed
+            except Exception:
+                closed = False
+            if closed:
+                _observe_shadow_memory(path, "file_buffer_closed", file_buffer_live=False)
+                _observe_shadow_memory(path, "buffer_released", file_buffer_live=False)
         if temporary and os.path.exists(temporary):
             os.unlink(temporary)
 
@@ -237,6 +290,7 @@ def update_json(
             )
         result = mutator(document)
         document["version"] = current_version + 1
+        _observe_shadow_memory(path, "ledger_mutated", document)
         atomic_write_json(path, document)
         return result, document
 
@@ -252,6 +306,7 @@ def migrate_json(
     with exclusive_file_lock(path, operation=operation):
         document = read_json(path, fallback)
         changed = migrator(document)
+        _observe_shadow_memory(path, "ledger_mutated", document)
         if changed:
             document["version"] = int(document.get("version", 0) or 0) + 1
             atomic_write_json(path, document)

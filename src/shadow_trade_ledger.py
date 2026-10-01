@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from src import failure_memory_diagnostics
 from src.runtime_memory import maybe_trim_allocator
 from src.state_store import migrate_json, update_json
 
@@ -84,12 +85,16 @@ def migrate_shadow_trade_document(document: dict[str, Any]) -> bool:
 
 
 def ensure_shadow_trades_migrated() -> dict[str, Any]:
-    return migrate_json(
-        SHADOW_TRADE_PATH,
-        empty_shadow_trades(),
-        migrate_shadow_trade_document,
-        operation="shadow_trade_migration",
-    )
+    with failure_memory_diagnostics.diagnostic_phase(
+        "shadow_ledger_write", shadow_migration_in_progress=True,
+    ):
+        # 반환 문서는 호출자가 보유한다. 여기서는 해제 경계를 기록하지 않는다.
+        return migrate_json(
+            SHADOW_TRADE_PATH,
+            empty_shadow_trades(),
+            migrate_shadow_trade_document,
+            operation="shadow_trade_migration",
+        )
 
 
 def _finite_number(value: Any) -> float | None:
@@ -236,32 +241,44 @@ def record_completed_shadow_trade(row: dict[str, Any]) -> bool:
         document["updated_at"] = datetime.now(timezone.utc).isoformat()
         return True
 
-    recorded, document = update_json(
-        SHADOW_TRADE_PATH,
-        empty_shadow_trades(),
-        mutate,
-        operation="shadow_trade_record",
-    )
-    # update_json returns only after releasing the state lock.  Drop the large
-    # ledger before considering a bounded allocator trim.
-    del document
-    maybe_trim_allocator()
+    with failure_memory_diagnostics.diagnostic_phase(
+        "shadow_ledger_write", projected_trade_count=1,
+    ) as phase:
+        recorded, document = update_json(
+            SHADOW_TRADE_PATH,
+            empty_shadow_trades(),
+            mutate,
+            operation="shadow_trade_record",
+        )
+        # 락과 update_json 내부 프레임이 끝난 뒤 큰 원장을 해제한다.
+        # 새 trade projection은 원래 mutate closure가 함수 반환까지 보유한다.
+        del document
+        phase.mark("ledger_released", ledger_document_live=False)
+        maybe_trim_allocator()
     return bool(recorded)
 
 
 def current_shadow_trade_ids() -> set[str]:
     """현재 shadow 원장을 검증하고 작은 identity 집합만 반환한다."""
-    current = ensure_shadow_trades_migrated()
-    # json.loads-created strings can share allocator arenas with the much
-    # larger document.  Detach the small returned identity set so releasing
-    # the document really makes those arenas eligible for trim.
-    identities = {
-        (" " + str(item.get("shadow_trade_id", "")))[1:]
-        for item in current.get("trades", [])
-        if isinstance(item, dict)
-    }
-    del current
-    maybe_trim_allocator()
+    with failure_memory_diagnostics.diagnostic_phase(
+        "shadow_ledger_write", shadow_ids_in_progress=True,
+    ) as phase:
+        current = ensure_shadow_trades_migrated()
+        # json.loads-created strings can share allocator arenas with the much
+        # larger document.  Detach the small returned identity set so releasing
+        # the document really makes those arenas eligible for trim.
+        identities = {
+            (" " + str(item.get("shadow_trade_id", "")))[1:]
+            for item in current.get("trades", [])
+            if isinstance(item, dict)
+        }
+        phase.mark(
+            "compact_projected", shadow_identity_count=len(identities),
+            ledger_document_live=True,
+        )
+        del current
+        phase.mark("ledger_released", ledger_document_live=False)
+        maybe_trim_allocator()
     return identities
 
 
@@ -317,12 +334,16 @@ def backfill_completed_shadow_trades(
             document["updated_at"] = datetime.now(timezone.utc).isoformat()
         return len(added)
 
-    added, document = update_json(
-        SHADOW_TRADE_PATH,
-        empty_shadow_trades(),
-        mutate,
-        operation="shadow_trade_backfill",
-    )
-    del document
-    maybe_trim_allocator()
+    with failure_memory_diagnostics.diagnostic_phase(
+        "shadow_ledger_write", projected_trade_count=len(candidates),
+    ) as phase:
+        added, document = update_json(
+            SHADOW_TRADE_PATH,
+            empty_shadow_trades(),
+            mutate,
+            operation="shadow_trade_backfill",
+        )
+        del document
+        phase.mark("ledger_released", ledger_document_live=False)
+        maybe_trim_allocator()
     return int(added)

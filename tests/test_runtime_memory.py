@@ -15,6 +15,7 @@ class RuntimeMemoryTests(unittest.TestCase):
         )
         runtime_memory._allocator_libc_handle = None
         runtime_memory._allocator_trim_last_attempt_monotonic = None
+        runtime_memory._allocator_trim_in_progress = False
         runtime_memory._allocator_trim_stats.update({
             "attempt_count": 0,
             "success_count": 0,
@@ -38,6 +39,37 @@ class RuntimeMemoryTests(unittest.TestCase):
         self.assertEqual(result["vms_bytes"], 456 * 1024)
         self.assertEqual(result["thread_count"], 7)
         self.assertEqual(result["system_available_memory_bytes"], 789 * 1024)
+
+    def test_hwm_and_cooldown_snapshot_do_not_wait_for_allocator_lock(self) -> None:
+        memory = runtime_memory.process_memory_snapshot(status_text="VmHWM: 300000 kB\n", meminfo_text="")
+        self.assertEqual(memory["hwm_bytes"], 300000 * 1024)
+        runtime_memory._allocator_trim_last_attempt_monotonic = 100.0
+        runtime_memory._allocator_trim_stats["last_at_epoch_seconds"] = 1000.0
+        with mock.patch.object(runtime_memory.time, "monotonic", return_value=130.0), mock.patch.object(runtime_memory.sys, "platform", "linux"):
+            with runtime_memory._allocator_trim_lock:
+                snapshot = runtime_memory.trim_cooldown_snapshot(rss_bytes=251 * 1024 * 1024)
+        self.assertEqual(snapshot["seconds_since_last_trim"], 30.0)
+        self.assertEqual(snapshot["cooldown_remaining_seconds"], 30.0)
+        self.assertFalse(snapshot["trim_eligible"])
+        self.assertTrue(snapshot["rss_threshold_exceeded"])
+        with mock.patch.object(runtime_memory.time, "monotonic", return_value=161.0), mock.patch.object(runtime_memory.sys, "platform", "linux"):
+            self.assertTrue(runtime_memory.trim_cooldown_snapshot(rss_bytes=251 * 1024 * 1024)["trim_eligible"])
+            runtime_memory._allocator_trim_in_progress = True
+            self.assertFalse(runtime_memory.trim_cooldown_snapshot(rss_bytes=251 * 1024 * 1024)["trim_eligible"])
+
+    def test_trim_events_include_release_phase_and_cooldown_skip_without_behavior_change(self) -> None:
+        with (
+            mock.patch.object(runtime_memory.sys, "platform", "linux"),
+            mock.patch.object(runtime_memory, "current_rss_bytes", return_value=251 * 1024 * 1024),
+            mock.patch.object(runtime_memory, "_load_malloc_trim", return_value=mock.Mock(return_value=1)),
+            mock.patch("src.failure_memory_diagnostics.record_event") as record,
+        ):
+            self.assertTrue(runtime_memory.maybe_trim_allocator(phase="momentum_candidate_fetch", reason="raw_candidate_payload_released"))
+            self.assertFalse(runtime_memory.maybe_trim_allocator(phase="momentum_candidate_fetch", reason="raw_candidate_payload_released"))
+        self.assertEqual([call.args[0] for call in record.call_args_list], ["trim_attempt", "trim_success", "trim_skipped_cooldown"])
+        self.assertEqual(record.call_args_list[-1].kwargs["phase_code"], 1)
+        self.assertEqual(record.call_args_list[-1].kwargs["reason_code"], 1)
+        self.assertFalse(runtime_memory._allocator_trim_in_progress)
 
     def test_payload_estimate_is_bounded_and_keeps_no_payload(self) -> None:
         size, truncated = runtime_memory.estimate_object_size_bytes(

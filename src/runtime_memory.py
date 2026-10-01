@@ -43,6 +43,7 @@ _malloc_trim_function: Any = _MALLOC_TRIM_UNINITIALIZED
 _allocator_libc_handle: Any = None
 _allocator_trim_lock = threading.Lock()
 _allocator_trim_last_attempt_monotonic: float | None = None
+_allocator_trim_in_progress = False
 _allocator_trim_stats: dict[str, int | float | None] = {
     "attempt_count": 0,
     "success_count": 0,
@@ -97,6 +98,7 @@ def process_memory_snapshot(
         system = {}
     return {
         "rss_bytes": process.get("VmRSS"),
+        "hwm_bytes": process.get("VmHWM"),
         "vms_bytes": process.get("VmSize"),
         "thread_count": process.get("Threads"),
         "system_available_memory_bytes": system.get("MemAvailable"),
@@ -105,6 +107,42 @@ def process_memory_snapshot(
 
 def current_rss_bytes() -> int | None:
     return process_memory_snapshot()["rss_bytes"]
+
+
+def trim_cooldown_snapshot(*, rss_bytes: int | None = None) -> dict[str, Any]:
+    """Sampler가 allocator lock을 기다리지 않고 스칼라 현황을 읽는다."""
+    last = _allocator_trim_last_attempt_monotonic
+    age = max(0.0, time.monotonic() - last) if last is not None else None
+    remaining = max(0.0, ALLOCATOR_TRIM_MIN_INTERVAL_SECONDS - age) if age is not None else 0.0
+    in_progress = _allocator_trim_in_progress
+    above_threshold = rss_bytes is not None and rss_bytes >= ALLOCATOR_TRIM_RSS_THRESHOLD_BYTES
+    return {
+        "last_trim_timestamp": _allocator_trim_stats["last_at_epoch_seconds"],
+        "seconds_since_last_trim": round(age, 4) if age is not None else None,
+        "cooldown_remaining_seconds": round(remaining, 4),
+        "trim_in_progress": in_progress,
+        "rss_threshold_bytes": ALLOCATOR_TRIM_RSS_THRESHOLD_BYTES,
+        "rss_threshold_exceeded": above_threshold,
+        "trim_eligible": bool(sys.platform.startswith("linux") and above_threshold and not remaining and not in_progress),
+    }
+
+
+def _failure_diagnostic_event(kind: str, *, phase: str, reason: str, **scalar_counts: Any) -> None:
+    try:
+        from src.failure_memory_diagnostics import record_event
+        scalar_counts["phase_code"] = {
+            "unspecified": 0, "momentum_candidate_fetch": 1,
+            "momentum_whale_confirmation": 2, "smart_get_transaction": 3,
+            "shadow_ledger_write": 4,
+        }.get(phase, 0)
+        scalar_counts["reason_code"] = {
+            "unspecified": 0, "raw_candidate_payload_released": 1,
+            "raw_confirmation_payload_released": 2,
+            "restored_transaction_consumed": 3,
+        }.get(reason, 0)
+        record_event(kind, **scalar_counts)
+    except Exception:
+        pass
 
 
 def _load_malloc_trim() -> Any:
@@ -152,7 +190,8 @@ def maybe_trim_allocator(
     reference.  Every actual attempt is logged so evidence survives PM2 process
     replacement even though in-process counters reset.
     """
-    global _allocator_trim_last_attempt_monotonic
+    global _allocator_trim_last_attempt_monotonic, _allocator_trim_in_progress
+    owns_attempt = False
     normalized_reason = _trim_label(reason)
     normalized_phase = _trim_label(phase)
     try:
@@ -169,6 +208,7 @@ def maybe_trim_allocator(
                 _allocator_trim_last_attempt_monotonic is not None
                 and now - _allocator_trim_last_attempt_monotonic < interval
             ):
+                _failure_diagnostic_event("trim_skipped_cooldown", phase=normalized_phase, reason=normalized_reason, rss_before_bytes=rss_before)
                 return False
             _allocator_trim_last_attempt_monotonic = now
             _allocator_trim_stats["attempt_count"] = int(
@@ -177,6 +217,9 @@ def maybe_trim_allocator(
             attempt_count = int(_allocator_trim_stats["attempt_count"] or 0)
             _allocator_trim_stats["last_at_epoch_seconds"] = time.time()
             _allocator_trim_stats["last_rss_before_bytes"] = rss_before
+            _allocator_trim_in_progress = True
+            owns_attempt = True
+            _failure_diagnostic_event("trim_attempt", phase=normalized_phase, reason=normalized_reason, rss_before_bytes=rss_before, attempt_count=attempt_count)
             logger.info(
                 "memory_trim_attempt process_start_id=%s phase=%s reason=%s "
                 "attempt_count=%d rss_before_bytes=%d threshold_bytes=%d",
@@ -206,6 +249,7 @@ def maybe_trim_allocator(
                     rss_before,
                     latency_ms,
                 )
+                _failure_diagnostic_event("trim_failure", phase=normalized_phase, reason=normalized_reason, rss_before_bytes=rss_before, attempt_count=attempt_count)
                 return False
             try:
                 succeeded = bool(malloc_trim(0))
@@ -243,9 +287,13 @@ def maybe_trim_allocator(
                 delta if delta is not None else "unknown",
                 latency_ms,
             )
+            _failure_diagnostic_event("trim_success" if succeeded else "trim_failure", phase=normalized_phase, reason=normalized_reason, rss_before_bytes=rss_before, rss_after_bytes=rss_after, attempt_count=attempt_count)
             return succeeded
     except Exception:
         return False
+    finally:
+        if owns_attempt:
+            _allocator_trim_in_progress = False
 
 
 def record_memory_phase(name: str, before_rss_bytes: int | None) -> None:

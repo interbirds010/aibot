@@ -20,6 +20,7 @@ from typing import Any, Mapping, Sequence
 
 import aiohttp
 
+from src.failure_memory_diagnostics import mark_current_phase
 from src.phase_memory_telemetry import (
     add_current_phase_metadata,
     add_ancestor_phase_metadata,
@@ -1283,9 +1284,33 @@ async def _provider_request_once(
                         "content_length_known": content_length_known,
                     },
                 ):
+                    mark_current_phase("rpc_decode_begin")
                     payload = await response.json()
             else:
+                if method in HEAVY_RPC_METHODS:
+                    mark_current_phase("rpc_decode_begin")
                 payload = await response.json()
+            if method in HEAVY_RPC_METHODS:
+                # 이미 수신된 body의 길이만 읽고 내용·URL은 보존하지 않는다.
+                body = getattr(response, "_body", None)
+                result = payload.get("result") if isinstance(payload, dict) else None
+                mark_current_phase(
+                    "http_body_decoded",
+                    response_body_bytes=(
+                        len(body) if isinstance(body, (bytes, bytearray)) else 0
+                    ),
+                    response_body_known=isinstance(body, (bytes, bytearray)),
+                    raw_payload_live_count=1,
+                    raw_transaction_count=int(
+                        method == "getTransaction" and isinstance(result, dict)
+                    ),
+                    raw_signature_count=(
+                        len(result)
+                        if method == "getSignaturesForAddress"
+                        and isinstance(result, list) else 0
+                    ),
+                )
+                del body, result
     except _ProviderRequestError:
         raise
     except asyncio.TimeoutError as exc:
