@@ -115,6 +115,10 @@ def fixture_row(name):
 
 
 class EntryTelemetryReadinessFixtureTests(unittest.TestCase):
+    def setUp(self):
+        for name, value in (("_epoch", {"telemetry_epoch_id": "offline-epoch", "start_utc": STAMP, "start_event_seq": 0}), ("_queue", queue.Queue(maxsize=16)), ("_receipt_queue", queue.Queue(maxsize=16)), ("_outcome_queue", queue.Queue(maxsize=16))):
+            item = patch.object(telemetry, name, value); item.start(); self.addCleanup(item.stop)
+
     def test_all_required_outcomes_use_actual_persisted_serializer(self):
         provenance = telemetry._build_provenance({"TRADING_MODE": "paper"})
         with tempfile.TemporaryDirectory() as directory, \
@@ -124,7 +128,7 @@ class EntryTelemetryReadinessFixtureTests(unittest.TestCase):
                 with self.subTest(name=name):
                     capture = fixture_capture(name)
                     telemetry._persist(capture)
-                    path = Path(directory) / "data/research/entry_telemetry/rows" / (capture.identity["signal_id"] + ".json")
+                    path = Path(directory) / "data/research/entry_telemetry/epochs/offline-epoch/predictors/2026-10-03" / (capture.identity["signal_id"] + ".json")
                     record = json.loads(path.read_text(encoding="utf-8"))
                     digest = record.pop("content_hash")
                     self.assertEqual(digest, telemetry._digest(record))
@@ -136,9 +140,9 @@ class EntryTelemetryReadinessFixtureTests(unittest.TestCase):
                     self.assertIn("entry_decision_at", record["predictors"]["timestamps"])
                     self.assertNotIn("paper_buy_created_at", record["predictors"]["timestamps"])
                     self.assertNotIn("decision", record["predictors"]["sections"])
-                    self.assertIsNone(record["predictors"]["sections"]["wallet_performance"]["realized_pnl"])
+                    self.assertIsNone(record["predictors"]["sections"]["wallet_performance"]["entry_time_snapshot"])
                     self.assertEqual(record["predictors"]["sections"]["wallet_performance"]["missing_reason"],
-                        "not_available_in_existing_flow")
+                        "NO_VERIFIED_ENTRY_TIME_SNAPSHOT_SOURCE")
                     self.assertEqual(record["provenance"]["telemetry_schema_version"], telemetry.SCHEMA_VERSION)
                     for field in ("git_sha", "source_digest", "config_fingerprint", "os", "platform", "session_id"):
                         self.assertTrue(record["provenance"][field])
@@ -190,12 +194,11 @@ class EntryTelemetryReadinessFixtureTests(unittest.TestCase):
             "MFE": 1, "MAE": 2, "future_horizon_roi": 3, "post_entry_research_status": "done",
             "future_wallet_performance": {"roi": 4}, "final_pnl": 5}
         with telemetry.bind(capture):
-            telemetry.set_section("scores", {"raw_components": {"observed": 1, **forbidden}})
+            telemetry.set_section("scores", {"raw_components": {"volume": 1, **forbidden}})
         raw = telemetry._row(capture)["predictors"]["sections"]["scores"]["raw_components"]
-        self.assertEqual(raw, {"observed": 1})
+        self.assertEqual(raw, {"volume": 1})
 
-    def test_characterize_unresolved_realized_pnl_sell_and_snapshot_leakage(self):
-        # 보안 통과 assertion이 아니다. 아래 누출 가능성 때문에 activation은 NOT_READY다.
+    def test_realized_pnl_sell_and_future_wallet_snapshot_are_removed(self):
         capture = telemetry.begin_signal(mint="offline", route_type="B", signal_detected_at=STAMP)
         after_entry = "2026-10-04T00:00:00+00:00"
         with telemetry.bind(capture):
@@ -204,22 +207,96 @@ class EntryTelemetryReadinessFixtureTests(unittest.TestCase):
             telemetry.set_section("scores", {"raw_components": {
                 "SELL": {"realized_pnl": 123, "roi": .5, "status": "closed"}}})
         sections = telemetry._row(capture)["predictors"]["sections"]
-        self.assertEqual(sections["wallet_performance"]["realized_pnl"], 123)
-        self.assertGreater(datetime.fromisoformat(sections["wallet_performance"]["snapshot_at"]),
-            datetime.fromisoformat(capture.identity["signal_detected_at"]))
-        self.assertEqual(sections["scores"]["raw_components"]["SELL"]["realized_pnl"], 123)
+        self.assertIsNone(sections["wallet_performance"]["entry_time_snapshot"])
+        self.assertEqual(sections["scores"]["raw_components"], {})
+        text = json.dumps(sections)
+        for key in ("realized_pnl", "SELL", "snapshot_at", "wins", "losses", "roi"):
+            self.assertNotIn('"' + key + '"', text)
 
-    def test_characterize_receipt_and_predictors_share_one_physical_file(self):
-        # 현재는 JSON key 분리만 있으며 요청한 물리적 파일 분리를 충족하지 않는다.
+    def test_receipt_and_predictors_are_physically_separate(self):
         with tempfile.TemporaryDirectory() as directory, patch.object(telemetry, "_root", Path(directory)):
             capture = fixture_capture("normal_buy")
             telemetry._persist(capture)
-            rows = list((Path(directory) / "data/research/entry_telemetry/rows").glob("*.json"))
+            rows = list((Path(directory) / "data/research/entry_telemetry/epochs/offline-epoch/predictors/2026-10-03").glob("*.json"))
             self.assertEqual(len(rows), 1)
             document = json.loads(rows[0].read_text(encoding="utf-8"))
             self.assertIn("predictors", document)
-            self.assertIn("execution_receipt", document)
-            self.assertEqual(document["execution_receipt"]["trade_id"], "offline-trade-normal_buy")
+            self.assertNotIn("execution_receipt", document)
+            receipt = telemetry._record_path("receipts", telemetry._receipt_row(capture))
+            self.assertNotEqual(rows[0], receipt)
+            self.assertEqual(json.loads(receipt.read_text(encoding="utf-8"))["execution_receipt"]["trade_id"], "offline-trade-normal_buy")
+
+    def test_serializer_rejects_direct_unknown_nested_result_injection(self):
+        capture = fixture_capture("normal_buy")
+        capture.identity["result"] = {"realized_pnl": 500, "SELL": True}
+        capture.sections["result"] = {"realized_pnl": 500, "SELL": True}
+        capture.timestamps["result"] = {"future": 500}
+        capture.timestamps["entry_decision_at"]["result"] = {"exit_reason": "x"}
+        capture.sections["scores"]["momentum"]["raw_components"]["result"] = {"mfe": 500}
+        capture.sections["trajectory"]["pre_signal_snapshots"] = [
+            {"snapshot_at_epoch": datetime.fromisoformat(STAMP).timestamp() + 1, "price_usd": 10}]
+        capture.counters["rpc_attempt_count"] = {"result": {"realized_pnl": 500}}
+        capture.durations["rpc_request_sec"] = {"result": {"realized_pnl": 500}}
+        with patch.object(telemetry, "_provenance", {"os": {"result": {"realized_pnl": 500}}}):
+            row = telemetry._row(capture)
+        for word in ("result", "realized_pnl", "SELL", "exit_reason", "mfe"):
+            self.assertNotIn('"' + word + '"', json.dumps(row))
+        self.assertEqual(row["predictors"]["sections"]["trajectory"]["pre_signal_snapshots"], [])
+
+    def test_explicit_nested_allowlist_keeps_inputs_and_rejects_outcome_aliases(self):
+        aliases = ("realized_pnl", "pnl", "profit", "loss", "SELL", "exit_reason", "closed",
+                   "outcome", "winner", "loser", "MAE", "MFE", "horizon_roi", "futureReturn", "final_status", "result")
+        capture = telemetry.begin_signal(mint="offline", route_type="B", signal_detected_at=STAMP)
+        with telemetry.bind(capture):
+            telemetry.set_section("scores", {"momentum": {"raw_components": {
+                "volume_points": 60, **{name: {"realized_pnl": 123} for name in aliases}},
+                "capped_total": 100, **{name: 500 for name in aliases}}})
+            telemetry.set_section("short_flow", {"sell_count": 2})
+            telemetry.set_section("quote_exit_preflight", {"expected_output": 100})
+        row = telemetry._row(capture)
+        raw = row["predictors"]["sections"]["scores"]["momentum"]["raw_components"]
+        self.assertEqual(raw, {"volume_points": 60})
+        self.assertEqual(row["predictors"]["sections"]["short_flow"]["sell_count"], 2)
+        self.assertEqual(row["predictors"]["sections"]["quote_exit_preflight"]["expected_output"], 100)
+
+    def test_outcome_persist_never_updates_predictor_and_has_distinct_schema(self):
+        with tempfile.TemporaryDirectory() as directory, patch.object(telemetry, "_root", Path(directory)):
+            capture = fixture_capture("normal_buy")
+            telemetry._persist(capture)
+            predictor_path = telemetry._record_path("predictors", telemetry._row(capture))
+            before = predictor_path.read_bytes()
+            telemetry.submit_outcome({"trade_id": "offline-trade-normal_buy", "mint": capture.identity["mint"],
+                "route_type": "B", "strategy_family": "dex_momentum_b", "signal_detected_at": STAMP,
+                "buy_event_seq": 1, "event_seq": 2, "completed_at": STAMP,
+                "realized_pnl_lamports": 7, "exit_reason": "offline_completion", "sell_legs": [
+                    {"event_seq": 2, "proceeds_lamports": 100, "realized_pnl_lamports": 7}]})
+            value = telemetry._outcome_queue.get_nowait()
+            telemetry._write_stream("outcomes", value)
+            telemetry._outcome_queue.task_done()
+            document = telemetry._outcome_row(value)
+            outcome_path = telemetry._record_path("outcomes", document)
+            receipt_path = telemetry._record_path("receipts", telemetry._receipt_row(capture))
+            self.assertEqual(len({predictor_path, receipt_path, outcome_path}), 3)
+            self.assertEqual(predictor_path.read_bytes(), before)
+            self.assertEqual(document["outcome_schema_version"], 1)
+            self.assertEqual(json.loads(outcome_path.read_text(encoding="utf-8"))["outcome"]["realized_pnl_lamports"], 7)
+            self.assertIsNone(document["identity"]["signal_id"])
+
+    def test_reject_and_rpc_skipped_do_not_require_execution_receipt(self):
+        with tempfile.TemporaryDirectory() as directory, patch.object(telemetry, "_root", Path(directory)):
+            for name in ("analyzer_reject", "rpc_skipped", "quote_failed"):
+                capture = fixture_capture(name)
+                telemetry._persist(capture)
+                self.assertTrue(telemetry._record_path("predictors", telemetry._row(capture)).exists())
+                self.assertFalse(telemetry._record_path("receipts", telemetry._receipt_row(capture)).exists())
+
+    def test_historical_and_future_wallet_performance_stay_null_without_verified_source(self):
+        for timestamp in ("2026-10-02T00:00:00+00:00", "2026-10-04T00:00:00+00:00"):
+            capture = telemetry.begin_signal(mint="offline", route_type="B", signal_detected_at=STAMP)
+            with telemetry.bind(capture):
+                telemetry.set_section("wallet_performance", {"entry_time_snapshot": {"snapshot_at": timestamp,
+                    "wins": 10, "realized_pnl": 500}, "snapshot_at": timestamp})
+            self.assertIsNone(telemetry._row(capture)["predictors"]["sections"]["wallet_performance"]["entry_time_snapshot"])
 
 
 if __name__ == "__main__":

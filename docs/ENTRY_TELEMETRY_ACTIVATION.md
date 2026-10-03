@@ -1,179 +1,133 @@
-# Entry telemetry: offline readiness와 N3 종료 후 cutover
+# Entry telemetry split-stream readiness와 activation 계약
 
-2026-10-03 KST audit. **TELEMETRY_NOT_READY**. 이 문서는 활성화 명령 실행 승인이 아니다. 현재 N3/Control을 재시작하거나 현재 checkout을 업데이트하지 않는다. 이번 변경은 테스트·측정 도구·문서뿐이다.
+2026-10-03 KST. **TELEMETRY_ACTIVATION_READY_WITH_LIMITATIONS**는 아래 검증을 통과한 코드의 준비 상태다. 현재 N3 종료·Control 정지·telemetry activation을 실행했다는 뜻이 아니다. 현재 frozen runtime은 그대로 유지한다.
 
 ## A. Preflight
 
-| 구분 | checkout / identity |
-|---|---|
-| 실제 실행 | `C:\Users\user\Documents\aibot-local-paper`, branch `codex/memory-failure-diagnostics`, HEAD `8f0b9429352c9961b895a9f9c0e2d1f3e6b19d05` |
-| Telemetry 구현 | `C:\Users\user\Documents\aibot-entry-telemetry`, branch `codex/entry-telemetry`, base HEAD `1c06e60642ab84837835d96e074a46be55e1db84` |
-| 원격 시작 상태 | origin/main = telemetry base; isolated ahead/behind 0/0, live 0/1 |
+실제 실행 checkout은 `C:\Users\user\Documents\aibot-local-paper`, HEAD `8f0b9429352c9961b895a9f9c0e2d1f3e6b19d05`, branch `codex/memory-failure-diagnostics`다. Candidate는 `C:\Users\user\Documents\aibot-entry-telemetry`, branch `codex/entry-telemetry`, 시작 HEAD/origin/main `7fad7db2bd18a4b223e0d38aded39687da2a1df7`, ahead/behind 0/0, clean이었다. 명시적인 main ref fetch를 사용했다. Git 설정·history는 변경하지 않는다.
 
-일반 `git fetch origin`은 설정된 삭제된 remote branch ref 때문에 실패했다. 설정을 변경하지 않고 `git fetch origin main`으로 main을 확인했다. 완료 commit은 이 문서/관련 tests만 추가하며 telemetry 구현 commit과 별개다. 최종 HEAD/origin/status는 완료 보고에서 확인한다.
+기존 live foreign monitor Windows feeder/sys patch, Linux feeder test patch, runner/Windows tests, local-paper 문서, .deployed-sha, research_tools와 first-BUY acceptance test는 보존한다. 필요한 Windows runner/feeder 동작과 관련 tests만 candidate에 이관했다. Live 파일이나 HEAD를 수정하지 않았다. Runtime telemetry `data/research/entry_telemetry`는 존재하지 않는다. Legacy v1 runtime rows 발견 시 epoch 생성은 차단하고 변환하지 않는다.
 
-Live foreign 변경: tracked `src/monitor.py`, `tests/test_self_recovery_filters.py`; untracked `.deployed-sha`, local-paper 문서 2개, `scripts/local_paper_runner.py`, Windows runner/feeder tests, `research_tools/`, first-BUY acceptance test. 수정/stage/commit하지 않았다. `legacy_carry_in.json`의 foreign hash inventory와 manifest의 실제 source identity가 일치했다.
+## B. Previous blockers
 
-Audit 중 actual PIDs monitor 7876, risk 4556, dashboard 3624, N3 43084 및 시작 시각은 기존과 같았다. N3 RUNNING/recorder OK, source identity 일치, WSS SUBSCRIBED, backlog 0. 첫 fresh BUY watcher는 이미 PASS 후 정상 종료했으며 N3 observer는 계속 실행 중이다. 현재 telemetry process는 시작하지 않았다. GitHub Actions 세 workflow는 disabled_manually이며 변경하지 않았다.
+7fad7db audit에서 A 동일 물리 파일, B nested label/future-wallet 유입, C epoch/Windows 연결 미완료를 확인했다. 이번 구현은 세 항목을 각각 코드·테스트로 해결한다. 이전 문서의 v1 내용과 취약 동작 characterization을 현재 readiness 승인으로 사용하지 않는다.
 
-## B. Implementation review
+## C. New split architecture
 
-실제 코드 `src/research/entry_telemetry.py` 기준 schema 1, queue 16, daemon writer. Import만으로 writer를 시작하지 않지만 candidate `monitor.main()`은 worker를 무조건 시작한다. 현재는 live checkout에 해당 코드가 없어서 disabled다. Candidate monitor를 시험 삼아 시작하는 것도 activation이다.
+`src/research/entry_telemetry.py`의 세 bounded queue(각16)가 실제 serializer/writer를 연결한다. 후보 critical path에는 projection/put_nowait만 있고 JSON 직렬화·Git/source 조회·락·fsync는 startup 또는 background writer에 있다. 한 stream 오류는 다른 stream 큐/파일/용량 예약에 전파되지 않는다.
 
-저장: `data/research/entry_telemetry/rows/<signal_id>.json`, `storage.json`, `health.json`. `state_store.exclusive_file_lock`과 `atomic_write_json`을 사용한다. I/O/직렬화/HEAD+src fingerprint는 writer에 있고 후보 경로는 bounded projection과 `put_nowait`다. Queue/row/storage 제한은 각각 16 / 64 KiB / 4096행 또는 128 MiB. 동일 identity/trade/event/outcome 재시도는 첫 파일을 보존하고 duplicate count를 올린다. 충돌/손상은 보존하고 degrade/drop한다.
+```text
+data/research/entry_telemetry/
+  active.json                         # versioned, hash-validated pointer
+  epochs/<telemetry_epoch_id>/
+    epoch.json                        # immutable marker
+    sessions/<session_hash>.json      # immutable process association
+    predictors/YYYY-MM-DD/<signal_id>.json
+    receipts/YYYY-MM-DD/<signal_id>.json
+    outcomes/YYYY-MM-DD/<trade_id>.json
+    <stream>/storage.json              # separate bounded reservation
+    health/monitor.json
+    health/risk-manager.json
+```
 
-Writer 오류 행은 retry하지 않는다. startup 오류 후에도 다음 row를 시도하며 health를 게시한다. 모든 쓰기 자체가 불가능하면 degraded는 메모리에만 있고 health 파일은 갱신되지 못한다. 운영자는 heartbeat stale도 검사해야 한다. Health counter는 session별이고 고정 health 파일은 최신 publisher 상태다. `degraded_event_count`는 첫 오류부터 생성된다. 영구 cumulative drop counter가 아니다.
+날짜는 signal UTC를 KST로 정규화한다. JSONL append 대신 state_store 락·원자 교체로 봉인한 개별 JSON을 생성한다. Runtime row는 덮어쓰거나 outcome으로 update하지 않는다. 이미 존재하는 동일 identity는 duplicate, 충돌/손상은 fail-closed다. 날짜 partition이 달라도 epoch/stream당 4096행 또는128MiB 제한은 유지한다. 자동 삭제/무한 rotation은 없다. 한도 도달은 해당 stream drop/degraded이며 기존 원본을 보존한다.
 
-Coverage는 BUY, analyzer/risk reject, quote fail, RPC skip, OTHER 및 B confirmation 실패다. 모든 원시 discovery/feed event를 기록한다는 보장은 없다. 성공 B confirmation의 세부값은 후속 BUY row에 연결되지 않는다. Provenance는 SHA, src digest, allowlisted config/hash, OS/Python/PID/session/module 초기화 UTC다. 전체 effective config나 OS process 생성 시각은 아니다.
+## D. Predictor allowlist
 
-## C. Sample fixtures
+`entry_predictor_schema.py`는 section뿐 아니라 score raw component, allocated component, threshold, wallet contribution, quote leg, pre-signal snapshot의 중첩 구조를 명시한다. 모르는 key·result/position/trade 객체·scalar 자리에 들어온 dict는 serializer 출력에서 제외/null 처리한다. Identity/timestamp/counter/duration/provenance도 명시적 허용 구조로 다시 projection한다. Capture에 직접 오염된 값을 넣은 테스트도 통과했다.
 
-`tests/test_entry_telemetry_readiness_fixtures.py`의 실제 capture/finish/_row/_persist를 사용해 정상 BUY, analyzer reject, risk reject, quote fail, RPC skip, optional missing, partial wallet/score를 만들었다. 추가 wallet-rich/bounded stress까지 9개이며 worker/runtime/network는 시작하지 않고 TemporaryDirectory만 쓴다.
+Predictor schema2에는 entry-time raw signal/timing/RPC/retry/wait/quote/score/wallet set/flow/trajectory/pressure 및 provenance가 있다. `decision`/`decision_outcome`은 BUY/REJECT_ANALYZER/REJECT_RISK/QUOTE_FAILED/RPC_SKIPPED/OTHER라는 admission 분류 metadata다. 이는 학습 feature 입력에서 제외해야 한다. 실제 trade_id/event_seq는 predictor에서 null이며 execution_receipt/outcome 객체는 없다. Receipt 없이 reject/RPC skipped/quote 실패 predictor도 독립 valid다.
 
-Identity/schema/outcome, hash 봉인, timestamps/monotonic order, cap 이전 momentum operand와 할당 점수, retry/wait, quote, wallet lower-bound, 실제 provenance, null/reason 및 Windows 저장 bytes를 검증한다. BUY event_seq는 기존 함수가 반환하지 않아 null이며 receipt trade ID로 이후 원장 join해야 한다. missing 값은 0으로 대체하지 않는다. 합성 fixture는 자연 거래 표본이 아니다.
+## E. Leakage guard
 
-## D. Leakage audit — 활성화 차단
+Allowlist가 primary defense이고 normalized semantic token 검사가 secondary defense다. realized_pnl/pnl/profit/loss/exit/SELL/closed/outcome/winner/loser/MFE/MAE/horizon/future/final_status 계열과 unknown nested object를 통과시키지 않는다. Entry 이전 `sell_count`, `sells_m5`, `quote_exit_preflight`는 정확한 schema 위치에서만 허용한다. Token substring만으로 실제 pre-entry field를 제거하지 않는다.
 
-1. `SECTION_FIELDS["wallet_performance"]`는 `realized_pnl`, `roi`, `wins`, `losses`를 허용한다. `_forbidden`은 realized_pnl/SELL을 거르지 않는다. `scores.raw_components` 내부 synthetic `SELL: {realized_pnl, roi, status}`가 살아남는다.
-2. `wallet_performance.snapshot_at`에 signal 이후 시각을 공급해도 비교/거절하지 않는다. 현재 monitor에서는 이 section 값이 null이므로 **현재 실제 미래값 누출을 관찰했다는 주장은 아니다**. Serializer가 잘못된 입력의 누출을 막지 못한다는 offline 재현이다.
-3. `_row`와 `_persist`는 predictors/decision/execution_receipt를 같은 물리적 JSON 파일에 저장한다. Top-level key 분리만으로 요청한 물리적 파일 분리를 충족하지 못한다.
+Entry decision 시 predictor를 freeze한다. 이후 Control BUY acknowledgment 또는 완료 거래가 predictor를 바꾸지 않는다. 미래 pre-signal snapshot도 signal UTC와 비교해 제외한다. Known counter/timestamp/identity/provenance에 직접 outcome dict를 넣어도 serializer 및 acceptance가 거절한다. 과거/미래 성과를 proxy scalar로 만들어 넣는 새 계산이나 backfill은 하지 않는다.
 
-winner/loser/exit_reason/MFE/MAE/future/post_entry/final_pnl처럼 알려진 key는 재귀적으로 제외되고 decision freeze 이후 predictor 수정은 차단된다. 그러나 이 부분적 보호로 위 위험이 해소되지 않는다. Entry 이전 5분 시장 `sell_count`는 미래 Control SELL/청산 결과와 다르다. 금지해야 할 미래 exit/settlement payload가 중첩 input으로 들어갈 수 있다는 것이 차단 사유다.
+## F. Wallet snapshot handling
 
-새 tests의 `characterize_*` PASS는 취약 동작 재현 성공이며 안전 통과가 아니다. 기존 `entry-telemetry-2026-10-03.md`의 leakage 설명은 이 추가 audit로 제한된다. 물리적 분리, 엄격한 nested schema, label 차단, 시점 검증을 별도 구현·검증하기 전 activation 금지.
+현재 entry-time에 검증된 historical wallet snapshot source가 없으므로 predictor wallet_performance는 항상 `entry_time_snapshot: null`, reason `NO_VERIFIED_ENTRY_TIME_SNAPSHOT_SOURCE`다. Current wallet lookup·future snapshot·realized PnL/ROI/wins/losses 객체를 입력해도 출력하지 않는다. 나중 값으로 채우지 않는다. 향후 snapshot 구현은 timestamp와 source 증거를 갖춘 별도 변경으로 검토해야 한다.
 
-## E. Failure isolation
+## G. Receipt / outcome separation
 
-16개 새 offline tests: directory 자동 생성, permission/row write/Windows atomic replace 실패, malformed final JSON 및 invalid seal, malformed storage, writer exception, serialization TypeError, full queue, health write 실패, stranded partial temp를 주입했다. Drop/degraded/write/conflict counter와 보존 동작을 확인했다. Queue-full에서 실제 monitor wrapper가 Control BUY/REJECT stub을 그대로 실행한다. 기존 monitor/execution tests는 실제 Control 본문과 거래 함수 인자 보존도 검증한다.
+Receipt schema1은 실제 Paper BUY commit 이후 trade ID/event_seq/생성 시각을 보존한다. 기존 원장 트랜잭션의 BUY event_seq를 scalar로 받아 lock 밖에서 safe hook으로 전달한다. 새 원장 조회나 schema 변경은 없다. Monitor의 후속 acknowledgment는 최초 생성 시각과 event_seq를 보존한다.
 
-ACL을 변경한 실환경 permission 시험이 아닌 fault injection이다. 실패 writer가 정상 Control 거래에 연결되지 않는 구조를 검사한 것이며 실제 실행 latency/네트워크 실패 확률 불변을 증명한 것은 아니다.
+Outcome schema1은 실제 완료 SELL만 기록한다. 기존 원장 lock 안의 이미 읽은 자료에서 최대2048개 event를 역조회하고 최대64개 SELL leg만 명시적으로 복사한다. Cumulative proceeds/entry cost/realized PnL/최종 exit reason은 **outcome 파일에만** 있다. Copy/submit 실패는 SELL commit·포지션 삭제·현금 갱신을 차단하거나 되돌리지 않는다. BUY identity가 조회 범위 밖이면 seq를 추정하지 않고 drop/missing을 보고한다. Epoch 이전 legacy carry-in은 BUY seq와 signal UTC 양쪽으로 제외한다. 중간 SELL은 completed outcome을 만들지 않는다.
 
-## F. Queue / backpressure
+## H. Offline join
 
-2026-10-03 23:01:10 KST 측정: 지난 저장된 **24개 완전하고 overflow/saturation 없는 시간 bucket**의 `analyzer_started + rpc_confirmation_failed` 합은 2170, 평균 90.4167/h (0.0251/s), 최소 21/h, 최대 271/h. UTC 10-02 04:00부터 10-03 13:00 시작 hour까지 비연속 구간이다. 결측 시간은 제외했다. 최근 24개 900초 bucket의 최대는 56건/15분 (0.0622/s). 이는 후보 row 빈도의 proxy이며 중복·미계측 초기 reject·새 envelope 범위 때문에 정확한 telemetry rate는 아니다. `candidate_considered`/시장 poll 횟수 전체를 telemetry row 수로 간주하지 않는다.
+`src/research/entry_telemetry_join.py`의 읽기 전용 `join_epoch(root, epoch_id)`로 연결한다. 공통 epoch_id+signal_id가 predictor/receipt를 연결하고, receipt의 epoch_id+trade_id가 완료 outcome을 연결한다. Runtime에는 이 join을 호출하거나 predictor를 수정하는 코드가 없다.
 
-TemporaryDirectory에서 실제 `_persist + _publish_health` 100건 평균으로 writer drain 약 **51.82행/s**. 순간 64건 producer 시험은 16건 저장/48건 drop, max depth 16이었다. Full 정책은 기존 queue 유지 + 새 row 즉시 drop + `queue_full` reason/counter이며 거래를 기다리게 하지 않는다.
+Hash/schema/epoch/build/mint/route/family/signal UTC와 BUY seq가 일치해야 한다. 중복 signal 또는 여러 signal에 연결된 trade ID는 거절한다. Reject/RPC predictor-only는 정상이며 BUY missing receipt와 orphan outcome은 명시한다. Read-only join에는 epoch marker 검증이 별도로 필요하며 acceptance 도구가 이를 함께 수행한다.
 
-이론상 빈 queue는 consumer 정지 시 16건을 받는다. 순간 burst에서는 서비스율 보장이 없다. 일정 입력률 λ가 실측 μ=51.82/s보다 크다면 빈 큐 포화 시간은 약 `16/(λ-μ)`초, 입력 중단 뒤 16건 drain은 약 0.309초다. 예시 λ=100/s면 약 0.332초. 이 예시는 설계 계산이며 관측 1초 burst가 아니다. Windows local disk 결과를 VPS/실거래 처리 보장으로 사용하지 않는다.
+## I. Epoch contract
 
-## G. Row sizes
+`src/research/entry_telemetry_epoch.py`는 explicit activation 직전 immutable UUID marker를 만든다. Marker에는 build SHA 및 전체 src/scripts/requirements/ecosystem inventory, safe config/hash, stream schemas2/1/1, start_event_seq, 같은 순간 UTC/KST, OS/platform, creator PID/session, 이전 N3 closure seal과 continuity snapshot ID가 있다. Runtime PID/생성 시각/session은 별도 immutable binding에 등록한다. Epoch는 재시작에도 유지되고 새 activation은 새 UUID를 만든다. Active pointer만 state_store version/hash 방식으로 바뀐다.
 
-`tests/entry_telemetry_readiness_measurements.py`가 실제 serializer와 atomic writer를 호출한다. 아래 UTF-8 sealed JSON 크기에 Windows CRLF 2바이트를 포함한 disk bytes를 별도 표기했다.
+Writer startup은 현재 N3 CLOSED/closure/final_report 일치, build/config/schema/platform, 실제 provenance Git/config를 동기 검증한다. Missing epoch·Git identity·불일치이면 telemetry만 DISABLED이고 Control은 원래 실행 경로를 유지한다. 첫 신호를 받기 전에 초기화하여 background startup race를 피한다. Row source digest는 검증된 전체 epoch inventory digest와 scope를 사용한다.
 
-| Fixture | raw canonical bytes | disk bytes |
-|---|---:|---:|
-| minimal fixed-schema row | 7611 | 7613 |
-| normal BUY | 8569 | 8571 |
-| wallet-rich 20-wallet | 10462 | 10464 |
-| analyzer reject | 8458 | 8460 |
-| bounded stress 128 long wallet IDs | 28957 | 28959 |
+Config fingerprint는 실제 monitor 상수9개의 명시적 비밀 제외 subset이다. 전체 .env fingerprint가 아니다. API key/RPC URL/credential을 저장하지 않는다. Snapshot source digest가 effective secret configuration까지 검증한다고 주장하지 않는다. Runtime config를 바꿀 경우 별도 검토와 epoch를 요구한다.
 
-5개 designed fixture 평균 disk 12813.4 bytes, 상단 28959 bytes. 실거래 p95는 없다. Wallet-rich는 풍부한 합성 입력, bounded stress는 예산 소진된 truncated 입력이며 실제 최대 시장 population을 뜻하지 않는다. 전체 실제 시장에서의 최대 realistic row는 아직 관측 불가다. Schema 자체 null keys 때문에 minimal도 약 7.6KB다. 긴 identity/문자열/노드 수는 기존 제한을 따르며 hard max는 64KiB다.
+## J. Windows cutover
 
-## H. Disk growth
+이번에 실행한 것은 tests뿐이다. 아래 명령은 **N3 자연 종료 후 별도 activation 작업에서만** 사용한다.
 
-십진 MB/GB, row 파일만 계산; fixed health/storage/lock와 파일시스템 allocation/백업 overhead 제외. 아래는 완전한 hour의 관측 빈도를 24시간으로 외삽한 **가정 시나리오**이며 생산 telemetry 예측의 확정치가 아니다.
+1. Frozen N3 hard-cap에 의해 closure.json/final_report.json이 생성되고 observer가 CLOSED 후 자연 종료했는지 확인한다. 현재 작업에서 평가/marker 생성/강제 종료를 하지 않는다. Closure/cohort/hash/end_seq 일치가 tool precondition이다.
+2. 현재 frozen8f0에는 cooperative handler가 없으므로 처음에는 기존 owned Windows runner의 승인된 종료 절차가 필요하다. Candidate의 clean-stop을 old process에 보내면 거절한다. 강제 fallback을 숨기지 않는다. N3 종료 이후, 기존 `local_paper_runner.py status all`로 PID/creation ownership을 검증하고 operator가 별도 승인된 stop을 수행한다. 모든 writer/PID 종료와 원장 정상성을 확인하기 전 snapshot/activation을 진행하지 않는다.
+3. Candidate CLI `python scripts/entry_telemetry_cutover.py snapshot --root <runtime-root> --execute`는 모든 runtime PID 종료를 다시 확인하고 원장/연구/N3 JSON의 실제 byte backup과 SHA-256 manifest를 만든다. 1MiB streaming, 최대256MiB/file·512MiB total·20000 files; 초과는 BLOCKED다. Current state와 backup hash 모두 검증한다. Secret files는 복사/출력하지 않는다.
+4. Foreign 변경의 별도 복구 가능 backup을 확보한 뒤 reviewed 최종 telemetry commit으로 checkout한다. 현재 live dirty monitor에 blind pull/checkout하지 않는다. Windows feeder/runner/tests가 candidate에 이미 이관됐는지 diff를 대조한다. 필요하면 **이 미래 단계에서만** foreign 관련 경로를 명시한 Git stash로 보존하고 final commit으로 전환한다. 이미 이관된 patch를 pop해 중복 적용하지 않는다. State snapshot은 거래 복원용 임의 reset으로 사용하지 않는다.
+5. 최종 commit에서 `python -m compileall -q src tests scripts`, `python -m unittest discover -s tests -v`를 실행한다. 실제 deployment/source inventory와 config를 고정한다.
+6. `python scripts/entry_telemetry_cutover.py create-epoch --root <runtime-root> --execute`, 이어 `validate`를 실행한다. Restart는 같은 epoch를 쓰며 별도 activation만 `--new-activation`을 사용한다. State continuity나 N3 증거가 달라지면 거절한다.
+7. `python scripts/entry_telemetry_cutover.py resume --root <runtime-root> --python <verified-python> --execute`는 정지·snapshot·N3 closure·epoch를 재검증하고 기존 hidden Windows runner로 monitor/risk/dashboard를 한 번 시작한다. Duplicate/unmanaged/ambiguous module PID가 있으면 거절한다. WSS/heartbeat/freshness/backlog/dashboard와 두 role health를 확인한다.
+8. 새 build 이후의 종료는 `clean-stop --execute`를 쓴다. PID creation/session이 맞는 immutable request를 보내 신규 discovery를 닫고 등록된 기존 신호/진행 중 청산을 완료한다. 큐 drain acknowledgment와 실제 process exit가 모두 필요하다. Timeout이면 프로세스를 강제로 죽이지 않고 cutover를 거절한다. Dashboard만 기존 소유 runner로 종료한다.
 
-| Scenario / 근거 | rows/day | bytes/row 가정 | MB/day | GB/30days | 4096행 도달 |
-|---|---:|---:|---:|---:|---:|
-| low: 최소 21/h, normal BUY size | 504 | 8571 | 4.320 | 0.130 | 8.13일 |
-| observed: 90.4167/h, fixture 평균 | 2170 | 12813.4 | 27.805 | 0.834 | 1.89일 |
-| high: 최대 271/h, fixture upper | 6504 | 28959 | 188.349 | 5.650 | 0.63일 |
+Path 비교는 Windows case-insensitive이고 registry launcher/child PID도 inventory에 포함한다. Cutover 자신의 현재 PID와 생성 시각·executable·전체 CLI argv가 일치하는 직접 venv launcher만 제외한다. cwd가 불분명한 동일 core `-m src...` host process는 보수적으로 차단한다. 다른 checkout의 모듈 실행이 차단 원인일 수 있으며 ownership을 확인해야 한다.
 
-Fixture minimal~upper 범위로 observed는 16.52~62.84MB/day, 0.50~1.89GB/30days다. High는 관측 hour 최대를 하루 지속시키는 보수적 가정이며 수초 burst 상한은 알 수 없다. 4096행 한도가 표의 row size에서는 byte 한도보다 먼저 온다. 64KiB에 근접하는 행이면 128MiB가 먼저 올 수 있다. 현재 구현은 한도 뒤 기록을 중단/drop하므로 계속 이 속도로 30일 저장하지 않는다.
+## K. Failure isolation
 
-## I. Rotation / retention
+Predictor/receipt/outcome에 각각 queue/drop/write/error/duplicate/conflict counter와 별도 lock/storage budget이 있다. 한 stream 실패 뒤 나머지 stream이 저장되는 테스트가 있다. Health는 bounded monitor/risk-manager 파일로 분리하고 중첩 counter snapshot을 lock 안에서 복사한다. Health write 자체가 실패하면 memory degraded와 stale heartbeat로 드러난다.
 
-현재 rotation/archive 없음. 무한 증가는 4096/128MiB cap으로 막지만 약 이틀 만에 수집이 멈출 수 있어 장기 coverage 계획이 부족하다. 기존 rows를 삭제하거나 budget을 임의 초기화해 회피하지 않는다.
+Missing directory·permission·serialization·malformed JSON/seal·atomic replace·queue full·storage cap·writer exception을 임시 경로에서 검증한다. 재시작은 실제 Windows subprocess/session/OS lock으로 검사한다. JSONL partial-line 복구는 구조상 해당하지 않으며 partial final JSON 보존/drop 및 stranded temp/atomic replace 경계를 검증한다. Startup storage scan은 개수/bytes를 재구성하고 모든 seal을 proactively 확인하지는 않는다. Acceptance가 전체 stream seal을 검사한다.
 
-추천은 **epoch별 일별 partition + immutable archive**, partition당 byte/row 한도와 활성 partition만 writer가 사용하도록 별도 구현하는 것이다. 월별 manifest로 각 partition hash/count/time/session 범위와 archive 경로를 연결하고, 중복 검색/epoch join/장애복구를 검증한다. 최소 하나의 완결된 prospective 수집 기간 전체와 이후 연구 재현에 필요한 원본을 보존하며 임의 자동 삭제 기한을 만들지 않는다. Hot disk 압박 시 검증된 다른 저장소 archive로 이동하고 양쪽 hash 검증 전 원본을 지우지 않는다. 현재 파일의 Windows 열린 handle/lock을 확인한 뒤 quiescent partition만 archive한다. 이번에 runtime rotation을 적용하지 않았다.
+## L. Performance
 
-## J. Restart continuity
+2026-10-03 23:31:46 KST Windows 임시 저장소 측정. Candidate source는 수정 중 HEAD7fad7db였으므로 값은 final source 실전 SLO가 아니다. 합성 1000건 mean/p95(µs): predictor finish/enqueue1.494/2.4; receipt queue put0.935/1.3; actual outcome capture/enqueue11.315/14.8; 전체 normal fixture capture/mark/projection/enqueue103.276/132.2. Writer serializer/hash는 predictor622.783/1025.9, outcome35.468/42.0으로 critical path 밖이다. 실제 split BUY 두 파일+health fsync100건 mean34.517ms/p9542.0ms, 약28.97 candidate/s. Producer64 burst에서 depth16 유지,17 처리/47drop이었다.
 
-실제 별도 Python process 2개를 순차 실행: session UUID 변경, schema 1 유지, 동일 identity duplicate의 기존 bytes 유지, 새 identity append와 두 session provenance를 확인했다. Windows process를 OS exit로 종료한 후 file lock을 재획득하고 stale lock 파일이 ownership이 아님을 검증했다.
+Worker는 predictor를 최대0.25초 기다린 뒤 receipt/outcome 각1개를 소비한다. Predictor가 없는 outcome-only rate는 디스크 비용 제외 최대약4/s라서 fsync-only throughput을 전체 서비스율로 간주하지 않는다. Queue drain timeout은 실패하면 ack하지 않는다. CPU/GIL/disk 경합에 따른 실전 Control latency regression은 current runtime에 instrumentation을 넣지 않아 미검증이며 activation 후 자연 수집으로 확인한다.
 
-JSONL이 아닌 개별 atomic JSON이므로 partial last line truncate recovery는 해당하지 않는다. Partial final JSON은 보존/drop; atomic replace 실패 시 final 미생성/temp 정리; 최근 stranded `.tmp`는 row로 계산하지 않는다. 같은 filename의 오래된 temp만 기존 state_store 정책으로 정리한다. Startup은 실제 파일 개수/크기를 재계산하고 실패한 예약을 회복하지만 **모든 row JSON/hash를 검증하지 않는다**. 일치 identity 재기록 전 다른 손상 row를 놓칠 수 있다. Cutover/restart preflight에 offline 전체 seal/inventory 검증이 필요하다.
+Fixture disk bytes: minimal7638, normal predictor8550+receipt1536, wallet-rich10442+1538, reject8574, bounded stress46523+1544. 합성 fixture upper를 production p95로 사용하지 않는다. 과거 완전24hour proxy 평균90.4167/h·최소21/h·최대271/h이며 실제 new telemetry rate와 같지 않을 수 있다. Normal predictor+BUY receipt를 모든2170/day에 가정하면 약21.89MB/day(0.657GB/30days), completed outcome bytes는 별도 추가다. 초단위 burst는 관측 근거가 없다.
 
-Queue는 메모리/daemon이며 process 종료 시 미기록 row가 유실될 수 있다. 기존 Windows runner stop은 TerminateProcess 기반이며 graceful writer drain API가 아니다. Clean stop은 별도 reviewed quiescence/drain 절차가 필요하다. 예전 ledger를 복원해 유실을 보완하지 않는다.
+4096행/stream/epoch 제한이면 현재 proxy에서 약1.89일에 predictor cap이 올 수 있다. 자동 archive/새 무한 epoch 생성을 하지 않는다. 장기 수집은 중지·봉인·검증된 archive 및 새 명시적 epoch 계획이 필요하다. 삭제 없이 연구 기간 전체 원본을 보존한다. 이 retention 한계와 null sub-second flow/전체 whale population/wallet performance/pool metadata는 READY_WITH_LIMITATIONS의 이유다.
 
-## K. N3 isolation
+## M. N3 isolation
 
-Frozen cohort `cba13fbb-c702-4b18-bcf7-20b78a8e252f`, start UTC `2026-10-03T01:04:59.425384+00:00`, event_seq 10901, rule hash `b219661c31c132e1b2f11901664981482a9e42dc847ab300f590072eb3271165` 그대로다. BUY는 양쪽 inclusive 경계를 충족해야 한다. Legacy 9583/9661 제외를 그대로 검증했다.
+Cohort cba13fbb-c702-4b18-bcf7-20b78a8e252f, start UTC2026-10-03T01:04:59.425384+00:00, seq10901, rule hash b219661c31c132e1b2f11901664981482a9e42dc847ab300f590072eb3271165 그대로다. Frozen dual inclusive eligibility와 legacy9583/9661 제외를 유지한다. N3 module/evaluation/contract는 변경하지 않았다. Monitor prepare/submit 인자도 유지한다.
 
-Telemetry path는 N3 `data/n3_shadow`와 독립이다. 보호 sentinel 테스트에서 N3 manifest/closure/entry와 Control ledger bytes는 변하지 않았다. `src/research/n3_shadow.py`, evaluation 코드와 기존 tests는 frozen base와 동일하다. Monitor의 telemetry context wrapper는 기존 Control 함수 전체(N3 prepare/submit 호출 포함)를 감싸지만 N3 recorder 함수를 교체/wrap하지 않으며 기존 호출 인자를 보존한다. ContextVar 기반 RPC/analyzer 계측도 N3 rule 입력을 재계산하지 않는다.
+현재 live HEAD/source/foreign hash, PID/start time와 observer 상태를 작업 전후 비교한다. Candidate 추가로 N3 build digest가 바뀌므로 현재 cohort 중에는 checkout/activation 절대 금지. Telemetry writes는 다른 namespace이며 N3 sentinel/Control 원장 불변을 테스트했다. Old observer를 새 build에서 다시 시작하지 않는다.
 
-그러나 **N3 build identity는 HEAD와 src/scripts/requirements/ecosystem 전체**다. Telemetry 추가만으로 frozen source digest가 달라지므로 현재 cohort 동안 activation 절대 금지. Telemetry 자체 src digest는 이보다 좁다. 새 epoch manifest에는 전체 실제 runtime inventory를 별도로 고정해야 한다.
+## N. Tests / first runtime acceptance
 
-진짜 `closure.json`이 있으면 `persist_capture`는 manifest/build 검사 전에 return한다. Old observer의 `observe_once`는 closure보다 build를 먼저 검사한다. 따라서 종료된 old observer를 새 checkout에서 실행하지 않는다. 기존 observer는 CLOSED 시 자연 종료한다.
+실제 serializer fixtures9개, leakage scalar/nested/unknown/future-wallet/future-history, 세 파일 불변·duplicate·offline join·missing identity·epoch mismatch·Windows path/reopen/process restart/lock·stream 장애·Control BUY/SELL 의미·clean-stop drain을 검증했다. `python -m compileall -q src tests scripts` PASS, `python -m unittest discover -s tests -v`는 **864 tests OK / skipped17**, 36.001초다. 기존 baseline745/17skip 회귀를 유지했다. Log: `C:\Users\user\AppData\Local\Temp\aibot-split-telemetry-full.log`. 최초 전체 실행에서 Windows feeder의 기존 Linux PM2 기대값과 새 pointer의 lock 진단 operation 누락을 확인하고 수정한 뒤 전체 재실행했다. Linux 전용15개/Windows symlink 권한2개 skip는 성공으로 바꾸지 않는다.
 
-## L. Cutover plan — 후속 구현 및 활성화 승인 이후에만
+`python scripts/entry_telemetry_acceptance.py --root <runtime-root> --output <report.json>`은 활성화 후 읽기 전용 확인용이다. 첫 predictor/rejected/RPC-skipped/BUY receipt/completed outcome 다섯 case를 독립 검사한다. 미발생 자연 case는 PENDING이다. 올바른 epoch/schema/build/config/session, hash, nested allowlist, duplicate, 분리 파일, actual Control BUY/최종 SELL identity를 확인한다. 두 role health stale90초 또는 drop/error/conflict/duplicate/degraded는 FAIL이다. 모든 case와 offline join이 맞아야 전체 PASS다. 결과 파일만 state_store API로 저장하며 전략/Alpha 평가를 하지 않는다.
 
-1. 현재 frozen 정책의 자연 hard-cap(28 active KST days 또는 400 completed)에 의해 immutable `data/n3_shadow/closure.json` 및 `final_report.json`이 작성될 때까지 기다린다. 이번 audit에서 final 평가를 수행하거나 종료 marker를 만들지 않는다. 기존 규칙의 최소 gate 도달을 조기 종료로 사용하지 않는다.
-2. Closure/final_report content seal, cohort/build/rule/contract/end_event_seq를 검증하고 old observer가 CLOSED 후 자연 종료한 것을 확인한다. N3 전체 artifact와 runtime_sources inventory 보존. 새 build에서 old observer를 재시작하지 않는다.
-3. 아래 S의 blocker를 **별도 candidate**에서 수정·검증한다. 현재 candidate의 PM2 feeder에는 live Windows sys/runner 분기가 없다. Foreign monitor patch, runner와 Windows tests를 명시적으로 reconciliation/review한 다음 최종 commit/source identity를 고정한다. Live에 blind git pull/checkout하지 않는다. 새 SHA는 현재 1c06을 그대로 사용할 수 없다.
-4. 서비스 ownership registry/creation time을 확인한다. 현재 runner의 `status all`로 unmanaged/duplicate 확인 후, 승인된 quiescence/Control clean-stop 절차로 monitor/risk/dashboard/feeder를 정지한다. 기존 runner `stop all --root ... --python ...`은 강제 종료를 하므로 writer drain 보장으로 해석하지 않는다. 중간 writer/ledger 작업이 없고 OS lock이 해제됨을 확인해야 한다.
-5. 모두 정지한 상태에서 state continuity snapshot을 별도 경로에 만들고 SHA-256 manifest를 남긴다. 대상: paper_trades, wallets, wallet_performance, global_metrics, 기존 연구 observation/shadow/coverage/archive 상태, N3 전체 산출물, runner registry. JSON은 읽기 검증, ledger next_event_seq와 position/event ID 보존 확인. 비밀 파일 내용을 로그/manifest에 출력하지 않는다. `.env`를 Git에 넣지 않는다.
-6. 최종 승인 candidate를 intended runtime으로 사용한다. Local 실제 foreign runtime source를 보존한 checkout을 사용하고 data 경로 연결/소유권을 사전에 검증한다. Snapshot을 읽는 dashboard가 별도 ledger를 만들지 않게 한다. Compile와 full suite, Windows runner/feeder tests를 해당 최종 build에서 실행한다.
-7. 아래 M의 immutable epoch marker를 **첫 monitor 실행 전** state_store lock/atomic API로 작성하고 모든 startup session을 epoch와 연결한다. 이 기능은 현재 구현에 없으므로 추가 구현이 완료되어야 한다. Ledger next_event_seq와 snapshot hash를 다시 확인한다.
-8. 기존 안전 Windows runner의 reviewed 최종 버전으로 Control을 한 번 시작한다. Registry/실제 PID creation/executable/arguments/session을 비교하고 duplicate process가 없어야 한다. 기존 config/threshold/sizing/SL/TP 유지.
-9. WSS SUBSCRIBED, monitor/risk heartbeat/freshness PASS, dashboard HTTP 200, backlog와 pending task bound 확인. 새 recorder health heartbeat/session/source/config/schema/epoch binding 확인.
-10. 아래 N의 자연 candidate/BUY/reject acceptance와 queue/drop/write/degraded/disk 검사를 수행한다. RPC skip은 자연 발생할 때만 검증하며 만들기 위해 장애/거래를 유발하지 않는다.
+## O. Changed files
 
-Abort: closure/final_report 미완료, blocker 남음, snapshot/next_event_seq/source/hash 불일치, unmanaged PID, failed tests, unknown session/epoch, stale health, 손상 row나 store capacity 부족이면 시작하지 않는다. 시작 후 acceptance 실패 시 새 프로세스를 안전하게 정지하고 새 row/ledger/log 증거를 보존한다. 검증한 baseline source로 되돌릴 때 **현재 최신 ledger를 사용**하며 pre-cutover snapshot으로 매매 state를 롤백하지 않는다. 기존 N3는 CLOSED 그대로이며 closure 삭제/새 cohort 등록/전략 변경을 rollback에 섞지 않는다.
+Core: entry_telemetry.py, new entry_predictor_schema.py / entry_telemetry_epoch.py / entry_telemetry_join.py. Minimal integration: monitor.py, risk_manager.py. Tools: new entry_telemetry_cutover.py / entry_telemetry_acceptance.py, reconciled local_paper_runner.py. 관련 recorder/fixture/failure/monitor/isolation tests와 new epoch/join/outcome/clean-stop/acceptance/inventory/Windows runner tests, measurement helper 및 이 문서/초기 구현 문서 안내만 변경한다. Strategy/threshold/sizing/SL/TP, shared ledger schema, dependency/deploy/N3 rules/AGENTS는 변경하지 않는다.
 
-## M. Telemetry epoch contract — 아직 구현되지 않은 precondition
+## P. Git state
 
-제안 위치 `data/research/entry_telemetry/epochs/<telemetry_epoch_id>/manifest.json`와 immutable session association 파일. 현재 serializer/storage layout에는 이 기능이 없다. 실제 binding과 namespace/duplicate/retention migration을 구현하고 테스트해야 하며 문서만으로 충족했다고 판정하지 않는다.
+관련 code/tests/docs만 commit/push한다. Live foreign 파일은 변경·stage하지 않는다. Main은 fast-forward이며 history rewrite 없음. Remote workflow3개 disabled_manually 확인 후 그대로 둔다. 현재 live checkout HEAD8f0는 main보다 뒤에 남는 것이 의도된 상태다. 최종 SHA/origin/ahead/status와 전체 검증 결과는 완료 응답에 기록한다. Runtime/서버 배포는 하지 않는다.
 
-필수: UUID telemetry_epoch_id; start KST 및 같은 순간 UTC; start_event_seq=정지 후 ledger next_event_seq; 최종 build SHA/full source inventory digest; schema version; 실제 allowlisted safe_config 및 config hash/scope; OS/platform/Python; 최초 recorder session ID 및 이후 restart session→동일 epoch 연결; 이전 N3 cohort/closure seal; continuity snapshot inventory. Epoch는 restart마다 새로 만드는 session과 다르다. 새 config/source 변경은 별도 epoch다. Signal time 경계와 session membership를 검증하고 이전 N3 sample 또는 기존 telemetry row를 새 epoch로 재분류하지 않는다.
+## Q. Final readiness verdict / abort
 
-Predictor/receipt 물리 분리 후 공통 signal_id/epoch_id로 join하고 post-entry receipt 시각/Control trade ID는 predictor 파일에 저장하지 않는다. Outcome metadata도 feature loader 입력에 들어가지 않게 별도 dataset 계약과 tests를 고정한다. Epoch marker만 만드는 것으로 live PID와 row의 join을 추정하지 않는다.
+**TELEMETRY_ACTIVATION_READY_WITH_LIMITATIONS**: predictor/receipt/outcome 물리적 분리, recursive leakage guard, current/future wallet 차단, immutable epoch+restart association, Windows cutover tools, stream/Control failure isolation, N3 isolation을 코드·테스트로 확인했다. 미발생 자연 runtime acceptance, 초기 oldbuild 수동 owned-stop precondition, retention cap와 unavailable input, production/VPS latency 검증은 명시적으로 남는다.
 
-## N. First-runtime acceptance plan
-
-후속 activation 시 별도 읽기 전용 acceptance가 다음을 고정 report로 남겨야 한다. 이번에는 실행하지 않았다.
-
-- 첫 recorded candidate: identity/schema/source/config/epoch/session, timestamp ordering, hash/bytes, 자연 missing reason.
-- 첫 BUY: Control trade ID/event_seq 원장 join, 별도 predictor/receipt 파일, entry freeze 전후 시각, duplicate 없음. N3 종료 artifact 변경 없음.
-- 첫 analyzer/risk/quote reject: outcome/reason이 별도 metadata에 있고 receipt에 가짜 trade 없음. 실제 Control reject 동일.
-- 첫 RPC_SKIPPED: 자연 발생 시 attempt/retry/누락/null 확인. 발생하지 않으면 pending으로 기록.
-- Queue depth≤16, new dropped/write_error/conflict/degraded=0을 정상 acceptance 기준으로 삼고 nonzero면 원인을 보고해 acceptance FAIL. Health stale도 FAIL. Counter reset/session 교체를 정상화로 해석하지 않는다.
-- 첫 100건 또는 충분한 자연 표본 이후 writer latency/bytes/drain/queue/drop를 offline 측정과 비교한다. 파일 fsync/health append 정상, 용량/retention 여유, restart epoch/session continuity 확인. 실제 기준 시간 예산은 승인된 runtime 요구에서 정하며 현재 synthetic p95를 거래 SLO로 만들지 않는다.
-
-모든 case가 자연 발생할 때만 검사한다. winner/loser/수익률/Alpha/threshold 판단은 포함하지 않는다.
-
-## O. Performance impact
-
-Windows local offline 결과, µs. Serialization은 `_row + canonical + digest`이며 worker `_persist` 전체와 동일 시간으로 해석하지 않는다. Write는 실제 budget reservation/row fsync 및 health fsync를 포함한다.
-
-| 작업 | n | 평균 | median | p95 | max |
-|---|---:|---:|---:|---:|---:|
-| serialize/hash | 1000 | 122.779 | 111.15 | 201.7 | 392.4 |
-| finish/enqueue only | 1000 | 1.326 | 1.1 | 1.8 | 24.6 |
-| fixture 전체 capture/marks/projection/enqueue | 1000 | 81.401 | 76.3 | 99.9 | 420.3 |
-| persist + health | 100 | 19297.647 | 18880.4 | 23591.8 | 25808.4 |
-
-추가 capture 동기 시간은 작고 디스크는 worker에 격리된다. 그러나 CPU/GIL/fsync 경쟁 및 real quote timeout/Control latency regression을 현재 frozen runtime에서 시험하지 않았다. 1GB VPS 결과도 아니다. 의미 있는 regression 없음을 확정하지 않는다. 재현: 프로젝트 root의 PYTHONPATH로 `python tests/entry_telemetry_readiness_measurements.py --live-root C:\Users\user\Documents\aibot-local-paper`; 출력은 측정 JSON이며 운영 파일은 coverage count/time만 읽는다. 재실행 시 시간/문자열 길이/관측 bucket에 따라 값은 조금 달라진다.
-
-## P. Limitations
-
-True sub-second flow, 전체 uncapped historical whale population, wallet performance snapshot, unavailable pool creation metadata는 null 유지. 60초 bucket/max6 과거 projection으로 10초 price/flow를 복원할 수 없다. Whale 조기 종료 lower-bound를 전체시장 population으로 해석할 수 없다. wallet historical/future performance가 없는 만큼 해당 인과 구분을 후속 Alpha 분석에서 할 수 없다. Signal 이후 데이터 보간/사후 snapshot으로 채우지 않는다. Config scope가 일부라는 사실과 RPC confirmation missing attribution도 dataset 설명에 보존한다.
-
-## Q. Tests
-
-새 fixture 7, failure/restart 16, N3/provenance 5 = 28 tests. 실제 소스/호출 경로와 diff를 root에서 확인했다. `python -m compileall -q src tests` PASS. `python -m unittest discover -s tests -v`는 **745 tests OK / skipped 17**, 27.267초였다. 기존 717/17skip 회귀를 유지하고 새 28개를 추가했다. Linux 전용 15개 및 Windows symlink permission 2개 skip는 성공 검증으로 바꾸지 않는다. 전체 log: `C:\Users\user\AppData\Local\Temp\aibot-entry-telemetry-readiness-full.log`. 실제 activation/실시간 Control latency/서버 테스트는 수행하지 않았다.
-
-## R. Git state
-
-Readiness commit 대상은 이 문서, 기존 telemetry 문서의 audit 주의 문구, 위 세 test 파일, offline measurement helper뿐이다. Production src/scripts/config/deploy/N3 tests 변경 없음. Foreign 파일/data/log/credentials는 포함하지 않는다. Fast-forward push 전에 workflow disabled 상태를 확인하고 최종 live source/foreign hash와 process continuity를 재검증한다. History rewrite 없음. Live HEAD는 계속 8f0b942이고 origin/main이 앞으로 가도 checkout을 변경하지 않는다.
-
-## S. Final verdict
-
-**TELEMETRY_NOT_READY**: 미래 label/raw SELL/future wallet snapshot guard 미충족과 predictor/receipt 물리 분리 부재가 직접 차단 사유다. Epoch 구현/검증, Windows foreign runtime reconciliation, 장기 archive/retention 및 안전 drain/재시작 integrity 절차도 activation 전에 해결해야 한다. 테스트 통과는 현재 동작/격리의 증거이며 readiness 승인이 아니다. 이번 테스트·문서 범위에서 production을 임의 수정하지 않았다.
+Abort: N3 closure/finalreport 미완료, PID 살아 있음/소유 불명, state 또는 byte backup 불일치, foreign patch 미이관, 실패한 tests, unknown/mismatched epoch/session/build/config/schema, corrupt stream, stale/degraded health, 저장 한도면 activation 금지. Activation 후 실패하면 새 서비스/row/log/current ledger 증거를 보존하고 검증된 baseline source로 재시작하더라도 **최신 거래 원장**을 쓴다. Pre-cutover snapshot으로 이후 거래를 지우지 않는다. N3 closure 삭제/재등록·강제 청산·전략 변경은 rollback에 포함하지 않는다.
 
 ```text
 N3_SHADOW_STATUS: RUNNING 유지
 PROJECT_STATUS: PAUSE_STRATEGY_REVIEW
-CURRENT_RUNTIME: N3 frozen build 8f0b942 유지
+CURRENT_RUNTIME: frozen 8f0b942 유지
 TELEMETRY_RUNTIME: NOT_STARTED
 ```

@@ -42,6 +42,63 @@ QUOTE_FAILURE_WARNING_COUNT = 3
 DEGRADED_QUOTE_GAP_SECONDS = 10.0
 
 
+def _completed_telemetry(ledger: dict[str, Any], position: dict[str, Any]) -> dict[str, Any] | None:
+    """이미 잠긴 원장의 스칼라만 복사한다. 조회 누락은 outcome 누락으로 남긴다."""
+    from src.research import entry_telemetry
+
+    if not entry_telemetry.is_enabled():
+        return None
+    trade_id = str(position.get("position_id") or "")
+    events = ledger.get("events", [])
+    buy = None
+    legs = []
+    leg_count = 0
+    # 기존 원장의 조회 범위도 제한한다. 오래된 BUY가 없으면 새 cohort로 추측하지 않는다.
+    for index, event in enumerate(reversed(events)):
+        if index >= 2048:
+            break
+        if not isinstance(event, dict) or event.get("position_id") != trade_id:
+            continue
+        if event.get("type") == "BUY":
+            buy = event
+            break
+        if event.get("type") == "SELL":
+            leg_count += 1
+            if len(legs) < 64:
+                legs.append({key: event.get(key) for key in (
+                    "event_seq", "event_id", "at", "reason", "token_amount_raw",
+                    "proceeds_lamports", "realized_pnl_lamports",
+                )})
+    last = legs[0] if legs else {}
+    route = str(position.get("route_type") or "A")
+    return {
+        "trade_id": trade_id, "mint": position.get("mint"), "route_type": route,
+        "strategy_family": "whale_route_a" if route == "A" else "dex_momentum_b",
+        "signal_detected_at": position.get("signal_detected_at"),
+        "buy_event_seq": buy.get("event_seq") if buy else None,
+        "buy_event_id": buy.get("event_id") if buy else None,
+        "event_seq": last.get("event_seq"), "completed_at": last.get("at"),
+        "exit_reason": last.get("reason"),
+        "entry_cost_lamports": int(position.get("entry_cost_lamports", 0) or 0),
+        "cumulative_proceeds_lamports": int(position.get("cumulative_proceeds_lamports", 0) or 0),
+        "realized_pnl_lamports": int(position.get("cumulative_proceeds_lamports", 0) or 0)
+        - int(position.get("entry_cost_lamports", 0) or 0),
+        "sell_legs": list(reversed(legs)),
+        "sell_legs_truncated": leg_count > 64 or buy is None,
+        "sell_legs_complete": leg_count <= 64 and buy is not None,
+    }
+
+
+def _telemetry_stop_requested() -> bool:
+    """독립 cutover 도구의 확인된 종료 요청만 읽는다. 장애는 거래와 격리한다."""
+    try:
+        from src.research import entry_telemetry_epoch
+
+        return entry_telemetry_epoch.should_stop(LEDGER_PATH.parent.parent, "risk-manager")
+    except Exception:
+        return False
+
+
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -373,6 +430,7 @@ async def record_paper_buy(
         )
     ensure_ledger_migrated()
     route_metadata = normalized_route_metadata(route_type, dex_momentum_score)
+    buy_identity: dict[str, Any] = {}
 
     def mutate(ledger: dict[str, Any]) -> str:
         if max_strategy_open_positions is not None:
@@ -462,11 +520,13 @@ async def record_paper_buy(
             "version": 1,
             **metadata,
         }
-        ledger["events"].append(_next_event(ledger, {
+        buy_event = _next_event(ledger, {
             "type": "BUY", "mint": mint, "cost_lamports": cost_lamports,
             "token_amount_raw": token_amount_raw,
             "token_decimals": max(0, token_decimals), "at": opened_at, **metadata,
-        }))
+        })
+        ledger["events"].append(buy_event)
+        buy_identity["event_seq"] = buy_event["event_seq"]
         ledger["updated_at"] = utc_now()
         return position_id
 
@@ -476,6 +536,15 @@ async def record_paper_buy(
         mutate,
         operation="paper_buy_record",
     )
+    try:
+        from src.research import entry_telemetry
+
+        entry_telemetry.safe_hook(
+            "mark", "paper_buy_created_at", trade_id=position_id,
+            event_seq=buy_identity.get("event_seq"),
+        )
+    except Exception:
+        pass
     return position_id
 
 
@@ -615,6 +684,7 @@ async def record_paper_sell(
 ) -> bool:
     ensure_ledger_migrated()
     closed_experiment: dict[str, str] = {}
+    completed_telemetry: dict[str, Any] = {}
 
     def mutate(ledger: dict[str, Any]) -> bool:
         position = ledger.setdefault("positions", {}).get(mint)
@@ -685,6 +755,13 @@ async def record_paper_sell(
             "at": utc_now(),
         }))
         if position["token_amount_raw"] <= 0:
+            try:
+                payload = _completed_telemetry(ledger, position)
+                if payload is not None:
+                    completed_telemetry.update(payload)
+            except Exception:
+                # 연구 계측은 원장 기록/청산을 되돌리거나 차단하지 않는다.
+                pass
             observation_id = position.get("observation_id")
             if observation_id:
                 closed_experiment["observation_id"] = str(observation_id)
@@ -699,6 +776,13 @@ async def record_paper_sell(
         mutate,
         operation="paper_sell_record",
     )
+    if recorded and completed_telemetry:
+        try:
+            from src.research import entry_telemetry
+
+            entry_telemetry.submit_outcome(completed_telemetry)
+        except Exception:
+            pass
     if recorded and closed_experiment:
         try:
             from src.observation_tracker import mark_paper_experiment_status
@@ -1075,9 +1159,13 @@ async def run_risk_loop(paper_trading: bool = True) -> None:
     timeout = aiohttp.ClientTimeout(total=10)
     async with aiohttp.ClientSession(timeout=timeout) as session:
         while True:
+            if _telemetry_stop_requested():
+                break
             started = asyncio.get_running_loop().time()
             positions = list(read_ledger()["positions"].values())
             for position in positions:
+                if _telemetry_stop_requested():
+                    break
                 try:
                     if paper_trading:
                         await evaluate_paper_position(session, settings.jupiter_api_key, position)
@@ -1163,7 +1251,30 @@ async def run_risk_loop(paper_trading: bool = True) -> None:
 def main() -> None:
     """Run the risk manager as a standalone PM2 service."""
     configure_safe_logging()
-    asyncio.run(run_risk_loop(paper_trading=True))
+    try:
+        from src.research import entry_telemetry, entry_telemetry_epoch
+        from dotenv import load_dotenv
+
+        load_dotenv()
+        entry_telemetry.start_worker(
+            root=LEDGER_PATH.parent.parent,
+            safe_config=entry_telemetry_epoch.safe_runtime_config(),
+            role="risk-manager",
+        )
+    except Exception:
+        pass
+    try:
+        asyncio.run(run_risk_loop(paper_trading=True))
+    finally:
+        try:
+            from src.research import entry_telemetry, entry_telemetry_epoch
+
+            drained = entry_telemetry.flush(timeout=5.0)
+            entry_telemetry_epoch.acknowledge_stopped(
+                LEDGER_PATH.parent.parent, "risk-manager", drained=bool(drained),
+            )
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":

@@ -47,11 +47,13 @@ class EntryTelemetryReadinessFailureTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
-        self.directory = self.root / "data/research/entry_telemetry"
+        self.directory = self.root / "data/research/entry_telemetry/epochs/offline-epoch"
         self.stack = ExitStack()
         self.addCleanup(self.stack.close)
         for name, value in {
             "_root": self.root, "_queue": queue.Queue(maxsize=16),
+            "_epoch": {"telemetry_epoch_id": "offline-epoch", "start_utc": STAMP, "start_event_seq": 0, "build": {"source_digest": "offline-source"}},
+            "_receipt_queue": queue.Queue(maxsize=16), "_outcome_queue": queue.Queue(maxsize=16),
             "_provenance": {"session_id": "test", "git_sha": "offline"},
             "_health": {"status": "TELEMETRY_READY", "dropped_row_count": 0,
                         "write_error_count": 0, "duplicate_count": 0,
@@ -69,20 +71,22 @@ class EntryTelemetryReadinessFailureTests(unittest.TestCase):
         rows = SingleRowQueue(capture)
         with ExitStack() as stack:
             stack.enter_context(patch.object(telemetry, "_queue", rows))
+            stack.enter_context(patch.object(telemetry, "_load_epoch", return_value=telemetry._epoch))
+            stack.enter_context(patch.object(telemetry, "_receipt_queue", queue.Queue(maxsize=16)))
             stack.enter_context(patch.object(telemetry, "_build_provenance", return_value={"session_id": "test"}))
             if persist_effect is not None:
-                stack.enter_context(patch.object(telemetry, "_persist", side_effect=persist_effect))
+                stack.enter_context(patch.object(telemetry, "_persist_stream", side_effect=persist_effect))
             with self.assertRaises(StopWorker):
                 telemetry._run({})
         self.assertEqual(rows.done, int(capture is not None))
 
     def health(self):
-        return json.loads((self.directory / "health.json").read_text(encoding="utf-8"))
+        return json.loads((self.directory / "health/monitor.json").read_text(encoding="utf-8"))
 
     def test_missing_directory_is_created_by_actual_worker(self):
         self.assertFalse(self.directory.exists())
         self.run_one(self.capture())
-        self.assertEqual(len(list((self.directory / "rows").glob("*.json"))), 1)
+        self.assertEqual(len(list((self.directory / "predictors/2026-10-03").glob("*.json"))), 1)
         self.assertEqual(self.health()["status"], "TELEMETRY_READY")
 
     def test_permission_failure_is_dropped_and_published_degraded(self):
@@ -96,18 +100,18 @@ class EntryTelemetryReadinessFailureTests(unittest.TestCase):
     def test_actual_row_write_failure_keeps_reserved_budget_until_restart(self):
         original = telemetry.atomic_write_json
         def fail_row(path, document):
-            if path.parent.name == "rows":
+            if path.parent.name == "2026-10-03":
                 raise PermissionError("injected row write failure")
             return original(path, document)
         with patch.object(telemetry, "atomic_write_json", side_effect=fail_row):
             self.run_one(self.capture())
-        self.assertEqual(json.loads((self.directory / "storage.json").read_text())["row_count"], 1)
+        self.assertEqual(json.loads((self.directory / "predictors/storage.json").read_text())["row_count"], 1)
         self.run_one(None)
-        self.assertEqual(json.loads((self.directory / "storage.json").read_text())["row_count"], 0)
+        self.assertEqual(json.loads((self.directory / "predictors/storage.json").read_text())["row_count"], 0)
 
     def test_malformed_existing_row_is_preserved_and_fails_closed(self):
         capture = self.capture()
-        path = self.directory / "rows" / (capture.identity["signal_id"] + ".json")
+        path = self.directory / "predictors/2026-10-03" / (capture.identity["signal_id"] + ".json")
         path.parent.mkdir(parents=True)
         partial = b'{"schema_version":1,"identity":'
         path.write_bytes(partial)
@@ -118,7 +122,7 @@ class EntryTelemetryReadinessFailureTests(unittest.TestCase):
 
     def test_valid_json_with_invalid_seal_is_preserved_and_reports_conflict(self):
         capture = self.capture()
-        path = self.directory / "rows" / (capture.identity["signal_id"] + ".json")
+        path = self.directory / "predictors/2026-10-03" / (capture.identity["signal_id"] + ".json")
         path.parent.mkdir(parents=True)
         path.write_text('{"content_hash":"wrong"}', encoding="utf-8")
         before = path.read_bytes()
@@ -133,9 +137,9 @@ class EntryTelemetryReadinessFailureTests(unittest.TestCase):
 
     def test_serialization_failure_is_dropped_without_partial_row(self):
         capture = self.capture()
-        capture.identity["offline_invalid_value"] = object()
+        capture.identity["mint"] = object()
         self.run_one(capture)
-        self.assertEqual(list((self.directory / "rows").glob("*.json")), [])
+        self.assertEqual(list((self.directory / "predictors/2026-10-03").glob("*.json")), [])
         self.assertEqual(self.health()["dropped_row_count"], 1)
 
     def test_queue_full_preserves_finished_buy_and_reject_capture(self):
@@ -144,7 +148,7 @@ class EntryTelemetryReadinessFailureTests(unittest.TestCase):
         buy = self.capture("overflow-buy")
         reject = self.capture("overflow-reject", "REJECT_ANALYZER")
         self.assertEqual(telemetry._queue.qsize(), 16)
-        self.assertEqual(telemetry._health["dropped_row_count"], 2)
+        self.assertEqual(telemetry._health["streams"]["predictors"]["dropped_row_count"], 2)
         self.assertTrue(buy.finished and reject.finished)
         self.assertEqual(buy.sections["decision"]["outcome"], "BUY")
         self.assertEqual(reject.sections["decision"]["outcome"], "REJECT_ANALYZER")
@@ -164,7 +168,7 @@ class EntryTelemetryReadinessFailureTests(unittest.TestCase):
                 asyncio.run(monitor.process_paper_signal(mint, 1000, 6, 2_000_000_000,
                                                        "WALLET", "SIGNATURE", STAMP))
         self.assertEqual(executed, ["BUY", "REJECT_ANALYZER"])
-        self.assertEqual(telemetry._health["dropped_row_count"], 2)
+        self.assertEqual(telemetry._health["streams"]["predictors"]["dropped_row_count"], 2)
 
     def test_health_write_failure_is_reported_in_memory_without_exception(self):
         with patch.object(telemetry, "_publish_health", side_effect=PermissionError("health failure")):
@@ -178,41 +182,42 @@ class EntryTelemetryReadinessFailureTests(unittest.TestCase):
         lock = self.directory / "recorder.lock"
         lock.write_bytes(b"\0stale file")
         telemetry._persist(self.capture())
-        self.assertEqual(len(list((self.directory / "rows").glob("*.json"))), 1)
+        self.assertEqual(len(list((self.directory / "predictors/2026-10-03").glob("*.json"))), 1)
         self.assertTrue(lock.exists())
 
     def test_malformed_storage_budget_is_not_silently_reset(self):
         self.directory.mkdir(parents=True)
-        path = self.directory / "storage.json"
+        path = self.directory / "predictors/storage.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(b'{"version":')
         self.run_one(self.capture())
         self.assertEqual(path.read_bytes(), b'{"version":')
         health = self.health()
         self.assertEqual(health["write_error_count"], 2)
         self.assertEqual(health["dropped_row_count"], 1)
-        self.assertFalse(list((self.directory / "rows").glob("*.json")))
+        self.assertFalse(list((self.directory / "predictors/2026-10-03").glob("*.json")))
 
     def test_atomic_replace_failure_leaves_no_partial_final_row_or_temp_file(self):
         capture = self.capture()
         original = state_store.os.replace
         def fail_row_replace(source, destination):
-            if Path(destination).parent.name == "rows":
+            if Path(destination).parent.name == "2026-10-03":
                 raise PermissionError("injected Windows replace denial")
             return original(source, destination)
         with patch.object(state_store.os, "replace", side_effect=fail_row_replace):
             self.run_one(capture)
-        self.assertFalse(list((self.directory / "rows").glob("*.json")))
-        self.assertFalse(list((self.directory / "rows").glob("*.tmp")))
+        self.assertFalse(list((self.directory / "predictors/2026-10-03").glob("*.json")))
+        self.assertFalse(list((self.directory / "predictors/2026-10-03").glob("*.tmp")))
         self.assertEqual(self.health()["dropped_row_count"], 1)
 
     def test_stranded_partial_temporary_file_is_not_treated_as_complete_row(self):
-        rows = self.directory / "rows"
+        rows = self.directory / "predictors/2026-10-03"
         rows.mkdir(parents=True)
         fragment = rows / ".offline.json.crash.tmp"
         fragment.write_bytes(b'{"schema_version":')
         self.run_one(self.capture())
         self.assertEqual(len(list(rows.glob("*.json"))), 1)
-        self.assertEqual(json.loads((self.directory / "storage.json").read_text())["row_count"], 1)
+        self.assertEqual(json.loads((self.directory / "predictors/storage.json").read_text())["row_count"], 1)
         # 다른 이름의 최근 임시 파일은 보존되며 budget에는 포함하지 않는다.
         self.assertTrue(fragment.exists())
 
@@ -228,19 +233,20 @@ class EntryTelemetryReadinessFailureTests(unittest.TestCase):
 from pathlib import Path
 from src.research import entry_telemetry as t
 t._root=Path(sys.argv[1]); t._provenance=t._build_provenance({})
+t._epoch={"telemetry_epoch_id":"offline-epoch","start_utc":"2026-10-03T00:00:00+00:00","start_event_seq":0}
 for mint in sys.argv[2:]:
     c=t.begin_signal(mint=mint,route_type="A",signal_detected_at="2026-10-03T00:00:00+00:00")
     t.finish(c,outcome="BUY",trade_id="POSITION"); t._persist(c)
 print(json.dumps({"session":t._session,"schema":t.SCHEMA_VERSION,"duplicate":t._health["duplicate_count"]}))
 '''
         first = self.child(code, str(self.root), "first")
-        rows = self.directory / "rows"
+        rows = self.directory / "predictors/2026-10-03"
         first_path = next(rows.glob("*.json"))
         before = first_path.read_bytes()
         second = self.child(code, str(self.root), "first", "second")
         self.assertNotEqual(first["session"], second["session"])
         self.assertEqual(first["schema"], second["schema"])
-        self.assertEqual(second["duplicate"], 1)
+        self.assertEqual(second["duplicate"], 2)
         self.assertEqual(first_path.read_bytes(), before)
         documents = [json.loads(path.read_text(encoding="utf-8")) for path in rows.glob("*.json")]
         self.assertEqual(len(documents), 2)
@@ -258,6 +264,103 @@ with exclusive_file_lock(Path(sys.argv[1])):
         self.assertTrue(self.child(code, str(self.directory / "recorder"))["locked"])
         with state_store.exclusive_file_lock(self.directory / "recorder", timeout_seconds=0.2):
             self.assertTrue((self.directory / "recorder.lock").exists())
+
+    def test_predictor_and_receipt_write_failures_are_independent(self):
+        original = telemetry._persist_stream
+        for failed, succeeding in (("predictors", "receipts"), ("receipts", "predictors")):
+            with self.subTest(failed=failed):
+                capture = self.capture("independent-" + failed)
+                def write(stream, document):
+                    if stream == failed:
+                        raise PermissionError("offline stream denied")
+                    return original(stream, document)
+                with patch.object(telemetry, "_persist_stream", side_effect=write):
+                    telemetry._persist(capture)
+                builder = telemetry._row if succeeding == "predictors" else telemetry._receipt_row
+                self.assertTrue(telemetry._record_path(succeeding, builder(capture)).exists())
+                builder = telemetry._row if failed == "predictors" else telemetry._receipt_row
+                self.assertFalse(telemetry._record_path(failed, builder(capture)).exists())
+                self.assertEqual(telemetry._health["streams"][failed]["write_error_count"], 1)
+
+    def test_outcome_failure_does_not_change_predictor_or_receipt(self):
+        capture = self.capture()
+        telemetry._persist(capture)
+        paths = [telemetry._record_path(stream, builder(capture)) for stream, builder in
+            (("predictors", telemetry._row), ("receipts", telemetry._receipt_row))]
+        before = [path.read_bytes() for path in paths]
+        value = {"trade_id": "POSITION", "mint": "MINT", "signal_detected_at": STAMP, "buy_event_seq": 1}
+        with patch.object(telemetry, "_persist_stream", side_effect=PermissionError("outcome denied")):
+            telemetry._write_stream("outcomes", value)
+        self.assertEqual([path.read_bytes() for path in paths], before)
+        self.assertEqual(telemetry._health["streams"]["outcomes"]["write_error_count"], 1)
+
+    def test_predictor_queue_full_still_enqueues_receipt(self):
+        telemetry._queue = queue.Queue(maxsize=1)
+        telemetry.finish(telemetry.begin_signal(mint="filled", route_type="A", signal_detected_at=STAMP))
+        capture = self.capture("buy-survives")
+        self.assertTrue(capture.finished)
+        self.assertEqual(telemetry._receipt_queue.qsize(), 1)
+        self.assertEqual(telemetry._health["streams"]["predictors"]["dropped_row_count"], 1)
+        self.assertNotIn("receipts", telemetry._health["streams"])
+
+    def test_disabled_epoch_collects_no_queued_rows_and_launch_error_cannot_raise(self):
+        with patch.object(telemetry, "_epoch", None):
+            self.capture()
+            self.assertEqual(telemetry._queue.qsize(), 0)
+            self.assertEqual(telemetry._receipt_queue.qsize(), 0)
+        with patch.object(telemetry, "_load_epoch", side_effect=ValueError("invalid epoch")):
+            telemetry._run({})
+        self.assertFalse(telemetry.is_enabled())
+        self.assertEqual(telemetry._health["status"], "TELEMETRY_DISABLED")
+
+    def test_role_health_publishers_keep_both_process_counters(self):
+        for role in ("monitor", "risk-manager"):
+            with patch.object(telemetry, "_role", role):
+                telemetry._publish_health()
+        self.assertEqual({path.name for path in (self.directory / "health").glob("*.json")},
+                         {"monitor.json", "risk-manager.json"})
+
+    def test_pre_epoch_signal_and_legacy_buy_receipt_are_excluded(self):
+        with patch.object(telemetry, "_epoch", {"telemetry_epoch_id": "offline-epoch",
+                "start_utc": "2026-10-03T00:00:01+00:00", "start_event_seq": 10}):
+            self.assertIsNone(telemetry.begin_signal(mint="legacy", route_type="A", signal_detected_at=STAMP))
+            self.assertEqual(telemetry._health["last_error"], "signal_before_epoch_start")
+        capture = self.capture()
+        capture.receipt["event_seq"] = 9
+        with patch.object(telemetry, "_epoch", {"telemetry_epoch_id": "offline-epoch",
+                "start_utc": STAMP, "start_event_seq": 10}):
+            telemetry._write_stream("receipts", capture)
+        self.assertFalse(telemetry._record_path("receipts", telemetry._receipt_row(capture)).exists())
+        self.assertEqual(telemetry._health["last_error"], "record_outside_epoch")
+
+    def test_startup_validates_epoch_before_starting_worker_thread(self):
+        order = []
+        def initialize(config):
+            order.append("validate")
+            return True
+        with patch.object(telemetry, "_worker", None), patch.object(telemetry, "_initialize", side_effect=initialize), \
+                patch.object(telemetry.threading, "Thread") as thread:
+            thread.return_value.start.side_effect = lambda: order.append("start")
+            telemetry.start_worker(self.root, {})
+            self.assertEqual(order, ["validate", "start"])
+            self.assertEqual(thread.call_args.kwargs["args"], ({}, True))
+
+    def test_startup_invalid_epoch_keeps_control_usable_and_does_not_launch_writer(self):
+        with patch.object(telemetry, "_worker", None), patch.object(telemetry, "_initialize", return_value=False), \
+                patch.object(telemetry.threading, "Thread") as thread:
+            telemetry.start_worker(self.root, {})
+            thread.assert_not_called()
+
+    def test_health_snapshot_nested_counters_do_not_change_after_lock_release(self):
+        telemetry._degrade("offline_injected", stream="predictors")
+        real = telemetry.atomic_write_json
+        def concurrent_update(path, document):
+            telemetry._health["streams"]["predictors"]["write_error_count"] = 10
+            return real(path, document)
+        with patch.object(telemetry, "atomic_write_json", side_effect=concurrent_update):
+            telemetry._publish_health()
+        self.assertEqual(self.health()["streams"]["predictors"]["write_error_count"], 0)
+        self.assertEqual(telemetry._health["streams"]["predictors"]["write_error_count"], 10)
 
 
 if __name__ == "__main__":

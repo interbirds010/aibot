@@ -1,6 +1,6 @@
 # Entry-time raw telemetry: 구현과 N3 격리
 
-후속 offline audit: [ENTRY_TELEMETRY_ACTIVATION.md](ENTRY_TELEMETRY_ACTIVATION.md)를 우선 적용한다. 현재 판정은 **TELEMETRY_NOT_READY**다. 아래 G의 보호는 알려진 key/freeze에 한정되며, realized_pnl/중첩 SELL/future wallet snapshot guard와 predictor/receipt 물리적 파일 분리는 충족하지 않는다. 기존 구현과 runtime은 이 audit에서 변경하지 않았다.
+이 문서는 초기 1c06e606 v1 구현의 기록이다. 현재 split-stream v2 계약과 readiness 판정은 [ENTRY_TELEMETRY_ACTIVATION.md](ENTRY_TELEMETRY_ACTIVATION.md)를 우선 적용한다. 후속 구현은 물리적 파일 분리, 중첩 allowlist, wallet null 및 immutable epoch/Windows cutover를 보강했다. 현재 실행 중인 frozen runtime은 변경하지 않았다.
 
 ## A. Preflight
 

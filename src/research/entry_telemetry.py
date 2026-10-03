@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+from copy import deepcopy
 from contextvars import ContextVar
 from datetime import datetime, timezone
 import hashlib
@@ -19,9 +20,11 @@ import time
 from uuid import uuid4
 
 from src.state_store import atomic_write_json, exclusive_file_lock, read_json
+from src.research import entry_predictor_schema as predictor_schema
 
 ROOT = Path(__file__).resolve().parents[2]
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+SCHEMAS = {"predictor": 2, "receipt": 1, "outcome": 1}
 MAX_ROW_BYTES = 64 * 1024
 MAX_ROWS = 4096
 MAX_STORAGE_BYTES = 128 * 1024 * 1024
@@ -60,8 +63,7 @@ SECTION_FIELDS = {
     "pressure": frozenset({"open_positions_count", "concurrent_candidate_count", "concurrent_analysis_count",
         "queue_depth", "pending_quote_count", "recent_signal_count", "recent_signal_window_sec", "missing_reason",
         "pending_signal_tasks", "pending_shadow_tasks", "analysis_semaphore_available", "permitted_analysis_concurrency", "risk_check_scope"}),
-    "wallet_performance": frozenset({"wallet_hash", "snapshot_at", "known_trades", "wins", "losses",
-        "realized_pnl", "roi", "recent_activity_count", "status", "missing_reason"}),
+    "wallet_performance": frozenset({"entry_time_snapshot", "missing_reason"}),
     "rpc": frozenset({"last_error_type", "missing_reason", "scope", "confirmation_missing_reason"}),
     "rpc_errors": frozenset({"last_error_type"}),
     "quote_buy_errors": frozenset({"last_error_type"}),
@@ -95,6 +97,8 @@ CONFIG_FIELDS = CONFIG_FIELDS | frozenset({"paper_buy_basis_points", "single_str
 OUTCOMES = frozenset({"BUY", "REJECT_ANALYZER", "REJECT_RISK", "QUOTE_FAILED", "RPC_SKIPPED", "OTHER"})
 _current: ContextVar = ContextVar("entry_telemetry", default=None)
 _queue: queue.Queue = queue.Queue(maxsize=16)
+_receipt_queue: queue.Queue = queue.Queue(maxsize=16)
+_outcome_queue: queue.Queue = queue.Queue(maxsize=16)
 _worker = None
 _worker_lock = threading.Lock()
 _health_lock = threading.Lock()
@@ -104,6 +108,9 @@ _session = str(uuid4())
 _process_start = datetime.now(timezone.utc).isoformat()
 _root = ROOT
 _provenance = {}
+_epoch = None
+_role = "monitor"
+SECTION_SHAPES = predictor_schema.section_shapes(SECTION_FIELDS)
 
 
 def _canonical(value):
@@ -119,10 +126,7 @@ def _now():
 
 
 def _forbidden(key):
-    normalized = "".join(char for char in key.lower() if char.isalnum())
-    return any(word in normalized for word in ("secret", "apikey", "privatekey", "password", "cookie",
-        "rpcurl", "authorization", "finalpnl", "winner", "loser", "exitreason", "future", "mfe", "mae",
-        "horizonreturn", "finalresearch", "postentry"))
+    return predictor_schema.forbidden(key)
 
 
 def _safe(value, depth=0, budget=None):
@@ -153,7 +157,7 @@ def _safe(value, depth=0, budget=None):
     return None
 
 
-def _degrade(reason, *, write=False, conflict=False, dropped=False):
+def _degrade(reason, *, write=False, conflict=False, dropped=False, stream=None):
     with _health_lock:
         _health["status"] = "TELEMETRY_DEGRADED"
         _health["last_error"] = str(reason)[:80]
@@ -164,6 +168,13 @@ def _degrade(reason, *, write=False, conflict=False, dropped=False):
             _health["dropped_row_count"] += 1
         if conflict:
             _health["conflict_count"] += 1
+        if stream:
+            counters = _health.setdefault("streams", {}).setdefault(stream, {
+                "written_count": 0, "dropped_row_count": 0, "write_error_count": 0,
+                "duplicate_count": 0, "conflict_count": 0})
+            for flag, key in ((write, "write_error_count"), (dropped, "dropped_row_count"), (conflict, "conflict_count")):
+                if flag:
+                    counters[key] += 1
 
 
 class Capture:
@@ -200,6 +211,9 @@ def begin_signal(*, mint, route_type, signal_detected_at, source_wallet=None, so
         if parsed.tzinfo is None:
             return None
         stamp = parsed.astimezone(timezone.utc).isoformat()
+        if _epoch and parsed < datetime.fromisoformat(_epoch["start_utc"].replace("Z", "+00:00")):
+            _degrade("signal_before_epoch_start", dropped=True, stream="predictors")
+            return None
         wallet = hashlib.sha256(source_wallet.encode()).hexdigest() if source_wallet else None
         signature = hashlib.sha256(source_signature.encode()).hexdigest() if source_signature else None
         identity = {"mint": mint, "route_type": route_type, "strategy_family": "whale_route_a" if route_type == "A" else "dex_momentum_b",
@@ -238,7 +252,7 @@ def mark(name, **safe_values):
                     "monotonic_ns": int(mono * 1_000_000_000), "semantics": "actual upstream capture; not reconstructed"}
         if name == "paper_buy_created_at":
             capture.frozen = True
-            capture.receipt[name] = stamp
+            capture.receipt.setdefault(name, stamp)
             for key in ("trade_id", "event_seq"):
                 if safe_values.get(key) is not None:
                     capture.receipt[key] = _safe(safe_values[key])
@@ -275,11 +289,16 @@ def set_section(name, mapping):
             return
         if capture.frozen and name != "decision":
             return
+        if name == "wallet_performance":
+            # 안전한 entry 시점 원본이 없다. 현재값/미래값 backfill은 금지한다.
+            capture.sections[name] = {"entry_time_snapshot": None, "missing_reason": "NO_VERIFIED_ENTRY_TIME_SNAPSHOT_SOURCE"}
+            return
         for key, value in islice(mapping.items(), MAX_ITEMS):
-            if key in SECTION_FIELDS[name] and not _forbidden(key):
+            if key in SECTION_FIELDS[name] and (not _forbidden(key) or name == "decision" and key == "outcome"):
                 if name == "decision" and key == "outcome" and capture.receipt.get("trade_id") is not None:
                     continue
-                capture.sections[name][key] = _safe(value, budget=capture.safe_budget)
+                capture.sections[name][key] = predictor_schema.project(value, SECTION_SHAPES[name][key],
+                    _safe, budget=capture.safe_budget)
     except Exception:
         _degrade("section_capture_error")
 
@@ -306,7 +325,7 @@ def duration(name, seconds):
 
 def safe_hook(name, *args, **kwargs):
     try:
-        if name in ("mark", "set_section", "add_counter", "duration", "begin_signal", "finish", "start_worker", "current_capture"):
+        if name in ("mark", "set_section", "add_counter", "duration", "begin_signal", "finish", "start_worker", "current_capture", "submit_outcome"):
             return globals()[name](*args, **kwargs)
     except Exception:
         _degrade("hook_error")
@@ -325,74 +344,237 @@ def finish(capture, outcome=None, trade_id=None, event_seq=None):
         capture.receipt.update({"trade_id": _safe(trade_id) if trade_id is not None else capture.receipt.get("trade_id"),
             "event_seq": _safe(event_seq) if event_seq is not None else capture.receipt.get("event_seq"),
             "semantics": "post-decision execution identity; never entry predictor"})
-        _queue.put_nowait(capture)
+        if not is_enabled():
+            return
+        # 서로 다른 큐를 사용한다. predictor overflow가 BUY receipt를 버리지 않는다.
+        for stream, target, value in (("predictors", _queue, capture), ("receipts", _receipt_queue, capture)):
+            if stream == "receipts" and not capture.receipt.get("trade_id"):
+                continue
+            try:
+                target.put_nowait(value)
+            except queue.Full:
+                _degrade("queue_full", dropped=True, stream=stream)
     except queue.Full:
         _degrade("queue_full", dropped=True)
     except Exception:
         _degrade("finish_error", dropped=True)
 
 
+def _envelope(stream):
+    provenance_fields = ("git_sha", "source_digest", "source_scope", "config_fingerprint", "config_scope", "platform", "os",
+        "python_version", "runtime", "process_id", "session_id", "process_start_timestamp",
+        "process_start_semantics", "telemetry_schema_version", "missing_reason")
+    provenance = {key: predictor_schema.project(_provenance.get(key), predictor_schema.SCALAR, _safe)
+        for key in provenance_fields}
+    provenance["safe_config"] = {key: _safe(value) for key, value in _provenance.get("safe_config", {}).items()
+        if key in CONFIG_FIELDS and not isinstance(value, (dict, list, tuple))}
+    return {"schema_version": SCHEMAS[stream], f"{stream}_schema_version": SCHEMAS[stream],
+        "telemetry_epoch_id": (_epoch or {}).get("telemetry_epoch_id"),
+        "build_sha": _provenance.get("git_sha"), "session_id": _provenance.get("session_id"),
+        "provenance": provenance}
+
+
+IDENTITY_FIELDS = ("signal_id", "mint", "route_type", "strategy_family", "signal_detected_at",
+    "source_wallet_hash", "source_signature_hash")
+
+
+def _identity(capture):
+    values = {key: _safe(capture.identity.get(key)) if not isinstance(capture.identity.get(key), (dict, list, tuple)) else None
+        for key in IDENTITY_FIELDS}
+    if not isinstance(values["signal_id"], str) or not isinstance(values["mint"], str) or values["route_type"] not in ("A", "B"):
+        raise ValueError("invalid_capture_identity")
+    return values
+
+
+def _timestamp(value):
+    if not isinstance(value, dict):
+        return None
+    return {key: _safe(value.get(key)) if not isinstance(value.get(key), (dict, list, tuple)) else None
+        for key in ("wall_utc", "monotonic_ns", "semantics")}
+
+
 def _row(capture):
-    return {"schema_version": SCHEMA_VERSION, "identity": capture.identity,
-        "decision": capture.sections["decision"],
-        "predictors": {"timestamps": capture.timestamps, "timestamp_missing_reason": "null means not reached or unavailable in existing flow",
-            "sections": {key: value for key, value in capture.sections.items() if key != "decision"},
-            "counters": capture.counters, "durations": capture.durations},
-        "execution_receipt": capture.receipt, "provenance": _provenance,
+    sections = {name: predictor_schema.project(capture.sections.get(name), SECTION_SHAPES[name], _safe)
+                for name in SECTION_FIELDS if name != "decision"}
+    sections["wallet_performance"] = {"entry_time_snapshot": None,
+        "missing_reason": "NO_VERIFIED_ENTRY_TIME_SNAPSHOT_SOURCE"}
+    # Serializer도 검증한다. capture 내부에 직접 섞은 미래 history가 출력되지 않는다.
+    for key in ("history", "pre_signal_snapshots"):
+        values = sections["trajectory"].get(key)
+        if isinstance(values, list):
+            boundary = datetime.fromisoformat(capture.identity["signal_detected_at"]).timestamp()
+            sections["trajectory"][key] = [value for value in values if isinstance(value, dict)
+                and isinstance(value.get("snapshot_at_epoch"), (int, float))
+                and value["snapshot_at_epoch"] <= boundary]
+    decision = predictor_schema.project(capture.sections["decision"], SECTION_SHAPES["decision"], _safe)
+    decision["outcome"] = decision.get("outcome") if decision.get("outcome") in OUTCOMES else "OTHER"
+    return {**_envelope("predictor"), "identity": {**_identity(capture), "trade_id": None, "event_seq": None},
+        "decision": decision, "decision_outcome": decision["outcome"],
+        "predictors": {"timestamps": {key: _timestamp(capture.timestamps.get(key)) for key in TIMESTAMPS | {"signal_detected_at"}},
+            "timestamp_missing_reason": "null means not reached or unavailable in existing flow",
+            "sections": sections,
+            "counters": {key: predictor_schema.project(capture.counters.get(key), predictor_schema.SCALAR, _safe) for key in COUNTERS},
+            "durations": {key: predictor_schema.project(capture.durations.get(key), predictor_schema.SCALAR, _safe) for key in DURATIONS}},
         "collection_limits": {"mapping_or_list_items": MAX_ITEMS, "string_characters": MAX_STRING, "nested_depth": MAX_DEPTH,
             "capture_nodes": MAX_CAPTURE_NODES, "capture_string_characters": MAX_CAPTURE_CHARACTERS,
             "capture_budget_exhausted": capture.safe_budget[0] <= 0 or capture.safe_budget[1] <= 0,
             "semantics": "bounded prefix only; raw lists may be truncated; count fields preserve upstream counts"}}
 
 
-def _persist(capture):
-    document = _row(capture)
+def _receipt_row(capture):
+    return {**_envelope("receipt"), "identity": {**_identity(capture),
+        "trade_id": capture.receipt.get("trade_id"), "event_seq": capture.receipt.get("event_seq")},
+        "execution_receipt": {"trade_id": capture.receipt.get("trade_id"), "event_seq": capture.receipt.get("event_seq"),
+            "paper_buy_created_at": _timestamp(capture.receipt.get("paper_buy_created_at")),
+            "semantics": "post-decision execution identity; never entry predictor"}}
+
+
+OUTCOME_IDENTITY_FIELDS = ("trade_id", "mint", "route_type", "strategy_family", "signal_detected_at",
+    "buy_event_seq", "buy_event_id", "event_seq")
+OUTCOME_VALUE_FIELDS = ("completed_at", "exit_reason", "entry_cost_lamports",
+    "cumulative_proceeds_lamports", "realized_pnl_lamports", "sell_legs_truncated", "sell_legs_complete")
+SELL_FIELDS = ("event_seq", "event_id", "at", "reason", "token_amount_raw", "proceeds_lamports", "realized_pnl_lamports")
+
+
+def is_enabled():
+    return _epoch is not None
+
+
+def submit_outcome(mapping):
+    """완료 원장에서 추출한 scalar만 작은 독립 큐로 넘긴다."""
+    try:
+        if not is_enabled() or not isinstance(mapping, dict):
+            return
+        row = {key: _safe(mapping.get(key)) if not isinstance(mapping.get(key), (dict, list, tuple)) else None
+               for key in OUTCOME_IDENTITY_FIELDS + OUTCOME_VALUE_FIELDS}
+        if not isinstance(row["trade_id"], str) or not row["trade_id"] or not isinstance(row["mint"], str):
+            _degrade("outcome_identity_invalid", dropped=True, stream="outcomes")
+            return
+        stamp = datetime.fromisoformat(row["signal_detected_at"].replace("Z", "+00:00"))
+        if (stamp.tzinfo is None or stamp < datetime.fromisoformat(_epoch["start_utc"].replace("Z", "+00:00"))
+                or not isinstance(row["buy_event_seq"], int) or row["buy_event_seq"] < _epoch["start_event_seq"]):
+            _degrade("outcome_outside_epoch", dropped=True, stream="outcomes")
+            return
+        legs = mapping.get("sell_legs")
+        row["sell_legs"] = [{key: _safe(leg.get(key)) if not isinstance(leg.get(key), (dict, list, tuple)) else None
+            for key in SELL_FIELDS} for leg in legs[:MAX_ITEMS] if isinstance(leg, dict)] if isinstance(legs, list) else []
+        row["sell_legs_truncated"] = bool(row["sell_legs_truncated"] or isinstance(legs, list) and len(legs) > MAX_ITEMS)
+        _outcome_queue.put_nowait(row)
+    except queue.Full:
+        _degrade("queue_full", dropped=True, stream="outcomes")
+    except Exception:
+        _degrade("outcome_capture_error", dropped=True, stream="outcomes")
+
+
+def _outcome_row(mapping):
+    return {**_envelope("outcome"), "identity": {key: mapping.get(key) for key in OUTCOME_IDENTITY_FIELDS} | {"signal_id": None},
+        "outcome": {key: mapping.get(key) for key in OUTCOME_VALUE_FIELDS + ("sell_legs",)}}
+
+
+def _directory():
+    if not _epoch:
+        raise ValueError("telemetry_epoch_required")
+    return _root / "data" / "research" / "entry_telemetry" / "epochs" / _epoch["telemetry_epoch_id"]
+
+
+def _record_path(stream, document):
+    identity = document["identity"]
+    key = identity["trade_id"] if stream == "outcomes" else identity["signal_id"]
+    # signal ids와 ledger UUID만 파일명으로 쓴다. 경로 이동 문자열은 거부한다.
+    if not isinstance(key, str) or not key or len(key) > 128 or any(char not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_" for char in key):
+        raise ValueError("unsafe_record_identity")
+    from datetime import timedelta
+    stamp = datetime.fromisoformat(identity["signal_detected_at"].replace("Z", "+00:00"))
+    day = stamp.astimezone(timezone(timedelta(hours=9))).date().isoformat()
+    return _directory() / stream / day / (key + ".json")
+
+
+def _increment(stream, key):
+    with _health_lock:
+        counters = _health.setdefault("streams", {}).setdefault(stream, {
+            "written_count": 0, "dropped_row_count": 0, "write_error_count": 0,
+            "duplicate_count": 0, "conflict_count": 0})
+        counters[key] += 1
+        if key in ("duplicate_count", "conflict_count"):
+            _health[key] += 1
+
+
+def _persist_stream(stream, document):
     encoded = _canonical(document).encode("utf-8")
     content_hash = hashlib.sha256(encoded).hexdigest()
     sealed = {**document, "content_hash": content_hash}
     # state_store는 끝 newline을 쓰며 Windows text 모드는 CRLF로 저장한다.
     byte_count = len(_canonical(sealed).encode("utf-8")) + (2 if os.name == "nt" else 1)
     if byte_count > MAX_ROW_BYTES:
-        _degrade("row_too_large", dropped=True)
+        _degrade("row_too_large", dropped=True, stream=stream)
         return
-    directory = _root / "data" / "research" / "entry_telemetry"
-    path = directory / "rows" / (capture.identity["signal_id"] + ".json")
+    directory = _directory() / stream
+    path = _record_path(stream, document)
+    # 각 stream의 lock/budget을 분리해 한 stream 장애를 격리한다.
     with exclusive_file_lock(directory / "recorder", operation="entry_telemetry_append"):
         if path.exists():
             old = read_json(path, {})
             prior_hash = old.pop("content_hash", None)
             if prior_hash != _digest(old):
-                _degrade("immutable_content_corrupt", conflict=True, dropped=True)
+                _degrade("immutable_content_corrupt", conflict=True, dropped=True, stream=stream)
                 return
             if (old.get("identity") == document["identity"] and
-                    old.get("execution_receipt", {}).get("trade_id") == document["execution_receipt"].get("trade_id") and
-                    old.get("execution_receipt", {}).get("event_seq") == document["execution_receipt"].get("event_seq") and
-                    old.get("decision", {}).get("outcome") == document["decision"]["outcome"]):
-                with _health_lock:
-                    _health["duplicate_count"] += 1
+                    all(old.get("execution_receipt", {}).get(key) == document.get("execution_receipt", {}).get(key)
+                        for key in ("trade_id", "event_seq")) and
+                    old.get("outcome", {}) == document.get("outcome", {}) and
+                    old.get("decision", {}).get("outcome") == document.get("decision", {}).get("outcome")):
+                _increment(stream, "duplicate_count")
                 return
-            _degrade("immutable_identity_conflict", conflict=True, dropped=True)
+            _degrade("immutable_identity_conflict", conflict=True, dropped=True, stream=stream)
             return
         budget_path = directory / "storage.json"
         budget = read_json(budget_path, {"version": 0, "row_count": 0, "bytes": 0})
         if budget["row_count"] >= MAX_ROWS or budget["bytes"] + byte_count > MAX_STORAGE_BYTES:
-            _degrade("storage_budget_reached", dropped=True)
+            _degrade("storage_budget_reached", dropped=True, stream=stream)
             return
         # 예약을 먼저 저장한다. 행 쓰기 실패 시 재시작까지 보수적으로 용량을 차감한다.
         atomic_write_json(budget_path, {"version": budget["version"] + 1, "row_count": budget["row_count"] + 1,
             "bytes": budget["bytes"] + byte_count})
         atomic_write_json(path, sealed)
+        _increment(stream, "written_count")
+
+
+def _write_stream(stream, value):
+    try:
+        builder = {"predictors": _row, "receipts": _receipt_row, "outcomes": _outcome_row}[stream]
+        document = builder(value)
+        stamp = datetime.fromisoformat(document["identity"]["signal_detected_at"].replace("Z", "+00:00"))
+        if not _epoch or stamp < datetime.fromisoformat(_epoch["start_utc"].replace("Z", "+00:00")):
+            _degrade("record_outside_epoch", dropped=True, stream=stream)
+            return
+        seq = document["identity"].get("buy_event_seq" if stream == "outcomes" else "event_seq")
+        if seq is not None and (not isinstance(seq, int) or isinstance(seq, bool) or seq < _epoch["start_event_seq"]):
+            _degrade("record_outside_epoch", dropped=True, stream=stream)
+            return
+        _persist_stream(stream, document)
+    except Exception:
+        _degrade("record_write_error", write=True, dropped=True, stream=stream)
+
+
+def _persist(capture):
+    """Offline 검증용 convenience. 실제 worker는 각 큐를 독립 소비한다."""
+    _write_stream("predictors", capture)
+    if capture.receipt.get("trade_id"):
+        _write_stream("receipts", capture)
 
 
 def _publish_health():
-    directory = _root / "data" / "research" / "entry_telemetry"
+    directory = _directory()
     with _health_lock:
-        doc = {**_health, "session_id": _session, "process_id": os.getpid(), "heartbeat_utc": _now(),
+        doc = {**deepcopy(_health), "session_id": _session, "process_id": os.getpid(), "heartbeat_utc": _now(),
             "queue_depth": _queue.qsize(), "queue_capacity": _queue.maxsize,
+            "telemetry_epoch_id": _epoch["telemetry_epoch_id"],
+            "stream_queues": {name: {"depth": target.qsize(), "capacity": target.maxsize} for name, target in
+                (("predictors", _queue), ("receipts", _receipt_queue), ("outcomes", _outcome_queue))},
             "storage_limits": {"rows": MAX_ROWS, "bytes": MAX_STORAGE_BYTES, "row_bytes": MAX_ROW_BYTES},
             "counter_semantics": "this recorder process/session; storage.json counts persistent rows"}
     with exclusive_file_lock(directory / "health", operation="entry_telemetry_health"):
-        health_path = directory / "health.json"
+        health_path = directory / "health" / (_role + ".json")
         prior = read_json(health_path, {"version": 0})
         atomic_write_json(health_path, {**doc, "version": prior["version"] + 1,
             "publisher_semantics": "latest recorder process; per-session provenance remains in immutable rows"})
@@ -420,53 +602,100 @@ def _build_provenance(config):
     return result
 
 
-def _run(config):
-    global _provenance
+def _load_epoch(config):
+    from src.research import entry_telemetry_epoch as epoch
+    marker = epoch.require_epoch(_root, provenance=_provenance, config=config, schemas=SCHEMAS)
+    epoch.register_session(_root, marker, session_id=_session, process_id=os.getpid(), provenance=_provenance)
+    return marker
+
+
+def _initialize(config):
+    global _provenance, _epoch
     try:
         _provenance = _build_provenance(config)
-        # crash 직후 budget 저장 누락도 실제 immutable 파일 크기로 복구한다.
-        directory = _root / "data" / "research" / "entry_telemetry"
-        with exclusive_file_lock(directory / "recorder", operation="entry_telemetry_budget"):
-            count = size = 0
-            for path in (directory / "rows").glob("*.json"):
-                count += 1
-                size += path.stat().st_size
-                if count > MAX_ROWS or size > MAX_STORAGE_BYTES:
-                    break
-            old = read_json(directory / "storage.json", {"version": 0})
-            atomic_write_json(directory / "storage.json", {"version": old["version"] + 1,
-                "row_count": count, "bytes": size})
-            if count >= MAX_ROWS or size >= MAX_STORAGE_BYTES:
-                _degrade("storage_budget_reached")
+        _epoch = _load_epoch(config)
+        _provenance["source_digest"] = _epoch["build"]["source_digest"]
+        _provenance["source_scope"] = "all src/**/*.py, scripts/*.py, requirements.txt and ecosystem.config.js"
     except Exception:
-        _degrade("worker_start_error", write=True)
+        _epoch = None
+        with _health_lock:
+            _health["status"] = "TELEMETRY_DISABLED"
+            _health["last_error"] = "validated_epoch_required"
+        return False
+    return True
+
+
+def _run(config, initialized=False):
+    if not initialized and not _initialize(config):
+        return
+    # 예약 후 crash가 난 공간은 restart에서 실제 immutable 파일 크기로 복구한다.
+    for stream in ("predictors", "receipts", "outcomes"):
+        try:
+            directory = _directory() / stream
+            with exclusive_file_lock(directory / "recorder", operation="entry_telemetry_budget"):
+                count = size = 0
+                for path in directory.glob("*/*.json"):
+                    count += 1
+                    size += path.stat().st_size
+                    if count > MAX_ROWS or size > MAX_STORAGE_BYTES:
+                        break
+                old = read_json(directory / "storage.json", {"version": 0})
+                atomic_write_json(directory / "storage.json", {"version": old["version"] + 1,
+                    "row_count": count, "bytes": size})
+                if count >= MAX_ROWS or size >= MAX_STORAGE_BYTES:
+                    _degrade("storage_budget_reached", stream=stream)
+        except Exception:
+            _degrade("worker_start_error", write=True, stream=stream)
+    last_health = 0.0
     while True:
-        capture = None
-        try:
-            capture = _queue.get(timeout=30)
-            _persist(capture)
-        except queue.Empty:
-            pass
-        except Exception:
-            _degrade("record_write_error", write=True, dropped=capture is not None)
-        finally:
-            if capture is not None:
-                _queue.task_done()
-        try:
-            _publish_health()
-        except Exception:
-            _degrade("health_write_error", write=True)
+        handled = False
+        for stream, target in (("predictors", _queue), ("receipts", _receipt_queue), ("outcomes", _outcome_queue)):
+            value = None
+            try:
+                value = target.get(timeout=0.25 if stream == "predictors" else 0)
+                handled = True
+                _write_stream(stream, value)
+            except queue.Empty:
+                pass
+            except Exception:
+                _degrade("worker_queue_error", write=True, dropped=value is not None, stream=stream)
+            finally:
+                if value is not None:
+                    target.task_done()
+        if handled or time.monotonic() - last_health >= 30:
+            try:
+                _publish_health()
+                last_health = time.monotonic()
+            except Exception:
+                _degrade("health_write_error", write=True)
 
 
-def start_worker(root=ROOT, safe_config=None):
+def flush(timeout=5.0):
+    """Clean stop에서만 큐가 비워질 때까지 bounded 대기한다."""
+    deadline = time.monotonic() + max(0.0, min(float(timeout), 30.0))
+    while any(target.unfinished_tasks for target in (_queue, _receipt_queue, _outcome_queue)):
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.01)
+    return True
+
+
+def start_worker(root=ROOT, safe_config=None, *, role="monitor"):
     """monitor 시작 때만 daemon을 만든다. 거래 경로에서는 호출하지 않는다."""
-    global _worker, _root
+    global _worker, _root, _role
     try:
         with _worker_lock:
             if _worker and _worker.is_alive():
                 return
+            if role not in ("monitor", "risk-manager"):
+                return
             _root = Path(root)
-            _worker = threading.Thread(target=_run, args=(safe_config,), daemon=True, name="entry-telemetry")
+            _role = role
+            # startup에서 marker/build/config를 먼저 검증해 첫 신호 수집 race를 없앤다.
+            # 거래 hot path에는 파일 I/O와 기다림을 추가하지 않는다.
+            if not _initialize(safe_config):
+                return
+            _worker = threading.Thread(target=_run, args=(safe_config, True), daemon=True, name="entry-telemetry")
             _worker.start()
     except Exception:
         _degrade("worker_launch_error", write=True)

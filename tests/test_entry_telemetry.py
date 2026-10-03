@@ -19,6 +19,7 @@ STAMP = "2026-10-03T00:00:00+00:00"
 
 def race_writer(root, start, connection):
     telemetry._root = Path(root)
+    telemetry._epoch = {"telemetry_epoch_id": "offline-epoch", "start_utc": STAMP, "start_event_seq": 0, "build": {"source_digest": "offline-source"}}
     telemetry._provenance = {"session_id": "race"}
     capture = telemetry.begin_signal(mint="mint", route_type="B", signal_detected_at=STAMP)
     telemetry.finish(capture, outcome="BUY", trade_id="trade", event_seq=1)
@@ -37,6 +38,10 @@ class EntryTelemetryTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name)
         self.patches = [patch.object(telemetry, "_root", self.root),
+            patch.object(telemetry, "_epoch", {"telemetry_epoch_id": "offline-epoch", "start_utc": STAMP, "start_event_seq": 0, "build": {"source_digest": "offline-source"}}),
+            patch.object(telemetry, "_load_epoch", return_value={"telemetry_epoch_id": "offline-epoch", "start_utc": STAMP, "start_event_seq": 0, "build": {"source_digest": "offline-source"}}),
+            patch.object(telemetry, "_receipt_queue", queue.Queue(maxsize=16)),
+            patch.object(telemetry, "_outcome_queue", queue.Queue(maxsize=16)),
             patch.object(telemetry, "_queue", queue.Queue(maxsize=16)),
             patch.object(telemetry, "_provenance", {"session_id": "test", "git_sha": "sha"}),
             patch.object(telemetry, "_health", {"status": "TELEMETRY_READY", "dropped_row_count": 0,
@@ -52,7 +57,7 @@ class EntryTelemetryTests(unittest.TestCase):
 
     def write(self, capture):
         telemetry._persist(capture)
-        return json.loads(next((self.root / "data/research/entry_telemetry/rows").glob("*.json")).read_text(encoding="utf-8"))
+        return json.loads(next((self.root / "data/research/entry_telemetry/epochs/offline-epoch/predictors/2026-10-03").glob("*.json")).read_text(encoding="utf-8"))
 
     def test_signal_identity_is_deterministic_and_signature_is_hashed(self):
         a = self.capture(source_wallet="wallet", source_signature="signature")
@@ -109,7 +114,7 @@ class EntryTelemetryTests(unittest.TestCase):
         self.assertIsNone(row["predictors"]["counters"]["rpc_attempt_count"])
         self.assertNotIn("paper_buy_created_at", row["predictors"]["timestamps"])
         self.assertNotIn("decision", row["predictors"]["sections"])
-        self.assertEqual(row["execution_receipt"]["trade_id"], "position")
+        self.assertEqual(telemetry._receipt_row(capture)["execution_receipt"]["trade_id"], "position")
         self.assertEqual(row["decision"]["outcome"], "BUY")
 
     def test_future_and_secret_fields_recursively_rejected(self):
@@ -139,8 +144,8 @@ class EntryTelemetryTests(unittest.TestCase):
         telemetry.finish(capture, outcome="REJECT_ANALYZER")
         row = self.write(capture)
         self.assertEqual(row["decision"]["outcome"], "REJECT_ANALYZER")
-        self.assertIsNone(row["execution_receipt"]["trade_id"])
-        self.assertIsNone(row["execution_receipt"]["event_seq"])
+        self.assertIsNone(row["identity"]["trade_id"])
+        self.assertIsNone(row["identity"]["event_seq"])
 
     def test_actual_buy_receipt_cannot_be_reclassified_by_later_control_error(self):
         capture = self.capture()
@@ -180,7 +185,7 @@ class EntryTelemetryTests(unittest.TestCase):
         for index in range(17):
             telemetry.finish(self.capture(mint=str(index)), outcome="BUY", trade_id=str(index))
         self.assertEqual(telemetry._queue.qsize(), 16)
-        self.assertEqual(telemetry._health["dropped_row_count"], 1)
+        self.assertEqual(telemetry._health["streams"]["predictors"]["dropped_row_count"], 1)
         self.assertEqual(telemetry._health["status"], "TELEMETRY_DEGRADED")
         self.assertEqual(telemetry._health["last_error"], "queue_full")
 
@@ -192,9 +197,9 @@ class EntryTelemetryTests(unittest.TestCase):
             second = self.capture()
             telemetry.finish(second, outcome="BUY", trade_id="trade", event_seq=1)
             telemetry._persist(second)
-        path = next((self.root / "data/research/entry_telemetry/rows").glob("*.json"))
+        path = next((self.root / "data/research/entry_telemetry/epochs/offline-epoch/predictors/2026-10-03").glob("*.json"))
         self.assertEqual(json.loads(path.read_text(encoding="utf-8")), first)
-        self.assertEqual(telemetry._health["duplicate_count"], 1)
+        self.assertEqual(telemetry._health["streams"]["predictors"]["duplicate_count"], 1)
         self.assertEqual(json.loads((path.parent.parent / "storage.json").read_text())["row_count"], 1)
 
     def test_conflicting_identity_receipt_never_overwrites(self):
@@ -210,7 +215,7 @@ class EntryTelemetryTests(unittest.TestCase):
         capture = self.capture()
         telemetry.finish(capture, outcome="BUY")
         self.write(capture)
-        path = next((self.root / "data/research/entry_telemetry/rows").glob("*.json"))
+        path = next((self.root / "data/research/entry_telemetry/epochs/offline-epoch/predictors/2026-10-03").glob("*.json"))
         row = json.loads(path.read_text(encoding="utf-8"))
         row["identity"]["mint"] = "changed"
         path.write_text(json.dumps(row), encoding="utf-8")
@@ -221,7 +226,8 @@ class EntryTelemetryTests(unittest.TestCase):
         capture = self.capture()
         capture.sections["scores"]["raw_components"] = {"large": "x" * telemetry.MAX_ROW_BYTES}
         telemetry.finish(capture)
-        telemetry._persist(capture)
+        with patch.object(telemetry, "MAX_ROW_BYTES", 1):
+            telemetry._persist(capture)
         self.assertEqual(telemetry._health["last_error"], "row_too_large")
         self.assertFalse((self.root / "data").exists())
 
@@ -229,33 +235,31 @@ class EntryTelemetryTests(unittest.TestCase):
         capture = self.capture()
         with telemetry.bind(capture):
             telemetry.set_section("wallets", {"wallet_ids": list(range(2000))})
-            telemetry.set_section("scores", {"raw_components": {"value": float("nan"), "text": "x" * 10000}})
+            telemetry.set_section("scores", {"raw_components": {"volume": float("nan"), "volume_m5_usd": "x" * 10000}})
         self.assertEqual(len(capture.sections["wallets"]["wallet_ids"]), telemetry.MAX_ITEMS)
-        self.assertIsNone(capture.sections["scores"]["raw_components"]["value"])
-        self.assertEqual(len(capture.sections["scores"]["raw_components"]["text"]), telemetry.MAX_STRING)
+        self.assertIsNone(capture.sections["scores"]["raw_components"]["volume"])
+        self.assertEqual(len(capture.sections["scores"]["raw_components"]["volume_m5_usd"]), telemetry.MAX_STRING)
 
     def test_budget_failure_prevents_row_write(self):
         capture = self.capture()
         telemetry.finish(capture)
         with patch.object(telemetry, "atomic_write_json", side_effect=OSError("write")) as writer:
-            with self.assertRaises(OSError):
-                telemetry._persist(capture)
+            telemetry._persist(capture)
         self.assertEqual(writer.call_count, 1)
         self.assertEqual(writer.call_args.args[0].name, "storage.json")
-        self.assertFalse(list((self.root / "data/research/entry_telemetry/rows").glob("*.json")))
+        self.assertFalse(list((self.root / "data/research/entry_telemetry/epochs/offline-epoch/predictors/2026-10-03").glob("*.json")))
 
     def test_row_failure_retains_reservation_so_budget_is_conservative(self):
         capture = self.capture()
         telemetry.finish(capture)
         real = telemetry.atomic_write_json
         def writer(path, document):
-            if path.parent.name == "rows":
+            if path.parent.name == "2026-10-03":
                 raise OSError("record failed")
             real(path, document)
         with patch.object(telemetry, "atomic_write_json", side_effect=writer):
-            with self.assertRaises(OSError):
-                telemetry._persist(capture)
-        budget = json.loads((self.root / "data/research/entry_telemetry/storage.json").read_text())
+            telemetry._persist(capture)
+        budget = json.loads((self.root / "data/research/entry_telemetry/epochs/offline-epoch/predictors/storage.json").read_text())
         self.assertEqual(budget["row_count"], 1)
 
     def test_persistent_budget_is_shared_across_processes(self):
@@ -267,15 +271,15 @@ class EntryTelemetryTests(unittest.TestCase):
             telemetry.finish(second)
             telemetry._persist(second)
         self.assertEqual(telemetry._health["last_error"], "storage_budget_reached")
-        self.assertEqual(len(list((self.root / "data/research/entry_telemetry/rows").glob("*.json"))), 1)
+        self.assertEqual(len(list((self.root / "data/research/entry_telemetry/epochs/offline-epoch/predictors/2026-10-03").glob("*.json"))), 1)
 
     def test_storage_bytes_match_actual_atomic_file_including_newline(self):
         capture = self.capture()
         telemetry.finish(capture)
         self.write(capture)
-        directory = self.root / "data/research/entry_telemetry"
-        actual_size = next((directory / "rows").glob("*.json")).stat().st_size
-        budget = json.loads((directory / "storage.json").read_text())
+        directory = self.root / "data/research/entry_telemetry/epochs/offline-epoch"
+        actual_size = next((directory / "predictors/2026-10-03").glob("*.json")).stat().st_size
+        budget = json.loads((directory / "predictors/storage.json").read_text())
         self.assertEqual(budget["bytes"], actual_size)
         another = self.capture(mint="another")
         telemetry.finish(another)
@@ -295,15 +299,15 @@ class EntryTelemetryTests(unittest.TestCase):
         self.assertNotIn("RPC_URL", a["safe_config"])
         self.assertNotIn('"secret"', json.dumps(a))
         self.assertEqual(a["process_start_semantics"], "module initialization UTC")
-        self.assertEqual(a["telemetry_schema_version"], 1)
+        self.assertEqual(a["telemetry_schema_version"], 2)
 
     def test_health_storage_is_bounded_across_sessions_and_versioned(self):
         telemetry._publish_health()
         with patch.object(telemetry, "_session", "restarted"):
             telemetry._publish_health()
-        directory = self.root / "data/research/entry_telemetry"
-        self.assertEqual(len(list(directory.glob("health*.json"))), 1)
-        health = json.loads((directory / "health.json").read_text())
+        directory = self.root / "data/research/entry_telemetry/epochs/offline-epoch"
+        self.assertEqual(len(list((directory / "health").glob("*.json"))), 1)
+        health = json.loads((directory / "health/monitor.json").read_text())
         self.assertEqual(health["version"], 2)
         self.assertEqual(health["session_id"], "restarted")
 
@@ -337,7 +341,7 @@ class EntryTelemetryTests(unittest.TestCase):
                 pass
         with patch.object(telemetry, "_queue", OneQueue()), \
                 patch.object(telemetry, "_build_provenance", return_value={}), \
-                patch.object(telemetry, "_persist", side_effect=OSError("sensitive text")), \
+                patch.object(telemetry, "_persist_stream", side_effect=OSError("sensitive text")), \
                 patch.object(telemetry, "_publish_health") as health:
             with self.assertRaises(KeyboardInterrupt):
                 telemetry._run({})
@@ -349,7 +353,7 @@ class EntryTelemetryTests(unittest.TestCase):
         capture = self.capture()
         with telemetry.bind(capture):
             for index in range(8):
-                telemetry.set_section("scores", {"raw_components": {str(index): ["x" * 256] * 128}})
+                telemetry.set_section("wallets", {"wallet_ids": ["x" * 256] * 128})
         self.assertGreaterEqual(capture.safe_budget[0], 0)
         self.assertGreaterEqual(capture.safe_budget[1], 0)
         self.assertTrue(telemetry._row(capture)["collection_limits"]["capture_budget_exhausted"])
@@ -404,9 +408,9 @@ class EntryTelemetryTests(unittest.TestCase):
             for worker in workers:
                 worker.join(30)
                 self.assertEqual(worker.exitcode, 0)
-            directory = self.root / "data/research/entry_telemetry"
-            self.assertEqual(len(list((directory / "rows").glob("*.json"))), 1)
-            self.assertEqual(json.loads((directory / "storage.json").read_text())["row_count"], 1)
+            directory = self.root / "data/research/entry_telemetry/epochs/offline-epoch"
+            self.assertEqual(len(list((directory / "predictors/2026-10-03").glob("*.json"))), 1)
+            self.assertEqual(json.loads((directory / "predictors/storage.json").read_text())["row_count"], 1)
         finally:
             for worker in workers:
                 if worker.is_alive():

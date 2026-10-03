@@ -23,6 +23,12 @@ class EntryMonitorTelemetryTests(unittest.TestCase):
         self.addCleanup(self.stack.close)
         self.rows = queue.Queue(maxsize=16)
         self.stack.enter_context(patch.object(telemetry, "_queue", self.rows))
+        self.stack.enter_context(patch.object(telemetry, "_epoch", {
+            "telemetry_epoch_id": "offline-monitor", "start_utc": STAMP, "start_event_seq": 0}))
+        self.receipts = queue.Queue(maxsize=16)
+        self.stack.enter_context(patch.object(telemetry, "_receipt_queue", self.receipts))
+        self.stack.enter_context(patch.object(telemetry, "_outcome_queue", queue.Queue(maxsize=16)))
+        self.stack.enter_context(patch.object(monitor, "_service_stopping", False))
         self.stack.enter_context(patch.object(monitor, "_analysis_limit", asyncio.Semaphore(2)))
         self.stack.enter_context(patch.dict("os.environ", {
             "OBSERVATION_MODE": "false", "JUPITER_API_KEY": "",
@@ -50,7 +56,8 @@ class EntryMonitorTelemetryTests(unittest.TestCase):
 
     def run_signal(self, **kwargs):
         asyncio.run(monitor.process_paper_signal("MINT", 1000, 6, 2_000_000_000, "WALLET", "SIGNATURE", STAMP, **kwargs))
-        return telemetry._row(self.rows.get_nowait())
+        self.last_capture = self.rows.get_nowait()
+        return telemetry._row(self.last_capture)
 
     def test_actual_buy_is_unchanged_and_receipt_is_not_predictor(self):
         row = self.run_signal()
@@ -58,9 +65,11 @@ class EntryMonitorTelemetryTests(unittest.TestCase):
         self.assertEqual(self.buy.await_args.args, ("MINT", 50_000_000, 2500, 6))
         self.n3_submit.assert_called_once_with("POSITION", {"would_skip": True})
         self.assertEqual(row["decision"]["outcome"], "BUY")
-        self.assertEqual(row["execution_receipt"]["trade_id"], "POSITION")
-        self.assertIsNone(row["execution_receipt"]["event_seq"])
-        self.assertIn("paper_buy_created_at", row["execution_receipt"])
+        receipt = telemetry._receipt_row(self.receipts.get_nowait())
+        self.assertNotIn("execution_receipt", row)
+        self.assertEqual(receipt["execution_receipt"]["trade_id"], "POSITION")
+        self.assertIsNone(receipt["execution_receipt"]["event_seq"])
+        self.assertIn("paper_buy_created_at", receipt["execution_receipt"])
         self.assertNotIn("paper_buy_created_at", row["predictors"]["timestamps"])
         for key in ("final_pnl", "winner", "exit_reason", "mfe", "mae"):
             self.assertNotIn(key, str(row["predictors"]).lower())
@@ -120,7 +129,8 @@ class EntryMonitorTelemetryTests(unittest.TestCase):
         self.buy.side_effect = RuntimeError("capacity reached")
         row = self.run_signal()
         self.assertEqual(row["decision"]["outcome"], "REJECT_RISK")
-        self.assertIsNone(row["execution_receipt"]["trade_id"])
+        self.assertNotIn("execution_receipt", row)
+        self.assertTrue(self.receipts.empty())
         self.assertIsNotNone(row["predictors"]["timestamps"]["entry_decision_at"])
 
     def test_actual_semaphore_wait_and_timestamp_order_are_preserved(self):

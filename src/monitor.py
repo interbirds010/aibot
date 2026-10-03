@@ -9,6 +9,7 @@ import logging
 import math
 import os
 import subprocess
+import sys
 import time
 from collections import defaultdict, deque
 from dataclasses import dataclass
@@ -144,6 +145,7 @@ TEST_ALLOW_UNVERIFIED_WALLETS = False
 _analysis_limit = asyncio.Semaphore(2)
 _signal_tasks: set[asyncio.Task[None]] = set()
 _shadow_signal_tasks: set[asyncio.Task[None]] = set()
+_service_stopping = False
 _signal_task_created_count = 0
 _signal_task_completed_count = 0
 _shadow_signal_task_created_count = 0
@@ -821,7 +823,9 @@ def route_a_entry_multiplier(
 
 
 def trigger_wallet_feeder_if_needed(now: float | None = None) -> bool:
-    """감시 지갑 부족 시 두 시간에 한 번만 PM2 공급기를 비동기 기동한다."""
+    """감시 지갑 부족 시 두 시간에 한 번만 단발 공급기를 비동기 기동한다."""
+    if _service_stopping:
+        return False
     current = float(now if now is not None else time.time())
     try:
         active_count = state_store.get_active_wallets_count()
@@ -856,14 +860,21 @@ def trigger_wallet_feeder_if_needed(now: float | None = None) -> bool:
                 active_count,
             )
             return False
-        subprocess.Popen(
-            ["pm2", "start", "wallet_feeder"],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            close_fds=True,
-            start_new_session=True,
-        )
+        if sys.platform == "win32":
+            root = Path(__file__).resolve().parents[1]
+            subprocess.Popen(
+                [sys.executable, str(root / "scripts" / "local_paper_runner.py"),
+                 "start", "wallet-feeder", "--python", sys.executable],
+                cwd=root, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL, close_fds=True,
+                creationflags=subprocess.CREATE_NO_WINDOW,
+            )
+        else:
+            subprocess.Popen(
+                ["pm2", "start", "wallet_feeder"],
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL, close_fds=True, start_new_session=True,
+            )
         logger.warning(
             "wallet feeder started asynchronously: active_wallets=%s "
             "target_wallets=%s trigger_threshold=%s",
@@ -873,7 +884,7 @@ def trigger_wallet_feeder_if_needed(now: float | None = None) -> bool:
         )
         return True
     except FileNotFoundError:
-        logger.exception("wallet feeder trigger failed: pm2 executable not found")
+        logger.exception("wallet feeder trigger failed: executable not found")
     except Exception:
         logger.exception("wallet feeder trigger failed")
     return False
@@ -1029,6 +1040,8 @@ async def process_paper_signal(
     _entry_telemetry_price_usd: float | None = None,
 ) -> None:
     """기존 신호 흐름에 작은 연구 envelope만 연결한다."""
+    if _service_stopping and asyncio.current_task() not in _signal_tasks:
+        return
     capture = _entry_hook(
         "begin_signal", mint=mint, route_type=requested_route,
         signal_detected_at=signal_detected_at, source_wallet=wallet,
@@ -1709,6 +1722,8 @@ def schedule_paper_signal(
     prefilter_reasons: tuple[str, ...] = (),
     discovery_source: str = DISCOVERY_SOURCE_HELIUS,
 ) -> None:
+    if _service_stopping:
+        return
     if prefilter_reasons and len(_shadow_signal_tasks) >= MAX_PENDING_SHADOW_SIGNALS:
         logger.warning(
             "shadow candidate backlog full: mint=%s pending=%s limit=%s",
@@ -3403,10 +3418,17 @@ async def run_forever(settings: MonitorSettings) -> None:
             )
             heartbeat_task = asyncio.create_task(monitor_heartbeat(len(wallets)))
             refresh_task = asyncio.create_task(subscription_refresh_timer())
-            done, pending = await asyncio.wait(
-                {monitor_task, watcher_task, heartbeat_task, refresh_task},
-                return_when=asyncio.FIRST_COMPLETED,
-            )
+            connection_tasks = {monitor_task, watcher_task, heartbeat_task, refresh_task}
+            try:
+                done, pending = await asyncio.wait(
+                    connection_tasks, return_when=asyncio.FIRST_COMPLETED,
+                )
+            except BaseException:
+                # 부모 수집을 닫을 때 detached WSS 작업도 끝낸 뒤 Paper 작업을 drain한다.
+                for task in connection_tasks:
+                    task.cancel()
+                await asyncio.gather(*connection_tasks, return_exceptions=True)
+                raise
             with phase_memory(
                 "ws_refresh_reconnect",
                 metadata={
@@ -3579,6 +3601,56 @@ async def failure_memory_counter_loop() -> None:
         await asyncio.sleep(1.0)
 
 
+async def _wait_for_clean_stop() -> None:
+    from src.research import entry_telemetry_epoch
+
+    root = Path(__file__).resolve().parents[1]
+    while True:
+        try:
+            requested = await asyncio.to_thread(
+                entry_telemetry_epoch.stop_requested, root, "monitor",
+                session_id=entry_telemetry._session,
+            )
+        except Exception:
+            # 정지 감시 오류를 Control 종료 요청으로 해석하지 않는다.
+            requested = False
+        if requested:
+            return
+        await asyncio.sleep(1.0)
+
+
+async def _run_service_tasks(coroutines) -> None:
+    """명시적 종료 요청 때 신규 수집을 닫고 기존 진입 작업을 끝낸다."""
+    global _service_stopping
+    tasks = [asyncio.create_task(item) for item in coroutines]
+    group = asyncio.gather(*tasks)
+    shutdown = asyncio.create_task(_wait_for_clean_stop())
+    try:
+        done, _ = await asyncio.wait({group, shutdown}, return_when=asyncio.FIRST_COMPLETED)
+        if group in done:
+            await group
+            return
+        await shutdown
+        _service_stopping = True
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        await asyncio.gather(*list(_signal_tasks), return_exceptions=True)
+    finally:
+        shutdown.cancel()
+        await asyncio.gather(shutdown, return_exceptions=True)
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        # gather의 취소 결과도 회수한다.
+        if group.done():
+            try:
+                group.exception()
+            except asyncio.CancelledError:
+                pass
+
+
 async def run_service() -> None:
     from src.observation_tracker import (
         approved_signal_paper_mode_enabled,
@@ -3616,13 +3688,13 @@ async def run_service() -> None:
     failure_sampler = start_failure_sampler()
     failure_counter_task = asyncio.create_task(failure_memory_counter_loop())
     try:
-        await asyncio.gather(
+        await _run_service_tasks([
             run_forever(settings),
             performance_loop(),
             run_market_momentum_route(settings),
             monitor_maintenance_loop(),
             observation_supervisor() if observation_mode else asyncio.Event().wait(),
-        )
+        ])
     finally:
         failure_counter_task.cancel()
         await asyncio.gather(failure_counter_task, return_exceptions=True)
@@ -3635,17 +3707,9 @@ async def run_service() -> None:
 def main() -> None:
     configure_safe_logging()
     try:
-        entry_telemetry.start_worker(safe_config={
-            "paper_buy_basis_points": PAPER_BUY_BASIS_POINTS,
-            "single_strength_lamports": SINGLE_STRENGTH_LAMPORTS,
-            "momentum_min_volume_m5_usd": MOMENTUM_MIN_VOLUME_M5_USD,
-            "momentum_min_net_buys_m5": MOMENTUM_MIN_NET_BUYS_M5,
-            "momentum_min_buy_sell_ratio": MOMENTUM_MIN_BUY_SELL_RATIO,
-            "momentum_min_liquidity_usd": MOMENTUM_MIN_LIQUIDITY_USD,
-            "momentum_min_pair_age_seconds": MOMENTUM_MIN_PAIR_AGE_SECONDS,
-            "route_b_min_safety_score": ROUTE_B_MIN_SAFETY_SCORE,
-            "unknown_whale_min_count": UNKNOWN_WHALE_MIN_COUNT,
-        })
+        from src.research import entry_telemetry_epoch
+        load_dotenv()
+        entry_telemetry.start_worker(safe_config=entry_telemetry_epoch.safe_runtime_config())
     except Exception as exc:
         logger.warning("TELEMETRY_DEGRADED startup; Control 유지 category=%s", type(exc).__name__)
     try:
@@ -3656,6 +3720,16 @@ def main() -> None:
         asyncio.run(run_service())
     finally:
         flush_phase_memory_telemetry()
+        try:
+            from src.research import entry_telemetry_epoch
+            drained = entry_telemetry.flush(timeout=5.0)
+            if _service_stopping:
+                entry_telemetry_epoch.acknowledge_stopped(
+                    Path(__file__).resolve().parents[1], "monitor",
+                    session_id=entry_telemetry._session, drained=drained,
+                )
+        except Exception as exc:
+            logger.warning("TELEMETRY_DEGRADED stop; Control 종료 유지 category=%s", type(exc).__name__)
 
 
 if __name__ == "__main__":

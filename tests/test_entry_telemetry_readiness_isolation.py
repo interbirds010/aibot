@@ -30,16 +30,20 @@ class EntryTelemetryReadinessIsolationTests(unittest.TestCase):
             with patch.object(telemetry, "_root", root), patch.object(
                 telemetry, "_queue", queue.Queue(maxsize=16)
             ), patch.object(telemetry, "_provenance", {"session_id": "offline"}):
-                capture = telemetry.begin_signal(
-                    mint="offline-mint", route_type="B",
-                    signal_detected_at="2026-10-03T00:00:00+00:00",
-                )
-                telemetry.finish(capture, outcome="BUY", trade_id="offline-trade")
-                telemetry._persist(capture)
-                telemetry._publish_health()
+                with patch.object(telemetry, "_epoch", {"telemetry_epoch_id": "offline-isolation",
+                        "start_utc": "2026-10-03T00:00:00+00:00", "start_event_seq": 0}), \
+                        patch.object(telemetry, "_receipt_queue", queue.Queue(maxsize=16)), \
+                        patch.object(telemetry, "_outcome_queue", queue.Queue(maxsize=16)):
+                    capture = telemetry.begin_signal(
+                        mint="offline-mint", route_type="B",
+                        signal_detected_at="2026-10-03T00:00:00+00:00",
+                    )
+                    telemetry.finish(capture, outcome="BUY", trade_id="offline-trade")
+                    telemetry._persist(capture)
+                    telemetry._publish_health()
             for relative, content in protected.items():
                 self.assertEqual((root / relative).read_bytes(), content)
-            rows = list((root / "data/research/entry_telemetry/rows").glob("*.json"))
+            rows = list((root / "data/research/entry_telemetry/epochs/offline-isolation/predictors").glob("*/*.json"))
             self.assertEqual(len(rows), 1)
 
     def test_any_new_telemetry_source_changes_frozen_n3_build_identity(self):
@@ -78,7 +82,7 @@ class EntryTelemetryReadinessIsolationTests(unittest.TestCase):
         for legacy_seq in (9583, 9661):
             self.assertFalse(n3.eligible(manifest, {**buy, "event_seq": legacy_seq}))
 
-    def test_provenance_has_session_but_no_activation_epoch_binding(self):
+    def test_source_provenance_and_validated_stream_epoch_binding_are_separate(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / "src").mkdir()
@@ -90,12 +94,17 @@ class EntryTelemetryReadinessIsolationTests(unittest.TestCase):
                 document = telemetry._build_provenance({"TRADING_MODE": "paper"})
             self.assertEqual(document["session_id"], "offline-session")
             self.assertEqual(document["git_sha"], "offline-sha")
-            self.assertEqual(document["telemetry_schema_version"], 1)
+            self.assertEqual(document["telemetry_schema_version"], 2)
             self.assertEqual(document["config_scope"], "explicit non-secret allowlist only; not full environment")
             for missing in ("telemetry_epoch_id", "epoch_start_utc", "epoch_start_event_seq"):
                 self.assertNotIn(missing, document)
             self.assertEqual(document["source_digest"], telemetry._digest({
                 "src/test.py": hashlib.sha256(b"example = 1\n").hexdigest()}))
+            with patch.object(telemetry, "_epoch", {"telemetry_epoch_id": "validated-epoch"}), \
+                    patch.object(telemetry, "_provenance", document):
+                envelope = telemetry._envelope("predictor")
+                self.assertEqual(envelope["telemetry_epoch_id"], "validated-epoch")
+                self.assertEqual(envelope["session_id"], "offline-session")
 
 
 if __name__ == "__main__":

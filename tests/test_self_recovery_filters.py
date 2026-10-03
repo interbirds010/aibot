@@ -165,6 +165,7 @@ class WalletFeederTriggerTests(unittest.TestCase):
                 return_value=True,
             ),
             patch.object(monitor.subprocess, "Popen", return_value=process) as popen,
+            patch.object(monitor.sys, "platform", "linux"),
         ):
             self.assertTrue(monitor.trigger_wallet_feeder_if_needed(now=10_000))
         self.assertEqual(popen.call_args.args[0], ["pm2", "start", "wallet_feeder"])

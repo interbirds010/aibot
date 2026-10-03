@@ -52,6 +52,13 @@ def capture(kind, identity):
     return c
 
 
+def discard_receipts():
+    while True:
+        try: t._receipt_queue.get_nowait()
+        except queue.Empty: return
+        t._receipt_queue.task_done()
+
+
 def summary(samples):
     ordered = sorted(samples)
     return {"n": len(samples), "mean_us": statistics.mean(samples),
@@ -87,8 +94,8 @@ def measure(live_root):
               "duplicate_count": 0, "conflict_count": 0, "last_error": None}
     with tempfile.TemporaryDirectory(prefix="aibot-telemetry-readiness-") as temporary:
         root = Path(temporary)
-        with patch.object(t, "_root", root), patch.object(t, "_queue", queue.Queue(maxsize=16)), \
-                patch.object(t, "_health", health):
+        with patch.object(t, "_epoch", {"telemetry_epoch_id": "offline-epoch", "start_utc": STAMP, "start_event_seq": 0}), patch.object(t, "_root", root), patch.object(t, "_queue", queue.Queue(maxsize=16)), \
+                patch.object(t, "_health", health), patch.object(t, "_receipt_queue", queue.Queue(maxsize=16)), patch.object(t, "_outcome_queue", queue.Queue(maxsize=16)):
             # provenance 실제 구현으로 후보 소스 fingerprint. temporary writer 경로와 분리한다.
             with patch.object(t, "_root", Path(__file__).resolve().parents[1]):
                 provenance = t._build_provenance({"TRADING_MODE": "PAPER"})
@@ -97,17 +104,18 @@ def measure(live_root):
                 rows = {}
                 for kind in kinds:
                     c = capture(kind, kind)
-                    t._queue.get_nowait(); t._queue.task_done()
+                    t._queue.get_nowait(); t._queue.task_done(); discard_receipts()
                     doc = t._row(c)
                     sealed = {**doc, "content_hash": t._digest(doc)}
                     started = time.perf_counter_ns(); t._persist(c)
                     elapsed = (time.perf_counter_ns() - started) / 1000
-                    path = root / "data/research/entry_telemetry/rows" / (c.identity["signal_id"] + ".json")
+                    path = root / "data/research/entry_telemetry/epochs/offline-epoch/predictors/2026-10-03" / (c.identity["signal_id"] + ".json")
                     rows[kind] = {"canonical_utf8_bytes": len(t._canonical(sealed).encode("utf-8")),
                         "disk_bytes": path.stat().st_size, "write_us": elapsed,
-                        "capture_budget_exhausted": doc["collection_limits"]["capture_budget_exhausted"]}
+                        "capture_budget_exhausted": doc["collection_limits"]["capture_budget_exhausted"],
+                        "receipt_disk_bytes": (t._record_path("receipts", t._receipt_row(c)).stat().st_size if c.receipt.get("trade_id") else 0)}
                 c = capture("normal_buy", "serialization")
-                t._queue.get_nowait(); t._queue.task_done()
+                t._queue.get_nowait(); t._queue.task_done(); discard_receipts()
                 serial = []
                 for _ in range(1000):
                     start = time.perf_counter_ns(); doc=t._row(c); t._canonical(doc); t._digest(doc)
@@ -116,15 +124,31 @@ def measure(live_root):
                 for i in range(1000):
                     c = t.begin_signal(mint="offline-mint", route_type="B", signal_detected_at=STAMP, signal_id=str(i))
                     start=time.perf_counter_ns(); t.finish(c); enqueue.append((time.perf_counter_ns()-start)/1000)
-                    t._queue.get_nowait(); t._queue.task_done()
+                    t._queue.get_nowait(); t._queue.task_done(); discard_receipts()
+                receipt_enqueue = []
+                outcome_enqueue = []
+                outcome_serial = []
+                for i in range(1000):
+                    start=time.perf_counter_ns(); t._receipt_queue.put_nowait(c)
+                    receipt_enqueue.append((time.perf_counter_ns()-start)/1000)
+                    discard_receipts()
+                    mapping={"trade_id":"offline-outcome-"+str(i),"mint":"offline-mint","route_type":"B",
+                        "strategy_family":"dex_momentum_b","signal_detected_at":STAMP,"buy_event_seq":1,"event_seq":2,
+                        "completed_at":STAMP,"exit_reason":"offline-fixture", "realized_pnl_lamports":7,
+                        "sell_legs":[{"event_seq":2,"proceeds_lamports":100,"realized_pnl_lamports":7}]}
+                    start=time.perf_counter_ns(); t.submit_outcome(mapping)
+                    outcome_enqueue.append((time.perf_counter_ns()-start)/1000)
+                    value=t._outcome_queue.get_nowait(); t._outcome_queue.task_done()
+                    start=time.perf_counter_ns(); doc=t._outcome_row(value); t._canonical(doc); t._digest(doc)
+                    outcome_serial.append((time.perf_counter_ns()-start)/1000)
                 hot_path = []
                 for i in range(1000):
                     start=time.perf_counter_ns(); capture("normal_buy", "capture-"+str(i))
                     hot_path.append((time.perf_counter_ns()-start)/1000)
-                    t._queue.get_nowait(); t._queue.task_done()
+                    t._queue.get_nowait(); t._queue.task_done(); discard_receipts()
                 write = []
                 for i in range(100):
-                    c = capture("normal_buy", "write-"+str(i)); t._queue.get_nowait(); t._queue.task_done()
+                    c = capture("normal_buy", "write-"+str(i)); t._queue.get_nowait(); t._queue.task_done(); discard_receipts()
                     start=time.perf_counter_ns(); t._persist(c); t._publish_health()
                     write.append((time.perf_counter_ns()-start)/1000)
                 # 기존 worker의 persist+health 경로를 별도 offline consumer로 재현한다.
@@ -133,11 +157,11 @@ def measure(live_root):
                     while not stopping.is_set() or not t._queue.empty():
                         try: item=t._queue.get(timeout=0.01)
                         except queue.Empty: continue
-                        t._persist(item); t._publish_health(); drain_count[0]+=1; t._queue.task_done()
+                        t._persist(item); t._publish_health(); drain_count[0]+=1; t._queue.task_done(); discard_receipts()
                 consumer=threading.Thread(target=consume); consumer.start()
                 start=time.perf_counter()
                 for i in range(64):
-                    capture("normal_buy", "burst-"+str(i)); max_depth=max(max_depth,t._queue.qsize())
+                    capture("normal_buy", "burst-"+str(i)); discard_receipts(); max_depth=max(max_depth,t._queue.qsize())
                 stopping.set(); consumer.join(30)
                 if consumer.is_alive(): raise RuntimeError("offline consumer did not finish")
                 burst_seconds=time.perf_counter()-start
@@ -147,6 +171,9 @@ def measure(live_root):
                     "fixture_upper_disk_bytes": max(r["disk_bytes"] for r in rows.values()),
                     "fixture_distribution_note": "five designed fixtures; upper estimate is not production p95",
                     "serialization": summary(serial), "enqueue_only": summary(enqueue),
+                    "receipt_queue_put_only": summary(receipt_enqueue), "outcome_capture_enqueue": summary(outcome_enqueue),
+                    "outcome_serialization": summary(outcome_serial),
+                    "worker_idle_semantics": "predictor wait 0.25sec before one receipt/outcome dequeue; idle outcome-only service ceiling about4/sec excludesdiskIO",
                     "full_fixture_capture_enqueue": summary(hot_path), "write_including_health": summary(write),
                     "writer_drain_rows_per_sec": 1000000/statistics.mean(write),
                     "burst": {"produced":64,"drained":drain_count[0],"dropped":health["dropped_row_count"],
