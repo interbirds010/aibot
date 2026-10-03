@@ -59,6 +59,9 @@ def validate_predictor(row):
             set(provenance.get("safe_config", {})) - t.CONFIG_FIELDS or \
             any(isinstance(v, (dict, list, tuple)) for v in provenance.get("safe_config", {}).values()):
         raise ValueError("provenance scalar/config allowlist violation")
+    safe_config = t.config_contract.validate_config(provenance.get("safe_config", {}))
+    if t.config_contract.config_fingerprint(safe_config) != provenance.get("config_fingerprint"):
+        raise ValueError("predictor config payload/fingerprint mismatch")
     signal_at = datetime.fromisoformat(identity["signal_detected_at"]).timestamp()
     for key in ("history", "pre_signal_snapshots"):
         for snapshot in features["sections"]["trajectory"].get(key) or []:
@@ -66,8 +69,9 @@ def validate_predictor(row):
                 raise ValueError("future trajectory snapshot")
 
 
-def inspect(root):
-    marker = epoch.require_epoch(root, config=epoch.safe_runtime_config())
+def inspect(root, *, config=None):
+    """전체 retained epoch 검증은 offline 메모리를 사용한다. runtime에서 호출하지 않는다."""
+    marker = epoch.require_epoch(root, config=epoch.safe_runtime_config() if config is None else config)
     epoch_id = marker["telemetry_epoch_id"]
     directory = epoch.directory(root) / "epochs" / epoch_id
     streams = {name: offline.load_stream(root, epoch_id, name) for name in offline.SCHEMAS}
@@ -85,6 +89,11 @@ def inspect(root):
             binding = read_immutable(directory / "sessions" / (hashlib.sha256(session.encode()).hexdigest() + ".json"))
             if not binding or any(binding.get(key) != row.get(key) for key in ("telemetry_epoch_id", "build_sha", "session_id")):
                 raise ValueError("runtime epoch/session association mismatch")
+            if binding.get("config_fingerprint") != marker["config_fingerprint"]:
+                raise ValueError("runtime session config mismatch")
+            safe_config = t.config_contract.validate_config(row["provenance"].get("safe_config", {}))
+            if t.config_contract.config_fingerprint(safe_config) != row["provenance"].get("config_fingerprint"):
+                raise ValueError("runtime config payload/fingerprint mismatch")
             if row["build_sha"] != marker["build_sha"] or row["provenance"].get("config_fingerprint") != marker["config_fingerprint"]:
                 raise ValueError("runtime build/config mismatch")
             signal_at = datetime.fromisoformat(row["identity"]["signal_detected_at"])
@@ -115,10 +124,10 @@ def inspect(root):
                                 any(leg.get(k) != actual.get(k) for k in t.SELL_FIELDS):
                             raise ValueError("completed outcome SELL leg mismatch")
     def first(name, predicate=lambda row: True):
-        eligible = [row for row in streams[name] if predicate(row)]
-        if not eligible:
+        row = min((row for row in streams[name] if predicate(row)),
+                  key=lambda item: t._record_path(name, item).stat().st_mtime_ns, default=None)
+        if row is None:
             return {"status": "PENDING", "reason": "natural event not recorded yet"}
-        row = min(eligible, key=lambda item: t._record_path(name, item).stat().st_mtime_ns)
         return {"status": "PASS", "identity": row["identity"], "schema_version": row["schema_version"],
                 "path": str(t._record_path(name, row))}
     # File paths are evaluated against this inspected epoch, not module default runtime.
@@ -162,7 +171,9 @@ def main():
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
     try:
-        result = inspect(args.root.resolve())
+        # Runner 모드 override 후 dotenv를 읽어 실제 monitor/risk와 같은 설정을 비교한다.
+        from scripts.entry_telemetry_cutover import _paper_config
+        result = inspect(args.root.resolve(), config=_paper_config(args.root.resolve()))
     except Exception as error:
         result = {"status": "FAIL", "reason": str(error), "category": type(error).__name__}
     if args.output:

@@ -97,7 +97,7 @@ class EntryTelemetryReadinessFailureTests(unittest.TestCase):
         self.assertEqual(health["dropped_row_count"], 1)
         self.assertEqual(health["last_error"], "record_write_error")
 
-    def test_actual_row_write_failure_keeps_reserved_budget_until_restart(self):
+    def test_actual_row_write_failure_keeps_identity_reservation_after_restart(self):
         original = telemetry.atomic_write_json
         def fail_row(path, document):
             if path.parent.name == "2026-10-03":
@@ -105,9 +105,11 @@ class EntryTelemetryReadinessFailureTests(unittest.TestCase):
             return original(path, document)
         with patch.object(telemetry, "atomic_write_json", side_effect=fail_row):
             self.run_one(self.capture())
-        self.assertEqual(json.loads((self.directory / "predictors/storage.json").read_text())["row_count"], 1)
+        index = next((self.directory / "predictors/_identity").glob("*/*.json"))
+        before = index.read_bytes()
         self.run_one(None)
-        self.assertEqual(json.loads((self.directory / "predictors/storage.json").read_text())["row_count"], 0)
+        self.assertEqual(index.read_bytes(), before)
+        self.assertEqual(json.loads(before)["index_schema_version"], 1)
 
     def test_malformed_existing_row_is_preserved_and_fails_closed(self):
         capture = self.capture()
@@ -118,7 +120,7 @@ class EntryTelemetryReadinessFailureTests(unittest.TestCase):
         self.run_one(capture)
         self.assertEqual(path.read_bytes(), partial)
         self.assertEqual(self.health()["dropped_row_count"], 1)
-        self.assertEqual(self.health()["last_error"], "record_write_error")
+        self.assertEqual(self.health()["last_error"], "immutable_content_corrupt")
 
     def test_valid_json_with_invalid_seal_is_preserved_and_reports_conflict(self):
         capture = self.capture()
@@ -185,17 +187,16 @@ class EntryTelemetryReadinessFailureTests(unittest.TestCase):
         self.assertEqual(len(list((self.directory / "predictors/2026-10-03").glob("*.json"))), 1)
         self.assertTrue(lock.exists())
 
-    def test_malformed_storage_budget_is_not_silently_reset(self):
-        self.directory.mkdir(parents=True)
+    def test_obsolete_storage_budget_is_preserved_and_not_used(self):
         path = self.directory / "predictors/storage.json"
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(b'{"version":')
+        before = b'{"version":'
+        path.write_bytes(before)
         self.run_one(self.capture())
-        self.assertEqual(path.read_bytes(), b'{"version":')
-        health = self.health()
-        self.assertEqual(health["write_error_count"], 2)
-        self.assertEqual(health["dropped_row_count"], 1)
-        self.assertFalse(list((self.directory / "predictors/2026-10-03").glob("*.json")))
+        self.assertEqual(path.read_bytes(), before)
+        self.assertEqual(self.health()["write_error_count"], 0)
+        self.assertEqual(self.health()["dropped_row_count"], 0)
+        self.assertEqual(len(list((self.directory / "predictors/2026-10-03").glob("*.json"))), 1)
 
     def test_atomic_replace_failure_leaves_no_partial_final_row_or_temp_file(self):
         capture = self.capture()
@@ -217,8 +218,8 @@ class EntryTelemetryReadinessFailureTests(unittest.TestCase):
         fragment.write_bytes(b'{"schema_version":')
         self.run_one(self.capture())
         self.assertEqual(len(list(rows.glob("*.json"))), 1)
-        self.assertEqual(json.loads((self.directory / "predictors/storage.json").read_text())["row_count"], 1)
-        # 다른 이름의 최근 임시 파일은 보존되며 budget에는 포함하지 않는다.
+        self.assertEqual(len(list((self.directory / "predictors/_identity").glob("*/*.json"))), 1)
+        # 다른 이름의 임시 파일은 보존되며 정상 row로 읽지 않는다.
         self.assertTrue(fragment.exists())
 
     def child(self, code, *args):

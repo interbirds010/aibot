@@ -88,6 +88,21 @@ def stopped_proof(root: Path) -> dict:
             "verified_by_pid": os.getpid()}
 
 
+def _paper_config(root: Path) -> dict:
+    """미래 runner/dotenv 우선순위를 재현하되 호출자 환경을 바꾸지 않는다."""
+    from dotenv import dotenv_values
+    from dotenv.variables import parse_variables
+    from src.research.entry_telemetry_config import effective_config
+    launch_environment = runner.paper_environment(root)
+    configured = dotenv_values(Path(root) / ".env", interpolate=False)
+    resolved = {}
+    for name, value in configured.items():
+        if value is not None:
+            interpolation_environment = {**resolved, **launch_environment}
+            resolved[name] = "".join(atom.resolve(interpolation_environment) for atom in parse_variables(value))
+    return effective_config({**resolved, **launch_environment})
+
+
 def _sessions(root: Path, marker: dict) -> dict:
     sessions = epoch.directory(root) / "epochs" / marker["telemetry_epoch_id"] / "sessions"
     return {binding["process_id"]: binding for path in sessions.glob("*.json")
@@ -98,7 +113,7 @@ def _sessions(root: Path, marker: dict) -> dict:
 def clean_stop(root: Path, python: Path, *, timeout: float = 120.0) -> dict:
     """후속 telemetry build의 협력 정지만 요청한다. 강제 종료 fallback은 없다."""
     epoch.n3_closed(root)
-    marker = epoch.require_epoch(root)
+    marker = epoch.require_epoch(root, config=_paper_config(root))
     bindings = _sessions(root, marker)
     registry = runner.read_json(root / "logs" / "local_runner.json", {})
     snapshot = runner.process_snapshot(root)
@@ -141,9 +156,7 @@ def resume(root: Path, python: Path) -> dict:
     """중지/상태 연속성/epoch 검증을 모두 통과한 후 기존 runner로 시작한다."""
     stopped_proof(root)
     epoch.validate_snapshot(root)
-    environment = runner.paper_environment(root)
-    os.environ.update(environment)
-    marker = epoch.require_epoch(root, config=epoch.safe_runtime_config())
+    marker = epoch.require_epoch(root, config=_paper_config(root))
     results = runner.manage(root, python, "start", runner.CORE_SERVICES)
     return {"telemetry_epoch_id": marker["telemetry_epoch_id"], "services": results,
             "acceptance": "PENDING natural predictor/reject/RPC_SKIP/BUY/completed events"}
@@ -167,7 +180,7 @@ def main() -> None:
             result = {"runtime_process_count": len(_active_processes(root)),
                       "epoch_created": (epoch.directory(root) / "active.json").exists()}
         elif args.action == "validate":
-            result = epoch.require_epoch(root, config=epoch.safe_runtime_config())
+            result = epoch.require_epoch(root, config=_paper_config(root))
         else:
             if not args.execute:
                 raise RuntimeError("Mutation requires explicit --execute after N3 closure")
@@ -176,8 +189,7 @@ def main() -> None:
             elif args.action == "snapshot":
                 result = epoch.create_snapshot(root, stopped_proof=stopped_proof(root))
             elif args.action == "create-epoch":
-                os.environ.update(runner.paper_environment(root))
-                result = epoch.create_epoch(root, config=epoch.safe_runtime_config(), stopped_proof=stopped_proof(root), new_activation=args.new_activation)
+                result = epoch.create_epoch(root, config=_paper_config(root), stopped_proof=stopped_proof(root), new_activation=args.new_activation)
             else:
                 result = resume(root, args.python)
         print(json.dumps(result, ensure_ascii=False))

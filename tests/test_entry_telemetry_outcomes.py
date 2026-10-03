@@ -154,7 +154,8 @@ class EntryTelemetryActualSplitOutcomeTests(unittest.TestCase):
             "_epoch": {"telemetry_epoch_id": "offline-epoch", "start_utc": STAMP, "start_event_seq": 1},
             "_queue": queue.Queue(maxsize=16), "_receipt_queue": queue.Queue(maxsize=16),
             "_outcome_queue": queue.Queue(maxsize=16),
-            "_provenance": {"session_id": "offline-session", "git_sha": "f" * 40},
+            "_provenance": {"session_id": "offline-session", "git_sha": "f" * 40,
+                            "config_fingerprint": telemetry._digest({})},
             "_health": {"status": "TELEMETRY_READY", "dropped_row_count": 0, "write_error_count": 0,
                         "duplicate_count": 0, "conflict_count": 0, "last_error": None},
         }.items():

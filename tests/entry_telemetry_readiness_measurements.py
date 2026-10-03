@@ -12,7 +12,7 @@ import threading
 import time
 from unittest.mock import patch
 
-from src.research import entry_telemetry as t
+from src.research import entry_telemetry as t, entry_telemetry_epoch as epoch
 
 STAMP = "2026-10-03T00:00:00+00:00"
 
@@ -98,7 +98,7 @@ def measure(live_root):
                 patch.object(t, "_health", health), patch.object(t, "_receipt_queue", queue.Queue(maxsize=16)), patch.object(t, "_outcome_queue", queue.Queue(maxsize=16)):
             # provenance 실제 구현으로 후보 소스 fingerprint. temporary writer 경로와 분리한다.
             with patch.object(t, "_root", Path(__file__).resolve().parents[1]):
-                provenance = t._build_provenance({"TRADING_MODE": "PAPER"})
+                provenance = t._build_provenance(epoch.safe_runtime_config())
             with patch.object(t, "_provenance", provenance):
                 kinds = ["minimal", "normal_buy", "wallet_rich", "reject", "bounded_stress"]
                 rows = {}
@@ -113,7 +113,9 @@ def measure(live_root):
                     rows[kind] = {"canonical_utf8_bytes": len(t._canonical(sealed).encode("utf-8")),
                         "disk_bytes": path.stat().st_size, "write_us": elapsed,
                         "capture_budget_exhausted": doc["collection_limits"]["capture_budget_exhausted"],
-                        "receipt_disk_bytes": (t._record_path("receipts", t._receipt_row(c)).stat().st_size if c.receipt.get("trade_id") else 0)}
+                        "receipt_disk_bytes": (t._record_path("receipts", t._receipt_row(c)).stat().st_size if c.receipt.get("trade_id") else 0),
+                        "predictor_index_bytes": t._identity_index_path("predictors", doc).stat().st_size,
+                        "receipt_index_bytes": (t._identity_index_path("receipts", t._receipt_row(c)).stat().st_size if c.receipt.get("trade_id") else 0)}
                 c = capture("normal_buy", "serialization")
                 t._queue.get_nowait(); t._queue.task_done(); discard_receipts()
                 serial = []
@@ -141,6 +143,11 @@ def measure(live_root):
                     value=t._outcome_queue.get_nowait(); t._outcome_queue.task_done()
                     start=time.perf_counter_ns(); doc=t._outcome_row(value); t._canonical(doc); t._digest(doc)
                     outcome_serial.append((time.perf_counter_ns()-start)/1000)
+                # 완료 outcome도 실제 임시 저장소에서 row/index bytes만 측정한다.
+                outcome_document = t._outcome_row(value)
+                t._persist_stream("outcomes", outcome_document)
+                outcome_disk = {"row_bytes": t._record_path("outcomes", outcome_document).stat().st_size,
+                    "index_bytes": t._identity_index_path("outcomes", outcome_document).stat().st_size}
                 hot_path = []
                 for i in range(1000):
                     start=time.perf_counter_ns(); capture("normal_buy", "capture-"+str(i))
@@ -166,7 +173,8 @@ def measure(live_root):
                 if consumer.is_alive(): raise RuntimeError("offline consumer did not finish")
                 burst_seconds=time.perf_counter()-start
                 result = {"measured_utc": datetime.now(timezone.utc).isoformat(), "platform": provenance["platform"],
-                    "build_sha": provenance["git_sha"], "rows": rows,
+                    "build_sha": provenance["git_sha"], "rows": rows, "completed_outcome_disk": outcome_disk,
+                    "config_key_count": len(provenance["safe_config"]),
                     "fixture_mean_disk_bytes": statistics.mean(r["disk_bytes"] for r in rows.values()),
                     "fixture_upper_disk_bytes": max(r["disk_bytes"] for r in rows.values()),
                     "fixture_distribution_note": "five designed fixtures; upper estimate is not production p95",

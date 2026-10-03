@@ -21,13 +21,12 @@ from uuid import uuid4
 
 from src.state_store import atomic_write_json, exclusive_file_lock, read_json
 from src.research import entry_predictor_schema as predictor_schema
+from src.research import entry_telemetry_config as config_contract
 
 ROOT = Path(__file__).resolve().parents[2]
 SCHEMA_VERSION = 2
 SCHEMAS = {"predictor": 2, "receipt": 1, "outcome": 1}
 MAX_ROW_BYTES = 64 * 1024
-MAX_ROWS = 4096
-MAX_STORAGE_BYTES = 128 * 1024 * 1024
 MAX_ITEMS = 128
 MAX_STRING = 256
 MAX_DEPTH = 5
@@ -89,11 +88,7 @@ DURATIONS = DURATIONS | frozenset({"quote_buy_request_duration_sec", "quote_buy_
     "quote_buy_retry_sleep_sec", "quote_exit_preflight_request_duration_sec", "quote_exit_preflight_reservation_duration_sec",
     "quote_exit_preflight_retry_sleep_sec", "quote_limiter_wait_duration_sec", "rpc_request_duration_sec",
     "rpc_retry_sleep_sec", "rpc_limiter_wait_duration_sec", "rpc_reservation_duration_sec", "rpc_reservation_queue_wait_sec"})
-CONFIG_FIELDS = frozenset({"TRADING_MODE", "OBSERVATION_MODE", "APPROVED_SIGNAL_PAPER_MODE",
-    "MAX_OPEN_POSITIONS", "PAPER_INITIAL_SOL", "JUPITER_MAX_CONCURRENCY", "JUPITER_MIN_REQUEST_INTERVAL_SEC"})
-CONFIG_FIELDS = CONFIG_FIELDS | frozenset({"paper_buy_basis_points", "single_strength_lamports",
-    "momentum_min_volume_m5_usd", "momentum_min_net_buys_m5", "momentum_min_buy_sell_ratio",
-    "momentum_min_liquidity_usd", "momentum_min_pair_age_seconds", "route_b_min_safety_score", "unknown_whale_min_count"})
+CONFIG_FIELDS = config_contract.CONFIG_KEYS
 OUTCOMES = frozenset({"BUY", "REJECT_ANALYZER", "REJECT_RISK", "QUOTE_FAILED", "RPC_SKIPPED", "OTHER"})
 _current: ContextVar = ContextVar("entry_telemetry", default=None)
 _queue: queue.Queue = queue.Queue(maxsize=16)
@@ -366,8 +361,7 @@ def _envelope(stream):
         "process_start_semantics", "telemetry_schema_version", "missing_reason")
     provenance = {key: predictor_schema.project(_provenance.get(key), predictor_schema.SCALAR, _safe)
         for key in provenance_fields}
-    provenance["safe_config"] = {key: _safe(value) for key, value in _provenance.get("safe_config", {}).items()
-        if key in CONFIG_FIELDS and not isinstance(value, (dict, list, tuple))}
+    provenance["safe_config"] = config_contract.project_config(_provenance.get("safe_config", {}))
     return {"schema_version": SCHEMAS[stream], f"{stream}_schema_version": SCHEMAS[stream],
         "telemetry_epoch_id": (_epoch or {}).get("telemetry_epoch_id"),
         "build_sha": _provenance.get("git_sha"), "session_id": _provenance.get("session_id"),
@@ -499,6 +493,23 @@ def _increment(stream, key):
             _health[key] += 1
 
 
+def _read_sealed(path, max_bytes=MAX_ROW_BYTES):
+    if path.stat().st_size > max_bytes:
+        raise ValueError("immutable_content_too_large")
+    value = read_json(path, {})
+    prior_hash = value.pop("content_hash", None)
+    if prior_hash != _digest(value):
+        raise ValueError("immutable_content_corrupt")
+    return value
+
+
+def _identity_index_path(stream, document):
+    identity = document["identity"]
+    key = identity["trade_id"] if stream == "outcomes" else identity["signal_id"]
+    digest = hashlib.sha256(key.encode("utf-8")).hexdigest()
+    return _directory() / stream / "_identity" / digest[:2] / (digest + ".json")
+
+
 def _persist_stream(stream, document):
     encoded = _canonical(document).encode("utf-8")
     content_hash = hashlib.sha256(encoded).hexdigest()
@@ -510,31 +521,49 @@ def _persist_stream(stream, document):
         return
     directory = _directory() / stream
     path = _record_path(stream, document)
-    # 각 stream의 lock/budget을 분리해 한 stream 장애를 격리한다.
+    index_path = _identity_index_path(stream, document)
+    reservation = {"index_schema_version": 1, "telemetry_epoch_id": document.get("telemetry_epoch_id"),
+        "stream": stream, "identity": document["identity"],
+        "record_relative_path": path.relative_to(directory).as_posix(), "record_content_hash": content_hash}
+    # 고정 크기 identity 조회로 날짜 간 중복을 막는다. 이력 스캔/용량 예약은 없다.
     with exclusive_file_lock(directory / "recorder", operation="entry_telemetry_append"):
+        if index_path.exists():
+            try:
+                index = _read_sealed(index_path, 4096)
+            except Exception:
+                _degrade("immutable_index_corrupt", conflict=True, dropped=True, stream=stream)
+                return
+            if any(index.get(key) != reservation[key] for key in
+                    ("index_schema_version", "telemetry_epoch_id", "stream", "identity", "record_relative_path")):
+                _degrade("immutable_identity_conflict", conflict=True, dropped=True, stream=stream)
+                return
+            # 예약 후 crash 복구는 최초 payload만 허용한다.
+            if not path.exists() and index.get("record_content_hash") != content_hash:
+                _degrade("immutable_reservation_conflict", conflict=True, dropped=True, stream=stream)
+                return
         if path.exists():
-            old = read_json(path, {})
-            prior_hash = old.pop("content_hash", None)
-            if prior_hash != _digest(old):
+            try:
+                old = _read_sealed(path)
+            except Exception:
                 _degrade("immutable_content_corrupt", conflict=True, dropped=True, stream=stream)
+                return
+            if index_path.exists() and index.get("record_content_hash") != _digest(old):
+                _degrade("immutable_index_record_conflict", conflict=True, dropped=True, stream=stream)
                 return
             if (old.get("identity") == document["identity"] and
                     all(old.get("execution_receipt", {}).get(key) == document.get("execution_receipt", {}).get(key)
                         for key in ("trade_id", "event_seq")) and
                     old.get("outcome", {}) == document.get("outcome", {}) and
                     old.get("decision", {}).get("outcome") == document.get("decision", {}).get("outcome")):
+                if not index_path.exists():
+                    reservation["record_content_hash"] = _digest(old)
+                    atomic_write_json(index_path, {**reservation, "content_hash": _digest(reservation)})
                 _increment(stream, "duplicate_count")
                 return
             _degrade("immutable_identity_conflict", conflict=True, dropped=True, stream=stream)
             return
-        budget_path = directory / "storage.json"
-        budget = read_json(budget_path, {"version": 0, "row_count": 0, "bytes": 0})
-        if budget["row_count"] >= MAX_ROWS or budget["bytes"] + byte_count > MAX_STORAGE_BYTES:
-            _degrade("storage_budget_reached", dropped=True, stream=stream)
-            return
-        # 예약을 먼저 저장한다. 행 쓰기 실패 시 재시작까지 보수적으로 용량을 차감한다.
-        atomic_write_json(budget_path, {"version": budget["version"] + 1, "row_count": budget["row_count"] + 1,
-            "bytes": budget["bytes"] + byte_count})
+        if not index_path.exists():
+            atomic_write_json(index_path, {**reservation, "content_hash": _digest(reservation)})
         atomic_write_json(path, sealed)
         _increment(stream, "written_count")
 
@@ -571,8 +600,9 @@ def _publish_health():
             "telemetry_epoch_id": _epoch["telemetry_epoch_id"],
             "stream_queues": {name: {"depth": target.qsize(), "capacity": target.maxsize} for name, target in
                 (("predictors", _queue), ("receipts", _receipt_queue), ("outcomes", _outcome_queue))},
-            "storage_limits": {"rows": MAX_ROWS, "bytes": MAX_STORAGE_BYTES, "row_bytes": MAX_ROW_BYTES},
-            "counter_semantics": "this recorder process/session; storage.json counts persistent rows"}
+            "storage_limits": {"rows": None, "bytes": None, "row_bytes": MAX_ROW_BYTES},
+            "storage_policy": "immutable individual JSON; signal KST day partitions; sharded identity index; no automatic deletion",
+            "counter_semantics": "this recorder process/session only; written_count counts successful row commits; persistent totals require offline enumeration"}
     with exclusive_file_lock(directory / "health", operation="entry_telemetry_health"):
         health_path = directory / "health" / (_role + ".json")
         prior = read_json(health_path, {"version": 0})
@@ -581,9 +611,9 @@ def _publish_health():
 
 
 def _build_provenance(config):
-    safe = {key: _safe(value) for key, value in (config or {}).items() if key in CONFIG_FIELDS}
+    safe = config_contract.project_config(config)
     result = {"git_sha": None, "source_digest": None, "config_fingerprint": _digest(safe), "safe_config": safe,
-        "config_scope": "explicit non-secret allowlist only; not full environment",
+        "config_scope": "effective non-secret settings contract v2; credentials and endpoint values excluded",
         "platform": sys.platform, "os": platform.system(), "python_version": platform.python_version(),
         "runtime": platform.python_implementation(), "process_id": os.getpid(), "session_id": _session,
         "process_start_timestamp": _process_start, "process_start_semantics": "module initialization UTC",
@@ -628,24 +658,7 @@ def _initialize(config):
 def _run(config, initialized=False):
     if not initialized and not _initialize(config):
         return
-    # 예약 후 crash가 난 공간은 restart에서 실제 immutable 파일 크기로 복구한다.
-    for stream in ("predictors", "receipts", "outcomes"):
-        try:
-            directory = _directory() / stream
-            with exclusive_file_lock(directory / "recorder", operation="entry_telemetry_budget"):
-                count = size = 0
-                for path in directory.glob("*/*.json"):
-                    count += 1
-                    size += path.stat().st_size
-                    if count > MAX_ROWS or size > MAX_STORAGE_BYTES:
-                        break
-                old = read_json(directory / "storage.json", {"version": 0})
-                atomic_write_json(directory / "storage.json", {"version": old["version"] + 1,
-                    "row_count": count, "bytes": size})
-                if count >= MAX_ROWS or size >= MAX_STORAGE_BYTES:
-                    _degrade("storage_budget_reached", stream=stream)
-        except Exception:
-            _degrade("worker_start_error", write=True, stream=stream)
+    # 재시작 시 전체 이력을 읽지 않는다. 각 identity 예약만 write 시 검증한다.
     last_health = 0.0
     while True:
         handled = False

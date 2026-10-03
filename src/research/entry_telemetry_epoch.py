@@ -6,7 +6,6 @@ import hashlib
 import os
 from pathlib import Path
 import platform
-import math
 import tempfile
 from uuid import UUID, uuid4
 
@@ -16,15 +15,11 @@ from src.research.n3_shadow import build_identity, digest, immutable, read_immut
 SCHEMAS = {"predictor": 2, "receipt": 1, "outcome": 1}
 STATE_FILES = ("paper_trades.json", "wallets.json", "wallet_performance.json", "global_metrics.json", "shadow_trades.json")
 _runtime_session_id = None
-CONFIG_KEYS = frozenset({"paper_buy_basis_points", "single_strength_lamports", "momentum_min_volume_m5_usd", "momentum_min_net_buys_m5", "momentum_min_buy_sell_ratio", "momentum_min_liquidity_usd", "momentum_min_pair_age_seconds", "route_b_min_safety_score", "unknown_whale_min_count"})
+from src.research.entry_telemetry_config import CONFIG_KEYS, effective_config, validate_config
 
 
 def _safe_config(config: dict) -> dict:
-    if not isinstance(config, dict) or set(config) - CONFIG_KEYS:
-        raise RuntimeError("Telemetry config must use explicit non-secret keys")
-    if any(isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) for value in config.values()):
-        raise RuntimeError("Telemetry config must contain finite numeric scalars")
-    return dict(config)
+    return validate_config(config)
 
 
 def _pointer(path: Path) -> dict:
@@ -50,14 +45,8 @@ def directory(root: Path) -> Path:
 
 
 def safe_runtime_config() -> dict:
-    """모니터의 실제 상수와 Paper 모드만 fingerprint에 포함한다."""
-    from src import monitor
-    names = {"paper_buy_basis_points": "PAPER_BUY_BASIS_POINTS", "single_strength_lamports": "SINGLE_STRENGTH_LAMPORTS",
-             "momentum_min_volume_m5_usd": "MOMENTUM_MIN_VOLUME_M5_USD", "momentum_min_net_buys_m5": "MOMENTUM_MIN_NET_BUYS_M5",
-             "momentum_min_buy_sell_ratio": "MOMENTUM_MIN_BUY_SELL_RATIO", "momentum_min_liquidity_usd": "MOMENTUM_MIN_LIQUIDITY_USD",
-             "momentum_min_pair_age_seconds": "MOMENTUM_MIN_PAIR_AGE_SECONDS", "route_b_min_safety_score": "ROUTE_B_MIN_SAFETY_SCORE",
-             "unknown_whale_min_count": "UNKNOWN_WHALE_MIN_COUNT"}
-    return {key: getattr(monitor, name) for key, name in names.items()}
+    """역할과 무관한 실제 non-secret 설정을 동일하게 추출한다."""
+    return effective_config()
 
 
 def n3_closed(root: Path) -> dict:

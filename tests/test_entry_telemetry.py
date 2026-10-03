@@ -200,7 +200,7 @@ class EntryTelemetryTests(unittest.TestCase):
         path = next((self.root / "data/research/entry_telemetry/epochs/offline-epoch/predictors/2026-10-03").glob("*.json"))
         self.assertEqual(json.loads(path.read_text(encoding="utf-8")), first)
         self.assertEqual(telemetry._health["streams"]["predictors"]["duplicate_count"], 1)
-        self.assertEqual(json.loads((path.parent.parent / "storage.json").read_text())["row_count"], 1)
+        self.assertEqual(len(list((path.parent.parent / "_identity").glob("*/*.json"))), 1)
 
     def test_conflicting_identity_receipt_never_overwrites(self):
         capture = self.capture()
@@ -240,50 +240,60 @@ class EntryTelemetryTests(unittest.TestCase):
         self.assertIsNone(capture.sections["scores"]["raw_components"]["volume"])
         self.assertEqual(len(capture.sections["scores"]["raw_components"]["volume_m5_usd"]), telemetry.MAX_STRING)
 
-    def test_budget_failure_prevents_row_write(self):
+    def test_identity_reservation_failure_prevents_row_write(self):
         capture = self.capture()
         telemetry.finish(capture)
         with patch.object(telemetry, "atomic_write_json", side_effect=OSError("write")) as writer:
             telemetry._persist(capture)
         self.assertEqual(writer.call_count, 1)
-        self.assertEqual(writer.call_args.args[0].name, "storage.json")
-        self.assertFalse(list((self.root / "data/research/entry_telemetry/epochs/offline-epoch/predictors/2026-10-03").glob("*.json")))
+        self.assertIn("_identity", writer.call_args.args[0].parts)
+        self.assertFalse(telemetry._record_path("predictors", telemetry._row(capture)).exists())
 
-    def test_row_failure_retains_reservation_so_budget_is_conservative(self):
+    def test_row_failure_preserves_immutable_identity_reservation(self):
         capture = self.capture()
         telemetry.finish(capture)
+        document = telemetry._row(capture)
         real = telemetry.atomic_write_json
-        def writer(path, document):
+        def writer(path, value):
             if path.parent.name == "2026-10-03":
                 raise OSError("record failed")
-            real(path, document)
+            real(path, value)
         with patch.object(telemetry, "atomic_write_json", side_effect=writer):
             telemetry._persist(capture)
-        budget = json.loads((self.root / "data/research/entry_telemetry/epochs/offline-epoch/predictors/storage.json").read_text())
-        self.assertEqual(budget["row_count"], 1)
+        index = telemetry._identity_index_path("predictors", document)
+        before = index.read_bytes()
+        reservation = json.loads(before)
+        self.assertEqual(reservation["record_content_hash"], telemetry._digest(document))
+        telemetry._persist(capture)
+        self.assertEqual(index.read_bytes(), before)
+        self.assertTrue(telemetry._record_path("predictors", document).exists())
 
-    def test_persistent_budget_is_shared_across_processes(self):
-        with patch.object(telemetry, "MAX_ROWS", 1):
-            first = self.capture(mint="first")
-            telemetry.finish(first)
-            self.write(first)
-            second = self.capture(mint="second")
-            telemetry.finish(second)
-            telemetry._persist(second)
-        self.assertEqual(telemetry._health["last_error"], "storage_budget_reached")
-        self.assertEqual(len(list((self.root / "data/research/entry_telemetry/epochs/offline-epoch/predictors/2026-10-03").glob("*.json"))), 1)
+    def test_old_epoch_storage_cap_metadata_does_not_limit_new_records(self):
+        directory = self.root / "data/research/entry_telemetry/epochs/offline-epoch/predictors"
+        directory.mkdir(parents=True)
+        old = directory / "storage.json"
+        old.write_text('{"version":1,"row_count":4096,"bytes":134217728}', encoding="utf-8")
+        before = old.read_bytes()
+        for mint in ("first", "second"):
+            capture = self.capture(mint=mint)
+            telemetry.finish(capture)
+            telemetry._persist(capture)
+        self.assertEqual(old.read_bytes(), before)
+        self.assertEqual(len(list((directory / "2026-10-03").glob("*.json"))), 2)
+        self.assertEqual(telemetry._health["dropped_row_count"], 0)
 
-    def test_storage_bytes_match_actual_atomic_file_including_newline(self):
+    def test_row_byte_bound_includes_actual_atomic_file_newline(self):
         capture = self.capture()
         telemetry.finish(capture)
         self.write(capture)
-        directory = self.root / "data/research/entry_telemetry/epochs/offline-epoch"
-        actual_size = next((directory / "predictors/2026-10-03").glob("*.json")).stat().st_size
-        budget = json.loads((directory / "predictors/storage.json").read_text())
-        self.assertEqual(budget["bytes"], actual_size)
+        row = telemetry._row(capture)
+        document = {**row, "content_hash": telemetry._digest(row)}
+        actual_size = telemetry._record_path("predictors", row).stat().st_size
+        self.assertEqual(actual_size, len(telemetry._canonical(document).encode()) + (2 if telemetry.os.name == "nt" else 1))
         another = self.capture(mint="another")
         telemetry.finish(another)
-        document = {**telemetry._row(another), "content_hash": telemetry._digest(telemetry._row(another))}
+        row = telemetry._row(another)
+        document = {**row, "content_hash": telemetry._digest(row)}
         size = len(telemetry._canonical(document).encode()) + (2 if telemetry.os.name == "nt" else 1)
         with patch.object(telemetry, "MAX_ROW_BYTES", size - 1):
             telemetry._persist(another)
@@ -410,7 +420,7 @@ class EntryTelemetryTests(unittest.TestCase):
                 self.assertEqual(worker.exitcode, 0)
             directory = self.root / "data/research/entry_telemetry/epochs/offline-epoch"
             self.assertEqual(len(list((directory / "predictors/2026-10-03").glob("*.json"))), 1)
-            self.assertEqual(json.loads((directory / "predictors/storage.json").read_text())["row_count"], 1)
+            self.assertEqual(len(list((directory / "predictors/_identity").glob("*/*.json"))), 1)
         finally:
             for worker in workers:
                 if worker.is_alive():

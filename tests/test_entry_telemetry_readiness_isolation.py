@@ -95,7 +95,7 @@ class EntryTelemetryReadinessIsolationTests(unittest.TestCase):
             self.assertEqual(document["session_id"], "offline-session")
             self.assertEqual(document["git_sha"], "offline-sha")
             self.assertEqual(document["telemetry_schema_version"], 2)
-            self.assertEqual(document["config_scope"], "explicit non-secret allowlist only; not full environment")
+            self.assertEqual(document["config_scope"], "effective non-secret settings contract v2; credentials and endpoint values excluded")
             for missing in ("telemetry_epoch_id", "epoch_start_utc", "epoch_start_event_seq"):
                 self.assertNotIn(missing, document)
             self.assertEqual(document["source_digest"], telemetry._digest({

@@ -4,14 +4,14 @@ from __future__ import annotations
 from datetime import datetime, timezone
 import hashlib
 import json
+import os
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Iterator
 
 SCHEMAS = {"predictors": ("predictor_schema_version", 2),
            "receipts": ("receipt_schema_version", 1),
            "outcomes": ("outcome_schema_version", 1)}
 MAX_ROW_BYTES = 64 * 1024
-MAX_STREAM_ROWS = 4096
 
 
 def _canonical(value: dict) -> bytes:
@@ -34,6 +34,9 @@ def _validate(document: dict, stream: str) -> None:
     if any(not isinstance(document.get(key), str) or not document[key]
            for key in ("telemetry_epoch_id", "build_sha", "session_id")):
         raise ValueError("telemetry provenance missing")
+    provenance = document.get("provenance")
+    if not isinstance(provenance, dict) or not isinstance(provenance.get("config_fingerprint"), str) or not provenance["config_fingerprint"]:
+        raise ValueError("telemetry config fingerprint missing")
     if stream == "predictors":
         if not isinstance(identity.get("signal_id"), str) or not identity["signal_id"] or "execution_receipt" in document or "outcome" in document:
             raise ValueError("invalid predictor stream separation")
@@ -44,24 +47,77 @@ def _validate(document: dict, stream: str) -> None:
         raise ValueError("completed outcome trade_id missing")
 
 
-def load_stream(root: Path, epoch_id: str, stream: str) -> list[dict]:
-    """운영 파일을 변경하지 않고 한 epoch의 별도 stream을 검증해서 읽는다."""
+def _check_identity_index(directory: Path, path: Path, document: dict, stream: str) -> None:
+    """새 writer의 sharded identity 봉인을 검증한다. 구 offline fixture는 index가 없다."""
+    metadata = directory / "_identity"
+    if not metadata.exists():
+        return
+    key = document["identity"]["trade_id" if stream == "outcomes" else "signal_id"]
+    digest = hashlib.sha256(key.encode("utf-8")).hexdigest()
+    index_path = metadata / digest[:2] / (digest + ".json")
+    if index_path.is_symlink() or index_path.parent.is_symlink() or metadata.is_symlink():
+        raise ValueError("telemetry identity index symlink forbidden")
+    with index_path.open("rb") as handle:
+        payload = handle.read(4097)
+    if len(payload) > 4096:
+        raise ValueError("telemetry identity index byte bound exceeded")
+    index = json.loads(payload.decode("utf-8"))
+    if not isinstance(index, dict):
+        raise ValueError("telemetry identity index must be an object")
+    body = {key: value for key, value in index.items() if key != "content_hash"}
+    if hashlib.sha256(_canonical(body)).hexdigest() != index.get("content_hash"):
+        raise ValueError("telemetry identity index hash mismatch")
+    expected = {"index_schema_version": 1, "telemetry_epoch_id": document["telemetry_epoch_id"],
+        "stream": stream, "identity": document["identity"],
+        "record_relative_path": path.relative_to(directory).as_posix(),
+        "record_content_hash": document["content_hash"]}
+    if body != expected:
+        raise ValueError("telemetry identity index linkage mismatch")
+
+
+def iter_stream(root: Path, epoch_id: str, stream: str) -> Iterator[dict]:
+    """일별 파일을 정렬·전체 복사하지 않고 검증하며 읽는다. 파일은 수정하지 않는다."""
     if stream not in SCHEMAS or not isinstance(epoch_id, str) or not epoch_id or len(epoch_id) > 128 \
             or any(char not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_" for char in epoch_id):
         raise ValueError("invalid stream or epoch path")
     directory = Path(root) / "data/research/entry_telemetry/epochs" / epoch_id / stream
-    rows = []
-    for path in sorted(directory.glob("*/*.json")):
-        if len(rows) >= MAX_STREAM_ROWS:
-            raise ValueError("offline stream row bound exceeded")
-        if path.stat().st_size > MAX_ROW_BYTES:
-            raise ValueError("telemetry row byte bound exceeded")
-        document = json.loads(path.read_text(encoding="utf-8"))
-        _validate(document, stream)
-        if document["telemetry_epoch_id"] != epoch_id:
-            raise ValueError("telemetry epoch directory mismatch")
-        rows.append(document)
-    return rows
+    if not directory.exists():
+        return
+    with os.scandir(directory) as partitions:
+        for partition in partitions:
+            if not partition.is_dir(follow_symlinks=False):
+                if partition.is_symlink():
+                    raise ValueError("telemetry partition symlink forbidden")
+                continue
+            if partition.name == "_identity":
+                continue
+            try:
+                if datetime.strptime(partition.name, "%Y-%m-%d").date().isoformat() != partition.name:
+                    raise ValueError("noncanonical day")
+            except ValueError as error:
+                raise ValueError("invalid telemetry date partition") from error
+            with os.scandir(partition.path) as files:
+                for entry in files:
+                    if not entry.name.endswith(".json"):
+                        continue
+                    if not entry.is_file(follow_symlinks=False):
+                        raise ValueError("telemetry row must be a regular file")
+                    # 읽는 도중 파일이 커져도 row 한도를 넘어 메모리를 사용하지 않는다.
+                    with open(entry.path, "rb") as handle:
+                        payload = handle.read(MAX_ROW_BYTES + 1)
+                    if len(payload) > MAX_ROW_BYTES:
+                        raise ValueError("telemetry row byte bound exceeded")
+                    document = json.loads(payload.decode("utf-8"))
+                    _validate(document, stream)
+                    if document["telemetry_epoch_id"] != epoch_id:
+                        raise ValueError("telemetry epoch directory mismatch")
+                    _check_identity_index(directory, Path(entry.path), document, stream)
+                    yield document
+
+
+def load_stream(root: Path, epoch_id: str, stream: str) -> list[dict]:
+    """호환 API: 검증된 stream을 offline 연구 메모리에만 모은다."""
+    return list(iter_stream(root, epoch_id, stream))
 
 
 def _utc(stamp: object) -> str:
@@ -78,6 +134,8 @@ def _consistent(left: dict, right: dict) -> None:
     for key in ("telemetry_epoch_id", "build_sha"):
         if left.get(key) != right.get(key):
             raise ValueError("offline join epoch/build conflict")
+    if left["provenance"]["config_fingerprint"] != right["provenance"]["config_fingerprint"]:
+        raise ValueError("offline join config fingerprint conflict")
     left_id, right_id = left["identity"], right["identity"]
     for key in ("mint", "route_type", "strategy_family"):
         if left_id.get(key) != right_id.get(key):
@@ -98,14 +156,16 @@ def _index(rows: Iterable[dict], stream: str, key: str) -> dict[tuple[str, str],
         if index in result:
             raise ValueError("duplicate telemetry join identity")
         result[index] = row
-        if len(result) > MAX_STREAM_ROWS:
-            raise ValueError("offline stream row bound exceeded")
     return result
 
 
 def join_streams(predictors: Iterable[dict], receipts: Iterable[dict] = (),
                  outcomes: Iterable[dict] = ()) -> dict:
-    """runtime lookup/update 없이 메모리에서만 연결한다. 누락 receipt는 명시한다."""
+    """Offline 전용 identity index를 메모리에 만든다. runtime 호출·행 수정은 없다.
+
+    전체 epoch 연구 결과의 메모리는 행 수에 비례한다. writer의 큐/보관 한도와
+    무관하며 데이터가 큰 연구 작업은 별도 프로세스에서 실행한다.
+    """
     pred = _index(predictors, "predictors", "signal_id")
     buys = _index(receipts, "receipts", "signal_id")
     closed = _index(outcomes, "outcomes", "trade_id")
@@ -144,4 +204,4 @@ def join_streams(predictors: Iterable[dict], receipts: Iterable[dict] = (),
 
 def join_epoch(root: Path, epoch_id: str) -> dict:
     """경로만 받아 실제 세 stream을 읽고 검증한다. 저장/마이그레이션은 하지 않는다."""
-    return join_streams(*(load_stream(root, epoch_id, stream) for stream in SCHEMAS))
+    return join_streams(*(iter_stream(root, epoch_id, stream) for stream in SCHEMAS))

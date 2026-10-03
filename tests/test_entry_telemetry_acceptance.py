@@ -34,7 +34,7 @@ class EntryTelemetryAcceptanceTests(unittest.TestCase):
         directory = t._directory()
         immutable(directory / "sessions" / (hashlib.sha256(b"offline-session").hexdigest() + ".json"),
                   {"telemetry_epoch_id": self.marker["telemetry_epoch_id"], "build_sha": "a" * 40,
-                   "session_id": "offline-session"})
+                   "session_id": "offline-session", "config_fingerprint": self.marker["config_fingerprint"]})
         atomic_write_json(self.root / "data/paper_trades.json", {"schema_version": 2, "next_event_seq": 3,
             "positions": {}, "events": [{"type": "BUY", "event_seq": 1, "mint": "mint", "position_id": "trade"},
                                        {"type": "SELL", "event_seq": 2, "mint": "mint", "position_id": "trade",
@@ -84,6 +84,15 @@ class EntryTelemetryAcceptanceTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Control BUY"):
             acceptance.inspect(self.root)
 
+    def test_session_config_fingerprint_mismatch_fails_acceptance(self):
+        self.write_candidate("REJECT_RISK"); self.health()
+        binding_path = t._directory() / "sessions" / (hashlib.sha256(b"offline-session").hexdigest() + ".json")
+        binding_path.unlink()
+        immutable(binding_path, {"telemetry_epoch_id": self.marker["telemetry_epoch_id"], "build_sha": "a" * 40,
+                                "session_id": "offline-session", "config_fingerprint": "wrong"})
+        with self.assertRaisesRegex(ValueError, "session config mismatch"):
+            acceptance.inspect(self.root)
+
     def test_recursive_schema_violation_is_rejected_without_outcome_join(self):
         self.write_candidate("REJECT_RISK")
         row = t._row(t.begin_signal(mint="mint", route_type="B", signal_detected_at=STAMP))
@@ -114,3 +123,45 @@ class EntryTelemetryAcceptanceTests(unittest.TestCase):
             t.mark("paper_buy_created_at", trade_id="trade", wall_clock=STAMP, monotonic=20)
         self.assertEqual(capture.receipt["paper_buy_created_at"], first)
         self.assertEqual(capture.receipt["event_seq"], 1)
+
+    def test_predictor_config_payload_type_and_hash_are_verified(self):
+        capture = t.begin_signal(mint="mint", route_type="B", signal_detected_at=STAMP, signal_id="config-check")
+        t.finish(capture, outcome="REJECT_ANALYZER")
+        row = t._row(capture)
+        row["provenance"]["safe_config"] = {"paper_buy_basis_points": "https://fake.test/private"}
+        with self.assertRaises(RuntimeError):
+            acceptance.validate_predictor(row)
+        row["provenance"]["safe_config"] = {"paper_buy_basis_points": 51}
+        with self.assertRaisesRegex(ValueError, "config payload/fingerprint"):
+            acceptance.validate_predictor(row)
+
+    def test_receipt_valid_type_config_tamper_is_rejected(self):
+        self.write_candidate("BUY"); self.health()
+        directory = t._directory()
+        path = next((directory / "receipts/2026-10-03").glob("*.json"))
+        from src.state_store import read_json
+        document = read_json(path, {})
+        document.pop("content_hash")
+        document["provenance"]["safe_config"] = {"paper_buy_basis_points": 51}
+        document["content_hash"] = t._digest(document)
+        # Index는 별도로 검증된다. 여기서는 payload/fingerprint 검증 자체를 격리한다.
+        with patch.object(acceptance.offline, "_check_identity_index"):
+            atomic_write_json(path, document)
+            with self.assertRaisesRegex(ValueError, "config payload/fingerprint"):
+                acceptance.inspect(self.root)
+
+    def test_cli_passes_effective_config_without_changing_environment(self):
+        from contextlib import redirect_stdout
+        import io
+        import json
+        import os
+        import sys
+        self.write_candidate("REJECT_RISK"); self.health()
+        before = dict(os.environ)
+        output = io.StringIO()
+        with patch.object(sys, "argv", ["acceptance", "--root", str(self.root)]), redirect_stdout(output):
+            with self.assertRaises(SystemExit) as completed:
+                acceptance.main()
+        self.assertEqual(completed.exception.code, 0)
+        self.assertEqual(json.loads(output.getvalue())["status"], "PENDING")
+        self.assertEqual(dict(os.environ), before)
