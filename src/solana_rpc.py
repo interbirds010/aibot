@@ -21,6 +21,7 @@ from typing import Any, Mapping, Sequence
 import aiohttp
 
 from src.failure_memory_diagnostics import mark_current_phase
+from src.research import entry_telemetry
 from src.phase_memory_telemetry import (
     add_current_phase_metadata,
     add_ancestor_phase_metadata,
@@ -809,6 +810,14 @@ def _reset_pacing_attribution() -> None:
         _pacing_request_times.clear()
 
 
+def _entry_hook(name: str, *args: Any, **kwargs: Any) -> None:
+    """연구 기록 실패가 RPC 결과나 재시도 정책을 바꾸지 않게 한다."""
+    try:
+        entry_telemetry.safe_hook(name, *args, **kwargs)
+    except Exception:
+        pass
+
+
 def _reserve_provider_slot_sync(
     provider: RpcProvider,
     *,
@@ -854,7 +863,10 @@ def _reserve_provider_slot_sync(
         last_request = _safe_epoch(state.get("last_request_at_epoch"))
         target = max(now, last_request + provider.minimum_interval_seconds)
         if now_epoch is None and target > now:
+            sleep_started = time.monotonic()
             time.sleep(target - now)
+            _entry_hook("add_counter", "rpc_limiter_wait_count")
+            _entry_hook("duration", "rpc_limiter_wait_duration_sec", time.monotonic() - sleep_started)
             now = time.time()
         else:
             now = target
@@ -909,7 +921,9 @@ async def _reserve_provider_slot(
     failover: bool = False,
     skip_reasons: dict[str, int] | None = None,
 ) -> ProviderReservation | None:
+    queue_started = time.monotonic()
     async with _process_reservation_lock(provider.name):
+        _entry_hook("duration", "rpc_reservation_queue_wait_sec", time.monotonic() - queue_started)
         return await asyncio.to_thread(
             _reserve_provider_slot_sync,
             provider,
@@ -1418,12 +1432,16 @@ async def solana_rpc_call(
     )
     failures: list[ProviderFailure] = []
     skip_reasons: dict[str, int] = {}
+    for counter in ("rpc_attempt_count", "rpc_retry_count", "rpc_local_retry_count",
+                    "rpc_failover_attempt_count", "rpc_transient_error_count", "rpc_limiter_wait_count"):
+        _entry_hook("add_counter", counter, 0)
     attempts_used = 0
     last_attempted_provider: RpcProvider | None = None
     for provider_index, provider in enumerate(ordered):
         for local_attempt in range(local_budget):
             if attempts_used >= total_budget:
                 break
+            reservation_started = time.monotonic()
             reservation = await _reserve_provider_slot(
                 provider,
                 method=str(method),
@@ -1431,9 +1449,17 @@ async def solana_rpc_call(
                 failover=provider_index > 0,
                 skip_reasons=skip_reasons,
             )
+            _entry_hook("duration", "rpc_reservation_duration_sec", time.monotonic() - reservation_started)
             if reservation is None:
                 break
             attempts_used += 1
+            _entry_hook("add_counter", "rpc_attempt_count")
+            if attempts_used > 1:
+                _entry_hook("add_counter", "rpc_retry_count")
+            if local_attempt:
+                _entry_hook("add_counter", "rpc_local_retry_count")
+            if provider_index:
+                _entry_hook("add_counter", "rpc_failover_attempt_count")
             last_attempted_provider = provider
             request_started = time.monotonic()
             try:
@@ -1445,6 +1471,10 @@ async def solana_rpc_call(
                 )
             except _ProviderRequestError as exc:
                 latency_ms = (time.monotonic() - request_started) * 1_000
+                _entry_hook("duration", "rpc_request_duration_sec", latency_ms / 1_000)
+                _entry_hook("set_section", "rpc_errors", {"last_error_type": exc.category})
+                if exc.transient:
+                    _entry_hook("add_counter", "rpc_transient_error_count")
                 failure = _failure_from_error(provider, exc, local_attempt)
                 failures.append(failure)
                 await asyncio.to_thread(
@@ -1474,14 +1504,18 @@ async def solana_rpc_call(
                     break
                 if failure.retry_delay_seconds > RPC_MAX_INLINE_BACKOFF_SECONDS:
                     break
+                sleep_started = time.monotonic()
                 await asyncio.sleep(failure.retry_delay_seconds)
+                _entry_hook("duration", "rpc_retry_sleep_sec", time.monotonic() - sleep_started)
                 continue
+            latency_ms = (time.monotonic() - request_started) * 1_000
+            _entry_hook("duration", "rpc_request_duration_sec", latency_ms / 1_000)
             await asyncio.to_thread(
                 _record_provider_success_sync,
                 provider,
                 reservation,
                 method=str(method),
-                latency_ms=(time.monotonic() - request_started) * 1_000,
+                latency_ms=latency_ms,
             )
             return result
         if attempts_used >= total_budget:

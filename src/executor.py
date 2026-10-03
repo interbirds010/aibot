@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import base64
+import hashlib
 import json
 import logging
 import math
@@ -29,6 +30,7 @@ from solders.transaction import VersionedTransaction
 from src.analyzer import analyze_token
 from src.logging_utils import configure_safe_logging, redact_sensitive_text
 from src.phase_memory_telemetry import add_current_phase_metadata
+from src.research import entry_telemetry
 from src.solana_rpc import solana_rpc_call
 from src.state_store import (
     atomic_write_json,
@@ -69,6 +71,46 @@ MAX_ENTRY_PRICE_IMPACT_PCT = 1.5
 MAX_EXIT_PRICE_IMPACT_PCT = 3.5
 logger = logging.getLogger("executor")
 _last_successful_tip_lamports: int | None = None
+
+
+def _entry_hook(name: str, *args: Any, **kwargs: Any) -> None:
+    """연구 기록 실패가 실행 흐름으로 전파되지 않게 한다."""
+    try:
+        entry_telemetry.safe_hook(name, *args, **kwargs)
+    except Exception:
+        pass
+
+
+def _record_entry_quote(prefix: str, quote: dict[str, Any], amount: int) -> None:
+    """이미 받은 견적의 허용된 필드만 보존한다."""
+    try:
+        capture = entry_telemetry.current_capture()
+        if capture is None or capture.frozen or capture.finished:
+            return
+        plan = quote.get("routePlan")
+        identifiers = []
+        if isinstance(plan, list):
+            for leg in plan[:32]:
+                swap = leg.get("swapInfo") if isinstance(leg, dict) else None
+                if isinstance(swap, dict):
+                    identifiers.append({
+                        key: swap[key][:256]
+                        for key in ("ammKey", "label")
+                        if isinstance(swap.get(key), str)
+                    })
+        _entry_hook("set_section", prefix, {
+            "input_amount": quote.get("inAmount", str(amount)),
+            "expected_output": quote.get("outAmount"),
+            "price_impact_pct": quote.get("priceImpactPct"),
+            "route_count": len(plan) if isinstance(plan, list) else None,
+            "route_identifiers_truncated": isinstance(plan, list) and len(plan) > 32,
+            "dex_identifiers": identifiers,
+            "selected_route_hash": hashlib.sha256(json.dumps(
+                identifiers, sort_keys=True, separators=(",", ":")
+            ).encode("utf-8")).hexdigest() if identifiers else None,
+        })
+    except Exception:
+        pass
 
 
 class JupiterNoRouteError(RuntimeError):
@@ -260,7 +302,10 @@ def _wait_for_jupiter_slot_sync(
         target = max(now, last_request + interval_seconds, not_before)
         delay = max(0.0, target - now)
         if delay:
+            sleep_started = time.monotonic()
             time.sleep(delay)
+            _entry_hook("add_counter", "quote_limiter_wait_count")
+            _entry_hook("duration", "quote_limiter_wait_duration_sec", time.monotonic() - sleep_started)
         request_at = time.time()
         state["last_request_at_epoch"] = request_at
         if not_before <= request_at:
@@ -326,9 +371,23 @@ async def jupiter_quote(
     }
     quote: dict[str, Any] | None = None
     last_error: Exception | None = None
+    telemetry_prefix = "quote_buy" if input_mint == WSOL_MINT else "quote_exit_preflight"
+    for counter in ("attempt_count", "retry_count", "transient_error_count"):
+        _entry_hook("add_counter", f"{telemetry_prefix}_{counter}", 0)
+    _entry_hook("add_counter", "quote_limiter_wait_count", 0)
     for attempt_index in range(_JUPITER_MAX_QUOTE_ATTEMPTS):
+        request_started = None
         try:
+            reservation_started = time.monotonic()
             await _wait_for_global_jupiter_slot()
+            _entry_hook("duration", f"{telemetry_prefix}_reservation_duration_sec", time.monotonic() - reservation_started)
+            _entry_hook("add_counter", f"{telemetry_prefix}_attempt_count")
+            if attempt_index:
+                _entry_hook("add_counter", f"{telemetry_prefix}_retry_count")
+            _entry_hook("mark", f"{telemetry_prefix}_request_started_at")
+            if telemetry_prefix == "quote_buy":
+                _entry_hook("mark", "quote_request_started_at")
+            request_started = time.monotonic()
             async with session.get(
                 f"{JUPITER_BASE}/quote", params=params, headers=headers
             ) as response:
@@ -345,13 +404,23 @@ async def jupiter_quote(
                     content_length_known=content_length_known,
                 )
                 if response.status == 400 and fail_fast_bad_request:
+                    _entry_hook("set_section", f"{telemetry_prefix}_errors", {"last_error_type": "JupiterNoRouteError"})
+                    _entry_hook("duration", f"{telemetry_prefix}_request_duration_sec", time.monotonic() - request_started)
                     raise JupiterNoRouteError(
                         "Jupiter returned HTTP 400 without an executable route"
                     )
                 if response.status != 429 and response.status < 500:
                     response.raise_for_status()
                     quote = await response.json()
+                    _entry_hook("duration", f"{telemetry_prefix}_request_duration_sec", time.monotonic() - request_started)
+                    _entry_hook("mark", f"{telemetry_prefix}_received_at")
+                    if telemetry_prefix == "quote_buy":
+                        _entry_hook("mark", "quote_received_at")
+                    _record_entry_quote(telemetry_prefix, quote, amount)
                     break
+                _entry_hook("duration", f"{telemetry_prefix}_request_duration_sec", time.monotonic() - request_started)
+                _entry_hook("add_counter", f"{telemetry_prefix}_transient_error_count")
+                _entry_hook("set_section", f"{telemetry_prefix}_errors", {"last_error_type": f"HTTP_{response.status}"})
                 now_epoch = time.time()
                 delay, source = _jupiter_backoff_seconds(
                     response.headers.get("x-ratelimit-reset")
@@ -375,9 +444,15 @@ async def jupiter_quote(
                     raise RuntimeError(
                         "Jupiter quote failed after 3 attempts"
                     ) from None
+                sleep_started = time.monotonic()
                 await asyncio.sleep(delay)
+                _entry_hook("duration", f"{telemetry_prefix}_retry_sleep_sec", time.monotonic() - sleep_started)
         except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
             last_error = exc
+            if request_started is not None:
+                _entry_hook("duration", f"{telemetry_prefix}_request_duration_sec", time.monotonic() - request_started)
+            _entry_hook("add_counter", f"{telemetry_prefix}_transient_error_count")
+            _entry_hook("set_section", f"{telemetry_prefix}_errors", {"last_error_type": type(exc).__name__})
             if attempt_index + 1 >= _JUPITER_MAX_QUOTE_ATTEMPTS:
                 break
             delay = min(float(2**attempt_index), 30.0)
@@ -388,12 +463,15 @@ async def jupiter_quote(
                 delay,
                 type(exc).__name__,
             )
+            sleep_started = time.monotonic()
             await asyncio.sleep(delay)
+            _entry_hook("duration", f"{telemetry_prefix}_retry_sleep_sec", time.monotonic() - sleep_started)
     if quote is None:
         raise RuntimeError(
             f"Jupiter quote failed after 3 attempts: {last_error or 'no response'}"
         ) from last_error
     if not quote.get("routePlan") or int(quote.get("outAmount", "0")) <= 0:
+        _entry_hook("set_section", f"{telemetry_prefix}_errors", {"last_error_type": "JupiterNoRouteError" if fail_fast_bad_request else "RuntimeError"})
         if fail_fast_bad_request:
             raise JupiterNoRouteError(
                 "Jupiter returned no executable route"

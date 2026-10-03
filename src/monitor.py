@@ -51,7 +51,7 @@ from src.runtime_memory import (
     runtime_memory_metrics,
 )
 from src.research.prospective_features import MomentumSnapshotStore
-from src.research import n3_shadow
+from src.research import entry_telemetry, n3_shadow
 from src.research.coverage_telemetry import (
     flush_coverage_telemetry,
     record_confirmation_result,
@@ -412,6 +412,7 @@ class MomentumCandidate:
     momentum_score: float
     pair_age_seconds: float = 0.0
     price_usd: float | None = None
+    momentum_score_components: dict[str, float] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -974,7 +975,142 @@ def route_report_allowed(requested_route: str, analyzed_route: str | None) -> bo
     return False
 
 
+def _entry_hook(name: str, *args: Any, **kwargs: Any) -> Any:
+    """연구 모듈 전체 실패도 Control에서 격리한다."""
+    try:
+        return entry_telemetry.safe_hook(name, *args, **kwargs)
+    except Exception:
+        return None
+
+
+@contextlib.contextmanager
+def _entry_bind(capture: Any):
+    binder = None
+    try:
+        binder = entry_telemetry.bind(capture)
+        binder.__enter__()
+    except Exception:
+        binder = None
+    try:
+        yield
+    finally:
+        if binder is not None:
+            try:
+                binder.__exit__(None, None, None)
+            except Exception:
+                pass
+
+
+def _entry_telemetry_decision(outcome: str, reasons: list[str] | tuple[str, ...]) -> None:
+    """관찰 결과만 갱신하며 거래 조건으로 사용하지 않는다."""
+    _entry_hook("set_section", "decision", {
+        "outcome": outcome, "reasons": list(reasons),
+    })
+
+
 async def process_paper_signal(
+    mint: str,
+    whale_token_amount_raw: int,
+    token_decimals: int,
+    whale_paid_lamports: int,
+    wallet: str,
+    signature: str,
+    signal_detected_at: str,
+    requested_route: str = "A",
+    dex_momentum_score: float = 0.0,
+    *,
+    momentum_metrics: dict[str, int | float] | None = None,
+    prospective_feature_collection: dict[str, Any] | None = None,
+    prefilter_reasons: tuple[str, ...] = (),
+    discovery_source: str | None = None,
+    _entry_telemetry_enqueued: tuple[str, float] | None = None,
+    _entry_telemetry_wallets: dict[str, Any] | None = None,
+    _entry_telemetry_scores: dict[str, Any] | None = None,
+    _entry_telemetry_price_usd: float | None = None,
+) -> None:
+    """기존 신호 흐름에 작은 연구 envelope만 연결한다."""
+    capture = _entry_hook(
+        "begin_signal", mint=mint, route_type=requested_route,
+        signal_detected_at=signal_detected_at, source_wallet=wallet,
+        source_signature=signature,
+    )
+    with _entry_bind(capture):
+        try:
+            try:
+                if _entry_telemetry_enqueued is not None:
+                    _entry_hook("mark", "signal_enqueued_at",
+                                             wall_clock=_entry_telemetry_enqueued[0],
+                                             monotonic=_entry_telemetry_enqueued[1])
+                _entry_hook("set_section", "signal", {
+                    "source_token_amount_raw": whale_token_amount_raw,
+                    "source_token_decimals": token_decimals,
+                    "source_paid_lamports": whale_paid_lamports,
+                    "discovery_source": discovery_source,
+                    "prefilter_reasons": list(prefilter_reasons),
+                })
+                _entry_hook("set_section", "pressure", {
+                    "pending_signal_tasks": len(_signal_tasks),
+                    "pending_shadow_tasks": len(_shadow_signal_tasks),
+                    "analysis_semaphore_available": getattr(_analysis_limit, "_value", None),
+                    "permitted_analysis_concurrency": 2,
+                    "risk_check_scope": "cash_balance_sizing_gate",
+                })
+                _entry_hook("set_section", "wallets", _entry_telemetry_wallets or {
+                    "participating_wallet_ids": [wallet] if requested_route == "A" else None,
+                    "observed_unique_wallet_count": 1 if requested_route == "A" else None,
+                    "missing_reason": "ROUTE_B_CONFIRMATION_SET_NOT_EXPOSED" if requested_route == "B" else None,
+                })
+                _entry_hook("set_section", "scores", _entry_telemetry_scores or {
+                    "momentum": {"capped_total": dex_momentum_score,
+                                 "raw_components": None, "uncapped_total": None,
+                                 "uncapped_total_missing_reason": "SCORER_COMPONENTS_NOT_EXPOSED"},
+                })
+                if momentum_metrics:
+                    _entry_hook("set_section", "short_flow", {
+                        "window_seconds": 300,
+                        "buy_count": momentum_metrics.get("buys_m5"),
+                        "sell_count": momentum_metrics.get("sells_m5"),
+                        "combined_volume_usd": momentum_metrics.get("volume_m5_usd"),
+                        "short_windows_missing_reason": "NO_EXACT_SUB_MINUTE_FEED_HISTORY",
+                    })
+                    _entry_hook("set_section", "ages", {
+                        "pair_age_seconds": momentum_metrics.get("pair_age_seconds"),
+                    })
+                    _entry_hook("set_section", "trajectory", {
+                        "price_now": _entry_telemetry_price_usd,
+                        "liquidity_now": momentum_metrics.get("liquidity_usd"),
+                        "volume_now": momentum_metrics.get("volume_m5_usd"),
+                    })
+                _entry_hook("set_section", "rpc", {
+                    "scope": "analysis_and_preflight",
+                    "confirmation_missing_reason": (
+                        "SUCCESSFUL_PRE_SIGNAL_CONFIRMATION_OUTSIDE_ENVELOPE"
+                        if requested_route == "B" else "ROUTE_A_NO_CONFIRMATION_STAGE"
+                    ),
+                })
+                if prospective_feature_collection:
+                    from src.research.prospective_features import normalize_prospective_feature_collection
+                    normalized = normalize_prospective_feature_collection(
+                        prospective_feature_collection, signal_timestamp=signal_detected_at,
+                    )
+                    _entry_hook("set_section", "trajectory", normalized)
+                _entry_telemetry_decision("OTHER", list(prefilter_reasons))
+            except Exception:
+                # 연구 projection 오류도 기존 Control 실행을 막지 않는다.
+                pass
+            await _process_paper_signal_control(
+                mint, whale_token_amount_raw, token_decimals, whale_paid_lamports,
+                wallet, signature, signal_detected_at, requested_route, dex_momentum_score,
+                momentum_metrics=momentum_metrics,
+                prospective_feature_collection=prospective_feature_collection,
+                prefilter_reasons=prefilter_reasons, discovery_source=discovery_source,
+            )
+        finally:
+            _entry_hook("mark", "entry_decision_at")
+            _entry_hook("finish", capture)
+
+
+async def _process_paper_signal_control(
     mint: str,
     whale_token_amount_raw: int,
     token_decimals: int,
@@ -992,6 +1128,7 @@ async def process_paper_signal(
 ) -> None:
     """모든 형성 후보를 관찰하고 승인 후보만 페이퍼 매수한다."""
     async with _analysis_limit:
+        _entry_hook("mark", "analysis_semaphore_acquired_at")
         observation_id: str | None = None
         observation_enabled = False
         decision_reasons = [str(reason) for reason in prefilter_reasons]
@@ -1063,6 +1200,7 @@ async def process_paper_signal(
                         discovery_source or "unknown",
                     )
             elif decision_reasons:
+                _entry_telemetry_decision("OTHER", decision_reasons)
                 return
             route_a_size_multiplier = Decimal("1")
             if requested_route == "A":
@@ -1077,6 +1215,7 @@ async def process_paper_signal(
                     )
                     decision_reasons.append("ROUTE_A_LOSS_STREAK_LOOKUP_FAILED")
                     if not observation_enabled:
+                        _entry_telemetry_decision("REJECT_RISK", decision_reasons)
                         return
                     loss_streak, latest_loss_at = 0, 0.0
                 route_a_size_multiplier = route_a_entry_multiplier(
@@ -1094,6 +1233,7 @@ async def process_paper_signal(
                     )
                     decision_reasons.append("ROUTE_A_LOSS_PAUSE")
                     if not observation_enabled:
+                        _entry_telemetry_decision("REJECT_RISK", decision_reasons)
                         return
                     route_a_size_multiplier = Decimal("1")
                 if route_a_size_multiplier < 1:
@@ -1106,6 +1246,7 @@ async def process_paper_signal(
             if token_cooldown_is_active(mint):
                 decision_reasons.append("TOKEN_COOLDOWN_OR_LOOKUP_FAILURE")
                 if not observation_enabled:
+                    _entry_telemetry_decision("REJECT_RISK", decision_reasons)
                     return
             from src.analyzer import analyze_token
             from src.risk_manager import (
@@ -1128,11 +1269,13 @@ async def process_paper_signal(
             )
             analyzer_memory_start = current_rss_bytes()
             n3_analysis_start = datetime.now(timezone.utc).isoformat()
+            _entry_hook("mark", "analysis_started_at")
             try:
                 report = await analyze_token(mint)
             finally:
                 record_memory_phase("analyzer", analyzer_memory_start)
             analysis_completed_at = datetime.now(timezone.utc).isoformat()
+            _entry_hook("mark", "analysis_completed_at")
             record_funnel_stage(
                 "analyzer_completed",
                 mint=mint,
@@ -1180,13 +1323,17 @@ async def process_paper_signal(
                     mint, report.safety_score, "; ".join(report.reasons),
                 )
             if decision_reasons and not observation_enabled:
+                _entry_telemetry_decision("REJECT_ANALYZER", decision_reasons)
                 return
+            _entry_hook("mark", "risk_check_started_at")
             cash = await paper_cash_balance()
             base_paper_cost = cash * PAPER_BUY_BASIS_POINTS // 10_000
             from src.executor import route_sized_amount
             paper_cost = route_sized_amount(base_paper_cost, requested_route)
             paper_cost = int(Decimal(paper_cost) * route_a_size_multiplier)
+            _entry_hook("mark", "risk_check_completed_at")
             if paper_cost <= 0:
+                _entry_telemetry_decision("REJECT_RISK", decision_reasons + ["PAPER_SIZE_UNUSABLE"])
                 logger.warning("paper signal has unusable observed price: %s", signature)
                 if observation_id:
                     await asyncio.to_thread(
@@ -1209,6 +1356,7 @@ async def process_paper_signal(
 
             timeout = aiohttp.ClientTimeout(total=20)
             n3_preflight_start = datetime.now(timezone.utc).isoformat()
+            _entry_hook("mark", "preflight_started_at")
             quote_preflight_started = True
             record_funnel_stage(
                 "quote_preflight_started",
@@ -1264,9 +1412,11 @@ async def process_paper_signal(
                     )
                     quote_status = "ENTRY_ONLY"
                     if not observation_enabled:
+                        _entry_telemetry_decision("QUOTE_FAILED", decision_reasons)
                         return
             quote_preflight_finished = True
             entry_quote_at = datetime.now(timezone.utc).isoformat()
+            _entry_hook("mark", "preflight_completed_at")
             whale_reference_price = (
                 whale_paid_lamports / whale_token_amount_raw
                 if whale_token_amount_raw > 0 else 0.0
@@ -1329,6 +1479,12 @@ async def process_paper_signal(
                 )
                 observation_id = decision.observation_id
                 if decision_reasons:
+                    _entry_telemetry_decision(
+                        "QUOTE_FAILED" if "EXIT_PREFLIGHT_FAILED" in decision_reasons
+                        else "REJECT_ANALYZER" if any("SAFETY" in reason or "ANALYZER" in reason for reason in decision_reasons)
+                        else "REJECT_RISK" if any("COOLDOWN" in reason or "LOSS_" in reason for reason in decision_reasons)
+                        else "OTHER", decision_reasons,
+                    )
                     logger.info(
                         "candidate observed without paper entry: mint=%s route=%s reasons=%s",
                         mint,
@@ -1340,6 +1496,7 @@ async def process_paper_signal(
                     approved_signal_paper_mode_enabled()
                     and decision.created
                 ):
+                    _entry_telemetry_decision("OTHER", ["OBSERVATION_NOT_PROMOTED"])
                     logger.info(
                         "observation recorded without paper entry: mint=%s "
                         "route=%s momentum=%.2f score=%s variants=%s",
@@ -1360,6 +1517,8 @@ async def process_paper_signal(
                     report.safety_score,
                 )
             try:
+                _entry_telemetry_decision("BUY", [])
+                _entry_hook("mark", "entry_decision_at")
                 position_id = await record_paper_buy(
                     mint,
                     paper_cost,
@@ -1397,6 +1556,7 @@ async def process_paper_signal(
                     ),
                 )
             except RuntimeError as exc:
+                _entry_telemetry_decision("REJECT_RISK", ["PAPER_LEDGER_ADMISSION_REJECTED"])
                 if strategy_version == "broad_discovery_v1" and observation_id:
                     status = (
                         "SKIPPED_CAPACITY"
@@ -1416,6 +1576,7 @@ async def process_paper_signal(
                     )
                     return
                 raise
+            _entry_hook("mark", "paper_buy_created_at", trade_id=position_id)
             try:
                 n3_shadow.submit_control_entry(position_id, n3_snapshot)
             except Exception as exc:
@@ -1437,6 +1598,10 @@ async def process_paper_signal(
                 report.safety_score, wallet, signature,
             )
         except RuntimeError as exc:
+            if quote_preflight_started and not quote_preflight_finished:
+                _entry_telemetry_decision("QUOTE_FAILED", ["PREFLIGHT_RUNTIME_ERROR"])
+            elif analyzer_started and not analysis_completed_at:
+                _entry_telemetry_decision("REJECT_ANALYZER", ["ANALYZER_RUNTIME_ERROR"])
             if analyzer_started and not analysis_completed_at:
                 record_funnel_stage(
                     "analyzer_failed",
@@ -1486,6 +1651,7 @@ async def process_paper_signal(
                 or "getTokenSupply failed" in reason
                 or "could not find account" in reason
             ):
+                _entry_telemetry_decision("RPC_SKIPPED", [canonical_failure or "RPC_LOOKUP_FAILED"])
                 from src.risk_manager import record_rpc_skip
                 await record_rpc_skip(mint, wallet, signature, reason)
             logger.info(
@@ -1494,6 +1660,7 @@ async def process_paper_signal(
                 redact_sensitive_text(exc),
             )
         except Exception:
+            _entry_telemetry_decision("OTHER", ["PROCESSING_FAILED"])
             if analyzer_started and not analysis_completed_at:
                 record_funnel_stage(
                     "analyzer_failed",
@@ -1559,6 +1726,7 @@ def schedule_paper_signal(
             0.0,
             prefilter_reasons=prefilter_reasons,
             discovery_source=discovery_source,
+            _entry_telemetry_enqueued=(datetime.now(timezone.utc).isoformat(), time.monotonic()),
         )
     )
     track_signal_task(task, shadow=bool(prefilter_reasons))
@@ -1668,11 +1836,27 @@ def print_buys(
                 )
 
 
-def momentum_score(volume_m5_usd: float, buys_m5: int, sells_m5: int) -> float:
+def momentum_score(
+    volume_m5_usd: float, buys_m5: int, sells_m5: int,
+    *, _raw_components: dict[str, float] | None = None,
+) -> float:
     """Score bounded five-minute activity without retaining a time-series."""
-    volume_points = min(60.0, max(0.0, volume_m5_usd) / 500.0)
+    volume_operand = max(0.0, volume_m5_usd) / 500.0
+    volume_points = min(60.0, volume_operand)
     net_buys = max(0, buys_m5 - sells_m5)
-    imbalance_points = min(40.0, net_buys * 2.0)
+    imbalance_operand = net_buys * 2.0
+    imbalance_points = min(40.0, imbalance_operand)
+    if _raw_components is not None:
+        try:
+            _raw_components.update({
+                "volume_operand_before_cap": volume_operand,
+                "volume_points": volume_points,
+                "positive_net_buys": float(net_buys),
+                "imbalance_operand_before_cap": imbalance_operand,
+                "imbalance_points": imbalance_points,
+            })
+        except Exception:
+            pass
     return round(volume_points + imbalance_points, 4)
 
 
@@ -1798,6 +1982,7 @@ def _momentum_shadow_candidate_from_projection(
         reasons.append("MOMENTUM_NET_BUYS_UNDER_MIN")
     if buys_m5 < sells_m5 * MOMENTUM_MIN_BUY_SELL_RATIO:
         reasons.append("MOMENTUM_BUY_SELL_RATIO_UNDER_MIN")
+    score_components: dict[str, float] = {}
     candidate = MomentumCandidate(
         mint=mint,
         pair_address=pair_address,
@@ -1805,13 +1990,14 @@ def _momentum_shadow_candidate_from_projection(
         buys_m5=buys_m5,
         sells_m5=sells_m5,
         liquidity_usd=liquidity,
-        momentum_score=momentum_score(volume_m5, buys_m5, sells_m5),
+        momentum_score=momentum_score(volume_m5, buys_m5, sells_m5, _raw_components=score_components),
         pair_age_seconds=pair_age_seconds,
         price_usd=(
             price_value
             if price_value is not None and price_value >= 0
             else None
         ),
+        momentum_score_components=score_components,
     )
     return MomentumShadowCandidate(candidate, tuple(reasons))
 
@@ -2449,6 +2635,52 @@ async def _confirm_unknown_whales_with_telemetry(
     watched_wallets: set[str],
 ) -> list[UnknownWhaleBuy]:
     """기존 funnel과 별도로 confirmation memory high-water를 기록한다."""
+    # 승인 신호 생성 이전의 RPC 실패도 독립 연구 envelope로 남긴다.
+    detected_at = datetime.now(timezone.utc).isoformat()
+    capture = _entry_hook(
+        "begin_signal", mint=candidate.mint, route_type="B",
+        signal_detected_at=detected_at,
+        source_signature=f"confirmation:{candidate.pair_address}:{detected_at}",
+    )
+    with _entry_bind(capture):
+        try:
+            _entry_hook("set_section", "scores", _momentum_entry_telemetry_scores(candidate))
+            _entry_hook("set_section", "short_flow", {
+                "window_seconds": 300, "buy_count": candidate.buys_m5,
+                "sell_count": candidate.sells_m5,
+                "combined_volume_usd": candidate.volume_m5_usd,
+                "short_windows_missing_reason": "NO_EXACT_SUB_MINUTE_FEED_HISTORY",
+            })
+            _entry_hook("set_section", "trajectory", {
+                "price_now": candidate.price_usd, "liquidity_now": candidate.liquidity_usd,
+                "volume_now": candidate.volume_m5_usd,
+            })
+            _entry_hook("set_section", "ages", {"pair_age_seconds": candidate.pair_age_seconds})
+            _entry_hook("set_section", "rpc", {"scope": "pre_signal_confirmation"})
+        except Exception:
+            pass
+        try:
+            return await _confirm_unknown_whales_with_memory_telemetry(
+                session, http_url, candidate, watched_wallets,
+            )
+        except asyncio.CancelledError:
+            _entry_telemetry_decision("OTHER", ["CONFIRMATION_CANCELLED"])
+            _entry_hook("mark", "entry_decision_at")
+            _entry_hook("finish", capture)
+            raise
+        except Exception as exc:
+            _entry_telemetry_decision("RPC_SKIPPED", ["CONFIRMATION_FAILED"])
+            _entry_hook("mark", "entry_decision_at")
+            _entry_hook("finish", capture)
+            raise
+
+
+async def _confirm_unknown_whales_with_memory_telemetry(
+    session: aiohttp.ClientSession,
+    http_url: str,
+    candidate: MomentumCandidate,
+    watched_wallets: set[str],
+) -> list[UnknownWhaleBuy]:
     with diagnostic_phase("whale_confirmation"):
         with phase_memory(
             "whale_confirmation",
@@ -2527,10 +2759,23 @@ def schedule_market_shadow(
                 )
             ),
             prefilter_reasons=rejection_reasons,
+            _entry_telemetry_enqueued=(datetime.now(timezone.utc).isoformat(), time.monotonic()),
+            _entry_telemetry_scores=_momentum_entry_telemetry_scores(candidate),
+            _entry_telemetry_price_usd=candidate.price_usd,
         )
     )
     track_signal_task(task, shadow=True)
     return True
+
+
+def _momentum_entry_telemetry_scores(candidate: MomentumCandidate) -> dict[str, Any]:
+    """기존 점수 계산에서 보존한 operand만 전달한다."""
+    return {"momentum": {
+        "capped_total": candidate.momentum_score,
+        "raw_components": candidate.momentum_score_components,
+        "uncapped_total": None,
+        "uncapped_total_missing_reason": "SCORER_CAPS_COMPONENTS_BEFORE_TOTAL",
+    }}
 
 
 async def run_market_momentum_route(settings: MonitorSettings) -> None:
@@ -2691,6 +2936,19 @@ async def run_market_momentum_route(settings: MonitorSettings) -> None:
                                         signal_detected_at=signal_detected_at,
                                     )
                                 ),
+                                _entry_telemetry_enqueued=(datetime.now(timezone.utc).isoformat(), time.monotonic()),
+                                _entry_telemetry_scores=_momentum_entry_telemetry_scores(candidate),
+                                _entry_telemetry_price_usd=candidate.price_usd,
+                                _entry_telemetry_wallets={
+                                    "participating_wallet_ids": [buy.wallet for buy in whales],
+                                    "observed_whale_count": len(whales),
+                                    "observed_unique_wallet_count": len(whales),
+                                    "paid_lamports_by_wallet": {
+                                        buy.wallet: buy.paid_lamports for buy in whales
+                                    },
+                                    "count_is_lower_bound": True,
+                                    "missing_reason": "CONFIRMATION_EARLY_EXIT_FULL_MARKET_COUNT_UNKNOWN",
+                                },
                             )
                         )
                         track_signal_task(task)
@@ -3376,6 +3634,20 @@ async def run_service() -> None:
 
 def main() -> None:
     configure_safe_logging()
+    try:
+        entry_telemetry.start_worker(safe_config={
+            "paper_buy_basis_points": PAPER_BUY_BASIS_POINTS,
+            "single_strength_lamports": SINGLE_STRENGTH_LAMPORTS,
+            "momentum_min_volume_m5_usd": MOMENTUM_MIN_VOLUME_M5_USD,
+            "momentum_min_net_buys_m5": MOMENTUM_MIN_NET_BUYS_M5,
+            "momentum_min_buy_sell_ratio": MOMENTUM_MIN_BUY_SELL_RATIO,
+            "momentum_min_liquidity_usd": MOMENTUM_MIN_LIQUIDITY_USD,
+            "momentum_min_pair_age_seconds": MOMENTUM_MIN_PAIR_AGE_SECONDS,
+            "route_b_min_safety_score": ROUTE_B_MIN_SAFETY_SCORE,
+            "unknown_whale_min_count": UNKNOWN_WHALE_MIN_COUNT,
+        })
+    except Exception as exc:
+        logger.warning("TELEMETRY_DEGRADED startup; Control 유지 category=%s", type(exc).__name__)
     try:
         n3_shadow.start_capture_worker()
     except Exception as exc:

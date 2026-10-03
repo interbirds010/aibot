@@ -267,7 +267,9 @@ class RuntimeMemoryTests(unittest.TestCase):
         self.assertIn("raw_candidate_payload_released", source)
 
     def test_whale_confirmation_trims_after_compact_projection(self) -> None:
-        source = inspect.getsource(monitor._confirm_unknown_whales_with_telemetry)
+        wrapper = inspect.getsource(monitor._confirm_unknown_whales_with_telemetry)
+        self.assertIn("_confirm_unknown_whales_with_memory_telemetry", wrapper)
+        source = inspect.getsource(monitor._confirm_unknown_whales_with_memory_telemetry)
         confirmation_index = source.index(
             "_confirm_unknown_whales_with_funnel_telemetry"
         )

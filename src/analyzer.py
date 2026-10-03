@@ -20,6 +20,7 @@ from src.phase_memory_telemetry import (
     phase_memory,
 )
 from src.runtime_memory import estimate_object_size_bytes
+from src.research import entry_telemetry
 from src.solana_rpc import provider_configs_from_env, solana_rpc_call
 
 RUGCHECK_BASE = "https://api.rugcheck.xyz/v1/tokens"
@@ -27,6 +28,14 @@ ROUTE_B_MINIMUM_LIQUIDITY_USD = Decimal("10000")
 ANALYZER_CACHE_TTL_SECONDS = 5.0
 ANALYZER_CACHE_MAX_ENTRIES = 128
 logger = logging.getLogger("analyzer")
+
+
+def _entry_hook(name: str, *args: Any, **kwargs: Any) -> None:
+    """연구 기록 실패는 안전 분석 결과를 바꾸지 않는다."""
+    try:
+        entry_telemetry.safe_hook(name, *args, **kwargs)
+    except Exception:
+        pass
 
 
 @dataclass(frozen=True, slots=True)
@@ -320,6 +329,30 @@ async def _analyze_token_uncached(
         settings=settings,
     )
     result.should_enter = result.route_type is not None
+    _entry_hook("set_section", "safety_components", {
+        "mint_authority_renounced": result.mint_authority_renounced,
+        "developer_supply_raw": supply_raw,
+        "developer_supply_percent_raw": str(creator_pct) if creator_pct is not None else None,
+        "lp_locked_percent_raw": str(lp_pct) if lp_pct is not None else None,
+        "liquidity_usd_raw": str(liquidity) if liquidity is not None else None,
+        "components": {
+            "mint_authority": 35 if result.mint_authority_renounced else 0,
+            "developer_holding": 30 if result.developer_below_ten_percent else 0,
+            "lp_lock": 35 if result.lp_locked else 0,
+        },
+        "uncapped_total": result.safety_score,
+        "capped_total": result.safety_score,
+        "cap_applied": False,
+        "maximum_possible_total": 100,
+        "thresholds": {
+            "minimum_safety_score": settings.minimum_safety_score,
+            "maximum_developer_percent": str(settings.maximum_developer_percent),
+            "minimum_lp_locked_percent": str(settings.minimum_lp_locked_percent),
+            "minimum_liquidity_usd": str(settings.minimum_liquidity_usd),
+            "route_b_minimum_liquidity_usd": str(ROUTE_B_MINIMUM_LIQUIDITY_USD),
+        },
+        "threshold_result": result.should_enter,
+    })
     return result
 
 
@@ -427,15 +460,31 @@ async def analyze_token(
         if cached is not None:
             expires_at, report = cached
             if expires_at > now:
+                _entry_hook("set_section", "analyzer_source", {
+                    "cache_hit": True, "shared_flight_owner": False,
+                    "raw_components_missing_reason": "cached_report_has_no_original_raw_inputs",
+                    "rpc_attempt_attribution": "no_current_request_cached_result",
+                })
                 return _copy_safety_report(report)
             _analysis_cache.pop(key, None)
         task = _analysis_flights.get(key)
         if task is None:
+            _entry_hook("set_section", "analyzer_source", {
+                "cache_hit": False, "shared_flight_owner": True,
+                "raw_components_missing_reason": None,
+                "rpc_attempt_attribution": "current_capture_owns_flight",
+            })
             task = asyncio.create_task(
                 _run_analysis_flight(key, mint, resolved_settings)
             )
             task.add_done_callback(_consume_flight_exception)
             _analysis_flights[key] = task
+        else:
+            _entry_hook("set_section", "analyzer_source", {
+                "cache_hit": False, "shared_flight_owner": False,
+                "raw_components_missing_reason": "shared_flight_raw_inputs_belong_to_owner",
+                "rpc_attempt_attribution": "shared_work_not_attributed_to_waiter",
+            })
     return _copy_safety_report(await asyncio.shield(task))
 
 
