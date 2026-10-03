@@ -1,5 +1,7 @@
 # Entry-time raw telemetry: 구현과 N3 격리
 
+후속 offline audit: [ENTRY_TELEMETRY_ACTIVATION.md](ENTRY_TELEMETRY_ACTIVATION.md)를 우선 적용한다. 현재 판정은 **TELEMETRY_NOT_READY**다. 아래 G의 보호는 알려진 key/freeze에 한정되며, realized_pnl/중첩 SELL/future wallet snapshot guard와 predictor/receipt 물리적 파일 분리는 충족하지 않는다. 기존 구현과 runtime은 이 audit에서 변경하지 않았다.
+
 ## A. Preflight
 
 지정 실행 checkout은 `C:\Users\user\Documents\aibot-local-paper`이다. 시작 HEAD/origin/main은 `8f0b9429352c9961b895a9f9c0e2d1f3e6b19d05`, branch `codex/memory-failure-diagnostics`, ahead/behind 0/0이었다. main ref를 명시적으로 fetch했다.
