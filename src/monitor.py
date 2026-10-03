@@ -51,6 +51,7 @@ from src.runtime_memory import (
     runtime_memory_metrics,
 )
 from src.research.prospective_features import MomentumSnapshotStore
+from src.research import n3_shadow
 from src.research.coverage_telemetry import (
     flush_coverage_telemetry,
     record_confirmation_result,
@@ -1126,6 +1127,7 @@ async def process_paper_signal(
                 family=requested_route,
             )
             analyzer_memory_start = current_rss_bytes()
+            n3_analysis_start = datetime.now(timezone.utc).isoformat()
             try:
                 report = await analyze_token(mint)
             finally:
@@ -1206,6 +1208,7 @@ async def process_paper_signal(
             )
 
             timeout = aiohttp.ClientTimeout(total=20)
+            n3_preflight_start = datetime.now(timezone.utc).isoformat()
             quote_preflight_started = True
             record_funnel_stage(
                 "quote_preflight_started",
@@ -1217,6 +1220,7 @@ async def process_paper_signal(
                     session, os.getenv("JUPITER_API_KEY", "").strip(),
                     WSOL_MINT, mint, paper_cost,
                 )
+                n3_quote_timestamp = datetime.now(timezone.utc).isoformat()
                 entry_price_impact = validate_entry_price_impact(quote)
                 paper_tokens = int(quote["outAmount"])
                 quote_status = "EXECUTABLE"
@@ -1276,6 +1280,20 @@ async def process_paper_signal(
             entry_latency_ms = int(
                 (datetime.now(timezone.utc) - detected).total_seconds() * 1000
             )
+            # 연구 판정은 진입 전에 고정하고 Control의 조건에는 사용하지 않는다.
+            n3_snapshot = None
+            try:
+                n3_snapshot = n3_shadow.prepare_entry_snapshot(
+                    signal_timestamp=signal_detected_at,
+                    analysis_start=n3_analysis_start,
+                    analysis_end=analysis_completed_at,
+                    preflight_start=n3_preflight_start,
+                    preflight_end=entry_quote_at,
+                    entry_decision=datetime.now(timezone.utc).isoformat(),
+                    quote_timestamp=n3_quote_timestamp,
+                )
+            except Exception as exc:
+                logger.warning("N3 snapshot failure; Control 유지 category=%s", type(exc).__name__)
             strategy_version = "baseline_v1"
             if observation_enabled:
                 decision = await record_observation_decision(
@@ -1398,6 +1416,10 @@ async def process_paper_signal(
                     )
                     return
                 raise
+            try:
+                n3_shadow.submit_control_entry(position_id, n3_snapshot)
+            except Exception as exc:
+                logger.warning("N3 recorder failure; Control 유지 category=%s", type(exc).__name__)
             if strategy_version == "broad_discovery_v1" and observation_id:
                 await asyncio.to_thread(
                     mark_paper_experiment_status,
@@ -3354,6 +3376,10 @@ async def run_service() -> None:
 
 def main() -> None:
     configure_safe_logging()
+    try:
+        n3_shadow.start_capture_worker()
+    except Exception as exc:
+        logger.warning("N3 recorder start failure; Control 유지 category=%s", type(exc).__name__)
     try:
         asyncio.run(run_service())
     finally:

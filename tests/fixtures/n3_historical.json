@@ -1,0 +1,1624 @@
+{
+  "source_dataset_sha256": "eb3296bdd2995d9e48080071f6a9a1338b17e594994bdd4ccb275713b88d6563",
+  "source_excluded_ids_sha256": "90527914e159eb9c8527f287109017a0c079b4395fd3a9006f30b50f81498d2e",
+  "rule_hash": "b219661c31c132e1b2f11901664981482a9e42dc847ab300f590072eb3271165",
+  "rows": [
+    {
+      "split": "DISCOVERY",
+      "position_id": "5c92afc1-12fe-4a95-b0aa-c23c252f1f6e",
+      "inputs": {
+        "analysis_duration_sec": 35.18091893196106,
+        "quote_preflight_duration_sec": 11.015050172805786
+      },
+      "would_skip": true,
+      "pnl_lamports": -5671549,
+      "entry_cost_lamports": 23217481
+    },
+    {
+      "split": "DISCOVERY",
+      "position_id": "18398e0c-c6fd-4d28-890d-b2bb2b5dd9ee",
+      "inputs": {
+        "analysis_duration_sec": 150.9163110256195,
+        "quote_preflight_duration_sec": 1.806555986404419
+      },
+      "would_skip": true,
+      "pnl_lamports": -717867,
+      "entry_cost_lamports": 6975773
+    },
+    {
+      "split": "DISCOVERY",
+      "position_id": "a6477c0c-1dd2-48ba-bb20-671d42a76fb5",
+      "inputs": {
+        "analysis_duration_sec": 137.3881130218506,
+        "quote_preflight_duration_sec": 1.892348051071167
+      },
+      "would_skip": true,
+      "pnl_lamports": -716124,
+      "entry_cost_lamports": 6975235
+    },
+    {
+      "split": "DISCOVERY",
+      "position_id": "6f6db077-f228-4927-8d9e-a3916b39c735",
+      "inputs": {
+        "analysis_duration_sec": 12.32905387878418,
+        "quote_preflight_duration_sec": 22.03295612335205
+      },
+      "would_skip": true,
+      "pnl_lamports": -2307955,
+      "entry_cost_lamports": 6939868
+    },
+    {
+      "split": "DISCOVERY",
+      "position_id": "4aa20046-8c66-4419-b9d2-2c62aa2d598b",
+      "inputs": {
+        "analysis_duration_sec": 32.862353801727295,
+        "quote_preflight_duration_sec": 6.218181133270264
+      },
+      "would_skip": true,
+      "pnl_lamports": -1982689,
+      "entry_cost_lamports": 6938137
+    },
+    {
+      "split": "DISCOVERY",
+      "position_id": "8557b5b1-3c2a-4963-84f2-20aa1a68f8e3",
+      "inputs": {
+        "analysis_duration_sec": 12.339072942733765,
+        "quote_preflight_duration_sec": 12.32349705696106
+      },
+      "would_skip": true,
+      "pnl_lamports": 798867,
+      "entry_cost_lamports": 6936650
+    },
+    {
+      "split": "DISCOVERY",
+      "position_id": "f62db24f-ad9c-424b-ad36-3d7ec446eae0",
+      "inputs": {
+        "analysis_duration_sec": 2.900803804397583,
+        "quote_preflight_duration_sec": 4.007460117340088
+      },
+      "would_skip": true,
+      "pnl_lamports": -743011,
+      "entry_cost_lamports": 6937249
+    },
+    {
+      "split": "DISCOVERY",
+      "position_id": "2fd3c613-68c3-4295-ad73-83fbb1b18ba0",
+      "inputs": {
+        "analysis_duration_sec": 3.225015878677368,
+        "quote_preflight_duration_sec": 4.481267929077148
+      },
+      "would_skip": false,
+      "pnl_lamports": -741705,
+      "entry_cost_lamports": 6936692
+    },
+    {
+      "split": "DISCOVERY",
+      "position_id": "7a7c0a5b-9859-4111-818d-4441574e0155",
+      "inputs": {
+        "analysis_duration_sec": 1.134673833847046,
+        "quote_preflight_duration_sec": 4.217642068862915
+      },
+      "would_skip": false,
+      "pnl_lamports": -902997,
+      "entry_cost_lamports": 6936135
+    },
+    {
+      "split": "DISCOVERY",
+      "position_id": "114bea64-993c-4aec-8097-539677aa6979",
+      "inputs": {
+        "analysis_duration_sec": 1.956723928451538,
+        "quote_preflight_duration_sec": 2.4826619625091553
+      },
+      "would_skip": true,
+      "pnl_lamports": -2273313,
+      "entry_cost_lamports": 6935458
+    },
+    {
+      "split": "DISCOVERY",
+      "position_id": "f458ddf6-7e17-425d-9a53-fef924af1020",
+      "inputs": {
+        "analysis_duration_sec": 19.33888077735901,
+        "quote_preflight_duration_sec": 20.447081089019775
+      },
+      "would_skip": true,
+      "pnl_lamports": 1309875,
+      "entry_cost_lamports": 6933753
+    },
+    {
+      "split": "DISCOVERY",
+      "position_id": "f05e96e3-ab36-4b41-a61c-018774980c3d",
+      "inputs": {
+        "analysis_duration_sec": 3.6574599742889404,
+        "quote_preflight_duration_sec": 8.496370077133179
+      },
+      "would_skip": true,
+      "pnl_lamports": -1005102,
+      "entry_cost_lamports": 6934735
+    },
+    {
+      "split": "DISCOVERY",
+      "position_id": "5a461f1c-f6ea-4140-aea0-19318c6ab74f",
+      "inputs": {
+        "analysis_duration_sec": 4.277458906173706,
+        "quote_preflight_duration_sec": 14.66232419013977
+      },
+      "would_skip": true,
+      "pnl_lamports": -1134579,
+      "entry_cost_lamports": 6933982
+    },
+    {
+      "split": "DISCOVERY",
+      "position_id": "d4311db9-87d3-44a3-b701-15451bb54a7c",
+      "inputs": {
+        "analysis_duration_sec": 5.823629856109619,
+        "quote_preflight_duration_sec": 4.703486204147339
+      },
+      "would_skip": false,
+      "pnl_lamports": 455440,
+      "entry_cost_lamports": 6933131
+    },
+    {
+      "split": "DISCOVERY",
+      "position_id": "bee9879a-4144-4b69-baff-95db30230166",
+      "inputs": {
+        "analysis_duration_sec": 1.379159927368164,
+        "quote_preflight_duration_sec": 4.335374116897583
+      },
+      "would_skip": false,
+      "pnl_lamports": 38549,
+      "entry_cost_lamports": 6933472
+    },
+    {
+      "split": "DISCOVERY",
+      "position_id": "692144c7-14f0-4859-a024-c2e3c17fce5d",
+      "inputs": {
+        "analysis_duration_sec": 1.1407959461212158,
+        "quote_preflight_duration_sec": 4.162894010543823
+      },
+      "would_skip": false,
+      "pnl_lamports": 2032366,
+      "entry_cost_lamports": 6933501
+    },
+    {
+      "split": "DISCOVERY",
+      "position_id": "e1d77b22-8865-4a8a-8fb2-e801ef123604",
+      "inputs": {
+        "analysis_duration_sec": 2.5621399879455566,
+        "quote_preflight_duration_sec": 3.851818084716797
+      },
+      "would_skip": true,
+      "pnl_lamports": -767176,
+      "entry_cost_lamports": 6934044
+    },
+    {
+      "split": "DISCOVERY",
+      "position_id": "45b93f85-1a97-4dd1-ad73-c509c1487009",
+      "inputs": {
+        "analysis_duration_sec": 12.429458141326904,
+        "quote_preflight_duration_sec": 18.24583387374878
+      },
+      "would_skip": true,
+      "pnl_lamports": -760963,
+      "entry_cost_lamports": 6933468
+    },
+    {
+      "split": "DISCOVERY",
+      "position_id": "8ca77581-081a-4f50-8f8e-8b0de2b790fb",
+      "inputs": {
+        "analysis_duration_sec": 2.2314751148223877,
+        "quote_preflight_duration_sec": 4.309780836105347
+      },
+      "would_skip": false,
+      "pnl_lamports": -3178684,
+      "entry_cost_lamports": 6932898
+    },
+    {
+      "split": "DISCOVERY",
+      "position_id": "c35e39f3-5f1d-482c-acd5-d31645ae1ae0",
+      "inputs": {
+        "analysis_duration_sec": 1.9626882076263428,
+        "quote_preflight_duration_sec": 4.6796698570251465
+      },
+      "would_skip": false,
+      "pnl_lamports": 4832254,
+      "entry_cost_lamports": 23104986
+    },
+    {
+      "split": "DISCOVERY",
+      "position_id": "74fb8a2d-7d9e-4d84-adba-63a14971e4fd",
+      "inputs": {
+        "analysis_duration_sec": 2.0170838832855225,
+        "quote_preflight_duration_sec": 4.206186056137085
+      },
+      "would_skip": false,
+      "pnl_lamports": 5546620,
+      "entry_cost_lamports": 23109657
+    },
+    {
+      "split": "DISCOVERY",
+      "position_id": "e09d1159-118f-46df-a7af-b932c965a0ae",
+      "inputs": {
+        "analysis_duration_sec": 2.392125129699707,
+        "quote_preflight_duration_sec": 8.256290912628174
+      },
+      "would_skip": true,
+      "pnl_lamports": -5492852,
+      "entry_cost_lamports": 23051883
+    },
+    {
+      "split": "DISCOVERY",
+      "position_id": "1d1395a3-e0e2-4ba0-967b-48c84a5c7146",
+      "inputs": {
+        "analysis_duration_sec": 3.300762891769409,
+        "quote_preflight_duration_sec": 4.2490410804748535
+      },
+      "would_skip": false,
+      "pnl_lamports": 2563614,
+      "entry_cost_lamports": 6913668
+    },
+    {
+      "split": "DISCOVERY",
+      "position_id": "c257950b-2be1-4722-8f1f-a13701a39b32",
+      "inputs": {
+        "analysis_duration_sec": 3.4960360527038574,
+        "quote_preflight_duration_sec": 1.7021009922027588
+      },
+      "would_skip": true,
+      "pnl_lamports": -775718,
+      "entry_cost_lamports": 6915590
+    },
+    {
+      "split": "DISCOVERY",
+      "position_id": "649243b1-061c-40fe-a7b7-b503e3c3a4ec",
+      "inputs": {
+        "analysis_duration_sec": 1.4757378101348877,
+        "quote_preflight_duration_sec": 3.939033031463623
+      },
+      "would_skip": false,
+      "pnl_lamports": 2052018,
+      "entry_cost_lamports": 6915009
+    },
+    {
+      "split": "DISCOVERY",
+      "position_id": "98310acc-adcb-4f0c-8f5d-251862eb2f24",
+      "inputs": {
+        "analysis_duration_sec": 5.577265024185181,
+        "quote_preflight_duration_sec": 10.037555932998657
+      },
+      "would_skip": true,
+      "pnl_lamports": -805914,
+      "entry_cost_lamports": 6916548
+    },
+    {
+      "split": "DISCOVERY",
+      "position_id": "87b8691c-ab58-44cb-951c-45bfdb453905",
+      "inputs": {
+        "analysis_duration_sec": 17.23096799850464,
+        "quote_preflight_duration_sec": 5.009637117385864
+      },
+      "would_skip": true,
+      "pnl_lamports": -1149270,
+      "entry_cost_lamports": 6915943
+    },
+    {
+      "split": "DISCOVERY",
+      "position_id": "f0236fa6-b461-4491-8e34-fecfc6515c41",
+      "inputs": {
+        "analysis_duration_sec": 6.915895938873291,
+        "quote_preflight_duration_sec": 4.807914972305298
+      },
+      "would_skip": false,
+      "pnl_lamports": 1143333,
+      "entry_cost_lamports": 6915081
+    },
+    {
+      "split": "DISCOVERY",
+      "position_id": "e9f27804-da4d-4f3f-b776-af45a0f143bf",
+      "inputs": {
+        "analysis_duration_sec": 5.211572885513306,
+        "quote_preflight_duration_sec": 3.812577962875366
+      },
+      "would_skip": true,
+      "pnl_lamports": -718178,
+      "entry_cost_lamports": 6909895
+    },
+    {
+      "split": "DISCOVERY",
+      "position_id": "b2a0407a-a960-4498-bfdf-ac06bb7d0fa8",
+      "inputs": {
+        "analysis_duration_sec": 1.3024828433990479,
+        "quote_preflight_duration_sec": 4.720645189285278
+      },
+      "would_skip": false,
+      "pnl_lamports": 6258939,
+      "entry_cost_lamports": 6909356
+    },
+    {
+      "split": "DISCOVERY",
+      "position_id": "61acf1b8-917a-4c66-8584-ec7c47e6b4a3",
+      "inputs": {
+        "analysis_duration_sec": 3.7424888610839844,
+        "quote_preflight_duration_sec": 4.769068956375122
+      },
+      "would_skip": false,
+      "pnl_lamports": 2469804,
+      "entry_cost_lamports": 6915005
+    },
+    {
+      "split": "DISCOVERY",
+      "position_id": "c29ce2bb-7236-48cd-944a-947428783d93",
+      "inputs": {
+        "analysis_duration_sec": 1.8307559490203857,
+        "quote_preflight_duration_sec": 7.635555028915405
+      },
+      "would_skip": true,
+      "pnl_lamports": 3114520,
+      "entry_cost_lamports": 6916857
+    },
+    {
+      "split": "DISCOVERY",
+      "position_id": "ae1d3906-3dd3-4faa-8f7b-fbb05ace17cd",
+      "inputs": {
+        "analysis_duration_sec": 1.601783037185669,
+        "quote_preflight_duration_sec": 7.2557220458984375
+      },
+      "would_skip": true,
+      "pnl_lamports": -1921814,
+      "entry_cost_lamports": 6924283
+    },
+    {
+      "split": "DISCOVERY",
+      "position_id": "2ec6e3fc-ba6e-41ac-9f61-feb9ab3c0a76",
+      "inputs": {
+        "analysis_duration_sec": 3.808664083480835,
+        "quote_preflight_duration_sec": 11.729690074920654
+      },
+      "would_skip": true,
+      "pnl_lamports": -843629,
+      "entry_cost_lamports": 6922841
+    },
+    {
+      "split": "DISCOVERY",
+      "position_id": "dfa4b553-15ed-4e64-95ee-f59413fd1128",
+      "inputs": {
+        "analysis_duration_sec": 1.3887829780578613,
+        "quote_preflight_duration_sec": 4.809752941131592
+      },
+      "would_skip": false,
+      "pnl_lamports": 1637779,
+      "entry_cost_lamports": 6922209
+    },
+    {
+      "split": "DISCOVERY",
+      "position_id": "c5bc5323-c91c-4c4a-9084-42439f5a4275",
+      "inputs": {
+        "analysis_duration_sec": 10.548551082611084,
+        "quote_preflight_duration_sec": 4.169395923614502
+      },
+      "would_skip": false,
+      "pnl_lamports": 2685663,
+      "entry_cost_lamports": 6923437
+    },
+    {
+      "split": "DISCOVERY",
+      "position_id": "5fcf20a1-5aaf-49ea-833d-73298f1de78a",
+      "inputs": {
+        "analysis_duration_sec": 1.5623779296875,
+        "quote_preflight_duration_sec": 4.625464200973511
+      },
+      "would_skip": false,
+      "pnl_lamports": -944874,
+      "entry_cost_lamports": 6918244
+    },
+    {
+      "split": "DISCOVERY",
+      "position_id": "5063a298-6aea-46b8-a572-a50eb832679b",
+      "inputs": {
+        "analysis_duration_sec": 1.3701331615447998,
+        "quote_preflight_duration_sec": 6.202247858047485
+      },
+      "would_skip": false,
+      "pnl_lamports": -872153,
+      "entry_cost_lamports": 6923491
+    },
+    {
+      "split": "DISCOVERY",
+      "position_id": "2970a9a4-5731-4bb9-ba34-6bfd9a8967c6",
+      "inputs": {
+        "analysis_duration_sec": 2.4919891357421875,
+        "quote_preflight_duration_sec": 3.998180866241455
+      },
+      "would_skip": true,
+      "pnl_lamports": -1140800,
+      "entry_cost_lamports": 6922837
+    },
+    {
+      "split": "DISCOVERY",
+      "position_id": "6dfe0c71-370b-4854-a1e9-17b49d7ff340",
+      "inputs": {
+        "analysis_duration_sec": 7.71637487411499,
+        "quote_preflight_duration_sec": 5.532880067825317
+      },
+      "would_skip": true,
+      "pnl_lamports": 2449712,
+      "entry_cost_lamports": 6921981
+    },
+    {
+      "split": "DISCOVERY",
+      "position_id": "45f4d3ff-7f0a-4746-845e-6b670def56b3",
+      "inputs": {
+        "analysis_duration_sec": 2.967634916305542,
+        "quote_preflight_duration_sec": 6.110352039337158
+      },
+      "would_skip": true,
+      "pnl_lamports": -722378,
+      "entry_cost_lamports": 6922444
+    },
+    {
+      "split": "DISCOVERY",
+      "position_id": "59a0dabf-08a5-4787-8c06-b3477a79d8ec",
+      "inputs": {
+        "analysis_duration_sec": 10.725470066070557,
+        "quote_preflight_duration_sec": 10.756276845932007
+      },
+      "would_skip": true,
+      "pnl_lamports": -1333347,
+      "entry_cost_lamports": 6921902
+    },
+    {
+      "split": "DISCOVERY",
+      "position_id": "ec8db744-b791-4ee1-86d2-4d86c5447568",
+      "inputs": {
+        "analysis_duration_sec": 2.9975740909576416,
+        "quote_preflight_duration_sec": 3.8974409103393555
+      },
+      "would_skip": true,
+      "pnl_lamports": -1963995,
+      "entry_cost_lamports": 6922277
+    },
+    {
+      "split": "DISCOVERY",
+      "position_id": "3c28b497-a92c-4687-98a0-639421385dbe",
+      "inputs": {
+        "analysis_duration_sec": 2.2546730041503906,
+        "quote_preflight_duration_sec": 4.370934009552002
+      },
+      "would_skip": false,
+      "pnl_lamports": -801748,
+      "entry_cost_lamports": 6920804
+    },
+    {
+      "split": "DISCOVERY",
+      "position_id": "5e5e258c-3aea-49eb-a3c3-be16fd7588d3",
+      "inputs": {
+        "analysis_duration_sec": 2.94767689704895,
+        "quote_preflight_duration_sec": 8.893433094024658
+      },
+      "would_skip": true,
+      "pnl_lamports": 290979,
+      "entry_cost_lamports": 6938360
+    },
+    {
+      "split": "DISCOVERY",
+      "position_id": "ae150eae-87e6-431f-9740-b34d77d6df5c",
+      "inputs": {
+        "analysis_duration_sec": 5.417028903961182,
+        "quote_preflight_duration_sec": 4.898077964782715
+      },
+      "would_skip": true,
+      "pnl_lamports": -871037,
+      "entry_cost_lamports": 6938579
+    },
+    {
+      "split": "DISCOVERY",
+      "position_id": "ebce20d9-6a3d-4cf6-af0f-97d3561c6503",
+      "inputs": {
+        "analysis_duration_sec": 1.4665858745574951,
+        "quote_preflight_duration_sec": 3.7967472076416016
+      },
+      "would_skip": false,
+      "pnl_lamports": -928973,
+      "entry_cost_lamports": 6937925
+    },
+    {
+      "split": "DISCOVERY",
+      "position_id": "6b14c4e7-5f76-46e7-a47d-889ef50eb064",
+      "inputs": {
+        "analysis_duration_sec": 1.5017480850219727,
+        "quote_preflight_duration_sec": 4.098989009857178
+      },
+      "would_skip": true,
+      "pnl_lamports": -731769,
+      "entry_cost_lamports": 6937229
+    },
+    {
+      "split": "DISCOVERY",
+      "position_id": "3aee6802-f7ef-4a80-9696-b93e632dbd96",
+      "inputs": {
+        "analysis_duration_sec": 4.98091983795166,
+        "quote_preflight_duration_sec": 6.210175037384033
+      },
+      "would_skip": true,
+      "pnl_lamports": -1427943,
+      "entry_cost_lamports": 6936680
+    },
+    {
+      "split": "DISCOVERY",
+      "position_id": "e83ddfda-898f-40e7-b151-a7b65a0738a4",
+      "inputs": {
+        "analysis_duration_sec": 1.2448840141296387,
+        "quote_preflight_duration_sec": 4.9063880443573
+      },
+      "would_skip": false,
+      "pnl_lamports": -833676,
+      "entry_cost_lamports": 6936860
+    },
+    {
+      "split": "DISCOVERY",
+      "position_id": "ed53b989-e809-4235-ae30-745203fa29b9",
+      "inputs": {
+        "analysis_duration_sec": 5.77771782875061,
+        "quote_preflight_duration_sec": 10.62804102897644
+      },
+      "would_skip": true,
+      "pnl_lamports": -910589,
+      "entry_cost_lamports": 6936235
+    },
+    {
+      "split": "DISCOVERY",
+      "position_id": "02ec37dc-5de0-419c-aab0-451d433f797b",
+      "inputs": {
+        "analysis_duration_sec": 5.413366079330444,
+        "quote_preflight_duration_sec": 7.4104390144348145
+      },
+      "would_skip": true,
+      "pnl_lamports": -2921693,
+      "entry_cost_lamports": 6935552
+    },
+    {
+      "split": "DISCOVERY",
+      "position_id": "01554757-acd1-44ab-800b-abed1672beb9",
+      "inputs": {
+        "analysis_duration_sec": 2.4122860431671143,
+        "quote_preflight_duration_sec": 5.883440971374512
+      },
+      "would_skip": true,
+      "pnl_lamports": -935942,
+      "entry_cost_lamports": 6933361
+    },
+    {
+      "split": "DISCOVERY",
+      "position_id": "f559db59-baa7-4b82-82ae-70ae860c9aee",
+      "inputs": {
+        "analysis_duration_sec": 1.4518158435821533,
+        "quote_preflight_duration_sec": 3.985288143157959
+      },
+      "would_skip": false,
+      "pnl_lamports": 2032618,
+      "entry_cost_lamports": 6932659
+    },
+    {
+      "split": "DISCOVERY",
+      "position_id": "3d92de4d-5a21-431d-a5c9-846601a85b2b",
+      "inputs": {
+        "analysis_duration_sec": 3.320803165435791,
+        "quote_preflight_duration_sec": 4.385149955749512
+      },
+      "would_skip": false,
+      "pnl_lamports": -1887775,
+      "entry_cost_lamports": 6934183
+    },
+    {
+      "split": "DISCOVERY",
+      "position_id": "905afaaf-20c7-4283-90b7-3ba13efebc58",
+      "inputs": {
+        "analysis_duration_sec": 1.4186069965362549,
+        "quote_preflight_duration_sec": 4.886109113693237
+      },
+      "would_skip": false,
+      "pnl_lamports": 1219176,
+      "entry_cost_lamports": 6932767
+    },
+    {
+      "split": "DISCOVERY",
+      "position_id": "079933a1-7c87-46a6-af8e-ab25b59cd897",
+      "inputs": {
+        "analysis_duration_sec": 13.849278926849365,
+        "quote_preflight_duration_sec": 4.675032138824463
+      },
+      "would_skip": false,
+      "pnl_lamports": -783756,
+      "entry_cost_lamports": 6933682
+    },
+    {
+      "split": "DISCOVERY",
+      "position_id": "42e602a2-7a14-449b-92f5-b0c630dc1ad6",
+      "inputs": {
+        "analysis_duration_sec": 2.695948839187622,
+        "quote_preflight_duration_sec": 7.224509954452515
+      },
+      "would_skip": true,
+      "pnl_lamports": -2496284,
+      "entry_cost_lamports": 6933094
+    },
+    {
+      "split": "DISCOVERY",
+      "position_id": "3f6c290f-ec41-45c6-aa14-27f197f3f615",
+      "inputs": {
+        "analysis_duration_sec": 1.9897358417510986,
+        "quote_preflight_duration_sec": 6.3038330078125
+      },
+      "would_skip": true,
+      "pnl_lamports": -1333898,
+      "entry_cost_lamports": 6931222
+    },
+    {
+      "split": "DISCOVERY",
+      "position_id": "3df89a9c-474f-49a8-86ce-7ad0a193e7f4",
+      "inputs": {
+        "analysis_duration_sec": 1.2146880626678467,
+        "quote_preflight_duration_sec": 5.501106023788452
+      },
+      "would_skip": false,
+      "pnl_lamports": -925538,
+      "entry_cost_lamports": 6930221
+    },
+    {
+      "split": "DISCOVERY",
+      "position_id": "b66ff2e9-91d1-42ee-8df9-b4d10e8d707b",
+      "inputs": {
+        "analysis_duration_sec": 13.211459159851074,
+        "quote_preflight_duration_sec": 7.62025785446167
+      },
+      "would_skip": true,
+      "pnl_lamports": -1324998,
+      "entry_cost_lamports": 6929527
+    },
+    {
+      "split": "DISCOVERY",
+      "position_id": "bff05e1a-7866-46b4-8635-17dba2f00d19",
+      "inputs": {
+        "analysis_duration_sec": 7.717181205749512,
+        "quote_preflight_duration_sec": 4.808171987533569
+      },
+      "would_skip": false,
+      "pnl_lamports": 1410425,
+      "entry_cost_lamports": 6928533
+    },
+    {
+      "split": "DISCOVERY",
+      "position_id": "6b078f19-0eb4-417d-bb4b-ff2355892c26",
+      "inputs": {
+        "analysis_duration_sec": 3.372607946395874,
+        "quote_preflight_duration_sec": 4.242521047592163
+      },
+      "would_skip": false,
+      "pnl_lamports": 1144008,
+      "entry_cost_lamports": 6929591
+    },
+    {
+      "split": "DISCOVERY",
+      "position_id": "f26f1c46-bd61-4c0b-8d67-62fa89e3896b",
+      "inputs": {
+        "analysis_duration_sec": 6.805450916290283,
+        "quote_preflight_duration_sec": 5.748389005661011
+      },
+      "would_skip": true,
+      "pnl_lamports": -1204052,
+      "entry_cost_lamports": 6929771
+    },
+    {
+      "split": "DISCOVERY",
+      "position_id": "a0b41455-ca27-48a3-9de8-ac3cb9a98c0d",
+      "inputs": {
+        "analysis_duration_sec": 2.5732970237731934,
+        "quote_preflight_duration_sec": 4.844620943069458
+      },
+      "would_skip": true,
+      "pnl_lamports": -6958234,
+      "entry_cost_lamports": 46192457
+    },
+    {
+      "split": "DISCOVERY",
+      "position_id": "96826275-f809-4273-a91f-9b231e811adb",
+      "inputs": {
+        "analysis_duration_sec": 1.464379072189331,
+        "quote_preflight_duration_sec": 3.841578960418701
+      },
+      "would_skip": false,
+      "pnl_lamports": -2094681,
+      "entry_cost_lamports": 6894224
+    },
+    {
+      "split": "DISCOVERY",
+      "position_id": "05407f52-f320-437b-ab66-2e6b07e37466",
+      "inputs": {
+        "analysis_duration_sec": 3.107296943664551,
+        "quote_preflight_duration_sec": 5.994330167770386
+      },
+      "would_skip": true,
+      "pnl_lamports": 1246180,
+      "entry_cost_lamports": 6922756
+    },
+    {
+      "split": "DISCOVERY",
+      "position_id": "70bf2718-f04a-4eac-9509-6a0e86500d1f",
+      "inputs": {
+        "analysis_duration_sec": 3.776189088821411,
+        "quote_preflight_duration_sec": 12.526165962219238
+      },
+      "would_skip": true,
+      "pnl_lamports": -993437,
+      "entry_cost_lamports": 6922899
+    },
+    {
+      "split": "DISCOVERY",
+      "position_id": "b7bd62af-397a-4049-aeb4-cc3d3abfa82a",
+      "inputs": {
+        "analysis_duration_sec": 6.504969120025635,
+        "quote_preflight_duration_sec": 4.202888011932373
+      },
+      "would_skip": false,
+      "pnl_lamports": 1484846,
+      "entry_cost_lamports": 6922946
+    },
+    {
+      "split": "DISCOVERY",
+      "position_id": "3d685ff9-b0d7-4195-8bce-c89a1978cdad",
+      "inputs": {
+        "analysis_duration_sec": 5.133708953857422,
+        "quote_preflight_duration_sec": 7.124943017959595
+      },
+      "would_skip": true,
+      "pnl_lamports": -1237939,
+      "entry_cost_lamports": 6924060
+    },
+    {
+      "split": "DISCOVERY",
+      "position_id": "6b9ef87a-c20f-4ae3-98f7-24878be92db4",
+      "inputs": {
+        "analysis_duration_sec": 9.021260976791382,
+        "quote_preflight_duration_sec": 6.403028964996338
+      },
+      "would_skip": true,
+      "pnl_lamports": 1826415,
+      "entry_cost_lamports": 6923131
+    },
+    {
+      "split": "DISCOVERY",
+      "position_id": "d642677a-f308-4f9b-bae3-0c704284312d",
+      "inputs": {
+        "analysis_duration_sec": 1.4810099601745605,
+        "quote_preflight_duration_sec": 17.121241092681885
+      },
+      "would_skip": false,
+      "pnl_lamports": -950627,
+      "entry_cost_lamports": 6927835
+    },
+    {
+      "split": "DISCOVERY",
+      "position_id": "fc931dee-b992-43ea-8860-4fd52e8503c8",
+      "inputs": {
+        "analysis_duration_sec": 1.3075251579284668,
+        "quote_preflight_duration_sec": 4.743327856063843
+      },
+      "would_skip": false,
+      "pnl_lamports": 3237436,
+      "entry_cost_lamports": 6927122
+    },
+    {
+      "split": "DISCOVERY",
+      "position_id": "f716d7fd-029b-4fe7-a5a6-a62f2422ce5c",
+      "inputs": {
+        "analysis_duration_sec": 10.09801197052002,
+        "quote_preflight_duration_sec": 16.42105507850647
+      },
+      "would_skip": true,
+      "pnl_lamports": -852461,
+      "entry_cost_lamports": 6928260
+    },
+    {
+      "split": "DISCOVERY",
+      "position_id": "718464cf-65bb-49c3-93a2-550c1e911e11",
+      "inputs": {
+        "analysis_duration_sec": 4.742276906967163,
+        "quote_preflight_duration_sec": 6.368271112442017
+      },
+      "would_skip": true,
+      "pnl_lamports": -1147174,
+      "entry_cost_lamports": 6928911
+    },
+    {
+      "split": "DISCOVERY",
+      "position_id": "06b281b8-46ba-49af-aa74-6dfb01ca7eef",
+      "inputs": {
+        "analysis_duration_sec": 1.397294044494629,
+        "quote_preflight_duration_sec": 6.198629140853882
+      },
+      "would_skip": false,
+      "pnl_lamports": -707656,
+      "entry_cost_lamports": 6928051
+    },
+    {
+      "split": "DISCOVERY",
+      "position_id": "dcb4df2a-9782-406e-83c9-392df3e4664d",
+      "inputs": {
+        "analysis_duration_sec": 1.3483881950378418,
+        "quote_preflight_duration_sec": 4.720831871032715
+      },
+      "would_skip": false,
+      "pnl_lamports": 427134,
+      "entry_cost_lamports": 6927520
+    },
+    {
+      "split": "DISCOVERY",
+      "position_id": "5a6fe62e-667a-45e4-b193-746b829dc689",
+      "inputs": {
+        "analysis_duration_sec": 1.4834799766540527,
+        "quote_preflight_duration_sec": 4.009984016418457
+      },
+      "would_skip": false,
+      "pnl_lamports": -1092312,
+      "entry_cost_lamports": 6927063
+    },
+    {
+      "split": "DISCOVERY",
+      "position_id": "d71fae4b-ecea-400f-8411-b7fcee6baaa5",
+      "inputs": {
+        "analysis_duration_sec": 2.899477005004883,
+        "quote_preflight_duration_sec": 5.467478036880493
+      },
+      "would_skip": true,
+      "pnl_lamports": 218247,
+      "entry_cost_lamports": 6927021
+    },
+    {
+      "split": "DISCOVERY",
+      "position_id": "9ea9bd48-ce13-412e-a5d9-a5dcdc041413",
+      "inputs": {
+        "analysis_duration_sec": 2.1943187713623047,
+        "quote_preflight_duration_sec": 4.446671009063721
+      },
+      "would_skip": false,
+      "pnl_lamports": -2789777,
+      "entry_cost_lamports": 6927185
+    },
+    {
+      "split": "DISCOVERY",
+      "position_id": "4710d4f1-1fea-4f3c-9fa7-0c45a0313769",
+      "inputs": {
+        "analysis_duration_sec": 8.91294002532959,
+        "quote_preflight_duration_sec": 4.225710868835449
+      },
+      "would_skip": false,
+      "pnl_lamports": 1527016,
+      "entry_cost_lamports": 6925093
+    },
+    {
+      "split": "DISCOVERY",
+      "position_id": "f526a52d-f7a7-4be4-a201-7c48ba083274",
+      "inputs": {
+        "analysis_duration_sec": 1.9305880069732666,
+        "quote_preflight_duration_sec": 3.898771047592163
+      },
+      "would_skip": true,
+      "pnl_lamports": -1238182,
+      "entry_cost_lamports": 6926238
+    },
+    {
+      "split": "DISCOVERY",
+      "position_id": "0d5f609e-80e9-40de-b020-3d415daf504f",
+      "inputs": {
+        "analysis_duration_sec": 1.4946019649505615,
+        "quote_preflight_duration_sec": 4.504328012466431
+      },
+      "would_skip": false,
+      "pnl_lamports": 1828983,
+      "entry_cost_lamports": 6925309
+    },
+    {
+      "split": "DISCOVERY",
+      "position_id": "0904ae93-0444-4153-9571-d834838151c8",
+      "inputs": {
+        "analysis_duration_sec": 8.132691144943237,
+        "quote_preflight_duration_sec": 5.592790842056274
+      },
+      "would_skip": true,
+      "pnl_lamports": -1556695,
+      "entry_cost_lamports": 6926681
+    },
+    {
+      "split": "DISCOVERY",
+      "position_id": "f6796817-b730-4bc0-a896-7216ab0220e3",
+      "inputs": {
+        "analysis_duration_sec": 2.647562026977539,
+        "quote_preflight_duration_sec": 4.859833002090454
+      },
+      "would_skip": true,
+      "pnl_lamports": -768324,
+      "entry_cost_lamports": 6925513
+    },
+    {
+      "split": "DISCOVERY",
+      "position_id": "0b4a5d0f-b4de-4552-b2c9-20e3676694da",
+      "inputs": {
+        "analysis_duration_sec": 5.905472993850708,
+        "quote_preflight_duration_sec": 4.212182998657227
+      },
+      "would_skip": false,
+      "pnl_lamports": -886129,
+      "entry_cost_lamports": 6924937
+    },
+    {
+      "split": "DISCOVERY",
+      "position_id": "39778f4f-fed7-4d5a-b0ad-2f5683a2f1dc",
+      "inputs": {
+        "analysis_duration_sec": 5.716545820236206,
+        "quote_preflight_duration_sec": 8.909088134765625
+      },
+      "would_skip": true,
+      "pnl_lamports": -9640771,
+      "entry_cost_lamports": 46161820
+    },
+    {
+      "split": "DISCOVERY",
+      "position_id": "8e1b426d-24b7-439a-8c05-2100ef65c67a",
+      "inputs": {
+        "analysis_duration_sec": 15.836804151535034,
+        "quote_preflight_duration_sec": 9.923203945159912
+      },
+      "would_skip": true,
+      "pnl_lamports": -764241,
+      "entry_cost_lamports": 6917042
+    },
+    {
+      "split": "DISCOVERY",
+      "position_id": "affe91bd-1f2c-4159-8850-bf17292a55b9",
+      "inputs": {
+        "analysis_duration_sec": 16.261722803115845,
+        "quote_preflight_duration_sec": 9.409104108810425
+      },
+      "would_skip": true,
+      "pnl_lamports": 2635653,
+      "entry_cost_lamports": 46109795
+    },
+    {
+      "split": "DISCOVERY",
+      "position_id": "8f4e3116-6560-4547-ba61-4923d5c94d35",
+      "inputs": {
+        "analysis_duration_sec": 2.563133955001831,
+        "quote_preflight_duration_sec": 4.436178922653198
+      },
+      "would_skip": false,
+      "pnl_lamports": 1757223,
+      "entry_cost_lamports": 6917974
+    },
+    {
+      "split": "DISCOVERY",
+      "position_id": "e4478836-026f-4782-a5b7-5fe80e97bab0",
+      "inputs": {
+        "analysis_duration_sec": 1.2048580646514893,
+        "quote_preflight_duration_sec": 4.744615077972412
+      },
+      "would_skip": false,
+      "pnl_lamports": 510353,
+      "entry_cost_lamports": 6912785
+    },
+    {
+      "split": "DISCOVERY",
+      "position_id": "8e845c7b-3c17-449a-8745-41cca43fb9c3",
+      "inputs": {
+        "analysis_duration_sec": 4.416939973831177,
+        "quote_preflight_duration_sec": 3.8912999629974365
+      },
+      "would_skip": true,
+      "pnl_lamports": -765337,
+      "entry_cost_lamports": 6918778
+    },
+    {
+      "split": "DISCOVERY",
+      "position_id": "39036698-bb52-4343-9fbb-99d772224ee2",
+      "inputs": {
+        "analysis_duration_sec": 3.910111904144287,
+        "quote_preflight_duration_sec": 4.7979230880737305
+      },
+      "would_skip": false,
+      "pnl_lamports": -9049828,
+      "entry_cost_lamports": 46130484
+    },
+    {
+      "split": "DISCOVERY",
+      "position_id": "b32fb4e4-4ff9-4fd4-8d1a-915a44601020",
+      "inputs": {
+        "analysis_duration_sec": 2.2522120475769043,
+        "quote_preflight_duration_sec": 4.6104278564453125
+      },
+      "would_skip": false,
+      "pnl_lamports": -1226492,
+      "entry_cost_lamports": 6912785
+    },
+    {
+      "split": "DISCOVERY",
+      "position_id": "251f2a04-28ee-4359-bf21-4ff3956d815d",
+      "inputs": {
+        "analysis_duration_sec": 8.390273094177246,
+        "quote_preflight_duration_sec": 7.145132780075073
+      },
+      "would_skip": true,
+      "pnl_lamports": -823210,
+      "entry_cost_lamports": 6911865
+    },
+    {
+      "split": "DISCOVERY",
+      "position_id": "b9a06d77-d59b-4ada-8a6c-2c6ab7d2a555",
+      "inputs": {
+        "analysis_duration_sec": 5.210616111755371,
+        "quote_preflight_duration_sec": 5.108596086502075
+      },
+      "would_skip": true,
+      "pnl_lamports": -903658,
+      "entry_cost_lamports": 6911248
+    },
+    {
+      "split": "DISCOVERY",
+      "position_id": "cc10527c-e28f-4b0b-bfb2-68de76242af1",
+      "inputs": {
+        "analysis_duration_sec": 3.537122964859009,
+        "quote_preflight_duration_sec": 3.8075480461120605
+      },
+      "would_skip": true,
+      "pnl_lamports": 1731097,
+      "entry_cost_lamports": 6910570
+    },
+    {
+      "split": "DISCOVERY",
+      "position_id": "b29e345a-7f2a-41cb-8f8c-fdc795cea319",
+      "inputs": {
+        "analysis_duration_sec": 5.221646070480347,
+        "quote_preflight_duration_sec": 4.095340967178345
+      },
+      "would_skip": true,
+      "pnl_lamports": -734275,
+      "entry_cost_lamports": 6911868
+    },
+    {
+      "split": "VALIDATION",
+      "position_id": "f20a400f-8cee-4890-a9ce-124b11e3d4f0",
+      "inputs": {
+        "analysis_duration_sec": 3.2860848903656006,
+        "quote_preflight_duration_sec": 4.193742036819458
+      },
+      "would_skip": false,
+      "pnl_lamports": -941029,
+      "entry_cost_lamports": 6911317
+    },
+    {
+      "split": "VALIDATION",
+      "position_id": "a8a7b8f7-8c0e-41bf-8fc0-8d7cbbaa7666",
+      "inputs": {
+        "analysis_duration_sec": 1.2358839511871338,
+        "quote_preflight_duration_sec": 4.6018149852752686
+      },
+      "would_skip": false,
+      "pnl_lamports": 2956901,
+      "entry_cost_lamports": 6910612
+    },
+    {
+      "split": "VALIDATION",
+      "position_id": "00507949-9a5c-4087-a309-15071dd56178",
+      "inputs": {
+        "analysis_duration_sec": 2.503448009490967,
+        "quote_preflight_duration_sec": 3.7085280418395996
+      },
+      "would_skip": true,
+      "pnl_lamports": -857566,
+      "entry_cost_lamports": 6910819
+    },
+    {
+      "split": "VALIDATION",
+      "position_id": "af1ac661-6e64-427b-891c-5d199b2e69d0",
+      "inputs": {
+        "analysis_duration_sec": 1.4738490581512451,
+        "quote_preflight_duration_sec": 3.704927921295166
+      },
+      "would_skip": false,
+      "pnl_lamports": -1025444,
+      "entry_cost_lamports": 6910176
+    },
+    {
+      "split": "VALIDATION",
+      "position_id": "c9f4e140-4e60-4f31-9a3b-22fe07a711dd",
+      "inputs": {
+        "analysis_duration_sec": 3.2099928855895996,
+        "quote_preflight_duration_sec": 4.643012046813965
+      },
+      "would_skip": false,
+      "pnl_lamports": -854041,
+      "entry_cost_lamports": 6911417
+    },
+    {
+      "split": "VALIDATION",
+      "position_id": "057d1d17-36dc-4b87-bfa8-f43e79276a20",
+      "inputs": {
+        "analysis_duration_sec": 6.292330026626587,
+        "quote_preflight_duration_sec": 4.4488420486450195
+      },
+      "would_skip": false,
+      "pnl_lamports": -848434,
+      "entry_cost_lamports": 6910777
+    },
+    {
+      "split": "VALIDATION",
+      "position_id": "233579e7-acbe-45d6-9843-117e0b07e351",
+      "inputs": {
+        "analysis_duration_sec": 12.832174062728882,
+        "quote_preflight_duration_sec": 6.095022916793823
+      },
+      "would_skip": true,
+      "pnl_lamports": -811449,
+      "entry_cost_lamports": 6910140
+    },
+    {
+      "split": "VALIDATION",
+      "position_id": "a5a65eac-a1ba-4711-a0eb-c5a75874db45",
+      "inputs": {
+        "analysis_duration_sec": 3.1985549926757812,
+        "quote_preflight_duration_sec": 4.443713903427124
+      },
+      "would_skip": false,
+      "pnl_lamports": -1334383,
+      "entry_cost_lamports": 6909532
+    },
+    {
+      "split": "VALIDATION",
+      "position_id": "9bbafc97-922c-45f2-a4ba-fd93a15949de",
+      "inputs": {
+        "analysis_duration_sec": 1.232513189315796,
+        "quote_preflight_duration_sec": 3.9631409645080566
+      },
+      "would_skip": false,
+      "pnl_lamports": -1365198,
+      "entry_cost_lamports": 6908531
+    },
+    {
+      "split": "VALIDATION",
+      "position_id": "81e4927a-0f8e-4360-bc5b-68f2bf9b31df",
+      "inputs": {
+        "analysis_duration_sec": 4.0213940143585205,
+        "quote_preflight_duration_sec": 4.0922839641571045
+      },
+      "would_skip": true,
+      "pnl_lamports": -2794213,
+      "entry_cost_lamports": 6907507
+    },
+    {
+      "split": "VALIDATION",
+      "position_id": "505b02cc-bf97-43b9-ad1b-7b3f5750bc19",
+      "inputs": {
+        "analysis_duration_sec": 2.618600845336914,
+        "quote_preflight_duration_sec": 3.8016860485076904
+      },
+      "would_skip": true,
+      "pnl_lamports": -1679715,
+      "entry_cost_lamports": 6905411
+    },
+    {
+      "split": "VALIDATION",
+      "position_id": "f54c95ec-1aa3-4c35-b0aa-7d2bb3e4361b",
+      "inputs": {
+        "analysis_duration_sec": 1.5086479187011719,
+        "quote_preflight_duration_sec": 5.414466857910156
+      },
+      "would_skip": true,
+      "pnl_lamports": -1070916,
+      "entry_cost_lamports": 6904152
+    },
+    {
+      "split": "VALIDATION",
+      "position_id": "7d23fad9-23c1-4d46-a96d-1ef84d8898c6",
+      "inputs": {
+        "analysis_duration_sec": 1.37608003616333,
+        "quote_preflight_duration_sec": 5.788667917251587
+      },
+      "would_skip": false,
+      "pnl_lamports": -1010047,
+      "entry_cost_lamports": 6903348
+    },
+    {
+      "split": "VALIDATION",
+      "position_id": "65d9cb40-642e-4ac8-8dac-8c74d2523089",
+      "inputs": {
+        "analysis_duration_sec": 4.9152209758758545,
+        "quote_preflight_duration_sec": 4.870675086975098
+      },
+      "would_skip": true,
+      "pnl_lamports": -1226337,
+      "entry_cost_lamports": 6902591
+    },
+    {
+      "split": "VALIDATION",
+      "position_id": "0c22362e-b920-4c9e-b068-5d0f3ea5387f",
+      "inputs": {
+        "analysis_duration_sec": 2.386625051498413,
+        "quote_preflight_duration_sec": 4.195113897323608
+      },
+      "would_skip": false,
+      "pnl_lamports": 2227037,
+      "entry_cost_lamports": 6901671
+    },
+    {
+      "split": "VALIDATION",
+      "position_id": "8fc4f2b4-f980-4ebd-beab-97d4c09cf1c9",
+      "inputs": {
+        "analysis_duration_sec": 1.3669970035552979,
+        "quote_preflight_duration_sec": 4.867160081863403
+      },
+      "would_skip": false,
+      "pnl_lamports": -1030939,
+      "entry_cost_lamports": 6903341
+    },
+    {
+      "split": "VALIDATION",
+      "position_id": "853a5872-6800-4541-ab6f-22e1743e90ca",
+      "inputs": {
+        "analysis_duration_sec": 1.236868143081665,
+        "quote_preflight_duration_sec": 4.406181812286377
+      },
+      "would_skip": false,
+      "pnl_lamports": 1349299,
+      "entry_cost_lamports": 6902568
+    },
+    {
+      "split": "VALIDATION",
+      "position_id": "4ac0665d-3fef-4dbe-9066-a973776b11d4",
+      "inputs": {
+        "analysis_duration_sec": 1.266228199005127,
+        "quote_preflight_duration_sec": 5.896852970123291
+      },
+      "would_skip": false,
+      "pnl_lamports": -1712220,
+      "entry_cost_lamports": 6903580
+    },
+    {
+      "split": "VALIDATION",
+      "position_id": "e1401e2c-aa9c-40e0-a2d0-1e885ace8fd1",
+      "inputs": {
+        "analysis_duration_sec": 42.727356910705566,
+        "quote_preflight_duration_sec": 10.606305122375488
+      },
+      "would_skip": true,
+      "pnl_lamports": -8708504,
+      "entry_cost_lamports": 46015309
+    },
+    {
+      "split": "VALIDATION",
+      "position_id": "67578e65-76a1-40c2-af33-1916dce0b4d9",
+      "inputs": {
+        "analysis_duration_sec": 1.401021957397461,
+        "quote_preflight_duration_sec": 4.240692853927612
+      },
+      "would_skip": false,
+      "pnl_lamports": -713161,
+      "entry_cost_lamports": 6895764
+    },
+    {
+      "split": "VALIDATION",
+      "position_id": "88ae9547-633e-43b5-bc85-b920c61b34eb",
+      "inputs": {
+        "analysis_duration_sec": 1.2772629261016846,
+        "quote_preflight_duration_sec": 3.940321922302246
+      },
+      "would_skip": false,
+      "pnl_lamports": -696292,
+      "entry_cost_lamports": 6895230
+    },
+    {
+      "split": "VALIDATION",
+      "position_id": "ac1d1c4a-557d-4afc-b4e8-92039f7e167e",
+      "inputs": {
+        "analysis_duration_sec": 1.2403569221496582,
+        "quote_preflight_duration_sec": 4.958433151245117
+      },
+      "would_skip": false,
+      "pnl_lamports": 1815651,
+      "entry_cost_lamports": 6894707
+    },
+    {
+      "split": "VALIDATION",
+      "position_id": "76d38bfa-d79a-44da-8a9f-980224ab1987",
+      "inputs": {
+        "analysis_duration_sec": 4.1306939125061035,
+        "quote_preflight_duration_sec": 3.9065890312194824
+      },
+      "would_skip": true,
+      "pnl_lamports": 1514510,
+      "entry_cost_lamports": 6896069
+    },
+    {
+      "split": "VALIDATION",
+      "position_id": "affc4418-243e-4cd1-a84a-ef6394452c4a",
+      "inputs": {
+        "analysis_duration_sec": 3.6158480644226074,
+        "quote_preflight_duration_sec": 4.106234073638916
+      },
+      "would_skip": true,
+      "pnl_lamports": -737326,
+      "entry_cost_lamports": 6897205
+    },
+    {
+      "split": "VALIDATION",
+      "position_id": "0043e214-0f95-4e32-a3f8-ce41b7d8c0fb",
+      "inputs": {
+        "analysis_duration_sec": 3.143364906311035,
+        "quote_preflight_duration_sec": 4.143340110778809
+      },
+      "would_skip": true,
+      "pnl_lamports": -3551991,
+      "entry_cost_lamports": 22988841
+    },
+    {
+      "split": "VALIDATION",
+      "position_id": "b554db5d-79dc-4bc5-82c4-563b97e5e98f",
+      "inputs": {
+        "analysis_duration_sec": 1.3121459484100342,
+        "quote_preflight_duration_sec": 3.9203970432281494
+      },
+      "would_skip": false,
+      "pnl_lamports": 1708540,
+      "entry_cost_lamports": 6879410
+    },
+    {
+      "split": "VALIDATION",
+      "position_id": "045148ea-78df-470f-862e-9fd5a3c4a9d5",
+      "inputs": {
+        "analysis_duration_sec": 1.386462926864624,
+        "quote_preflight_duration_sec": 4.293524980545044
+      },
+      "would_skip": false,
+      "pnl_lamports": -2648698,
+      "entry_cost_lamports": 6880692
+    },
+    {
+      "split": "VALIDATION",
+      "position_id": "78299e65-f0ff-4734-836d-eb6663320866",
+      "inputs": {
+        "analysis_duration_sec": 1.3074700832366943,
+        "quote_preflight_duration_sec": 4.877481937408447
+      },
+      "would_skip": false,
+      "pnl_lamports": -693510,
+      "entry_cost_lamports": 6878705
+    },
+    {
+      "split": "VALIDATION",
+      "position_id": "1484deca-5377-40d8-84bd-3439af2c33c4",
+      "inputs": {
+        "analysis_duration_sec": 3.9346539974212646,
+        "quote_preflight_duration_sec": 3.7048959732055664
+      },
+      "would_skip": true,
+      "pnl_lamports": -695226,
+      "entry_cost_lamports": 6878185
+    },
+    {
+      "split": "VALIDATION",
+      "position_id": "cad8f655-0db3-439c-aa5c-b2f1c38504ba",
+      "inputs": {
+        "analysis_duration_sec": 1.4621410369873047,
+        "quote_preflight_duration_sec": 15.674880027770996
+      },
+      "would_skip": false,
+      "pnl_lamports": -1238192,
+      "entry_cost_lamports": 6877664
+    },
+    {
+      "split": "VALIDATION",
+      "position_id": "64ab799c-0fb9-4059-8550-fe898a7e951f",
+      "inputs": {
+        "analysis_duration_sec": 1.2635490894317627,
+        "quote_preflight_duration_sec": 3.9541189670562744
+      },
+      "would_skip": false,
+      "pnl_lamports": 1458823,
+      "entry_cost_lamports": 6876735
+    },
+    {
+      "split": "VALIDATION",
+      "position_id": "a93d74d5-7d10-49c1-be4c-36d11cee6143",
+      "inputs": {
+        "analysis_duration_sec": 1.337022066116333,
+        "quote_preflight_duration_sec": 4.2143309116363525
+      },
+      "would_skip": false,
+      "pnl_lamports": -914777,
+      "entry_cost_lamports": 6877829
+    },
+    {
+      "split": "VALIDATION",
+      "position_id": "28c4e05e-fbb0-4357-bbce-93e04268d8c6",
+      "inputs": {
+        "analysis_duration_sec": 1.6317789554595947,
+        "quote_preflight_duration_sec": 5.239898920059204
+      },
+      "would_skip": true,
+      "pnl_lamports": -708926,
+      "entry_cost_lamports": 6877143
+    },
+    {
+      "split": "VALIDATION",
+      "position_id": "35e5507f-78cc-4fe4-879f-52eac2071085",
+      "inputs": {
+        "analysis_duration_sec": 13.542044878005981,
+        "quote_preflight_duration_sec": 5.91403603553772
+      },
+      "would_skip": true,
+      "pnl_lamports": -1213947,
+      "entry_cost_lamports": 6876611
+    },
+    {
+      "split": "VALIDATION",
+      "position_id": "e9eeb881-5261-4ca3-a65b-3488d09f4d4a",
+      "inputs": {
+        "analysis_duration_sec": 1.3166399002075195,
+        "quote_preflight_duration_sec": 7.179623126983643
+      },
+      "would_skip": false,
+      "pnl_lamports": -844566,
+      "entry_cost_lamports": 6875701
+    },
+    {
+      "split": "VALIDATION",
+      "position_id": "ea969504-715a-4a14-9712-d6fb3fda5ac0",
+      "inputs": {
+        "analysis_duration_sec": 2.287271022796631,
+        "quote_preflight_duration_sec": 4.2309410572052
+      },
+      "would_skip": false,
+      "pnl_lamports": -1380528,
+      "entry_cost_lamports": 6875068
+    },
+    {
+      "split": "VALIDATION",
+      "position_id": "8e61d69c-832a-4f9f-b50f-f3f03974f784",
+      "inputs": {
+        "analysis_duration_sec": 1.2940080165863037,
+        "quote_preflight_duration_sec": 5.714602947235107
+      },
+      "would_skip": false,
+      "pnl_lamports": -894740,
+      "entry_cost_lamports": 6874032
+    },
+    {
+      "split": "VALIDATION",
+      "position_id": "814c7a3c-1dd3-48b9-95a2-4f02a0f8ab8b",
+      "inputs": {
+        "analysis_duration_sec": 6.4044671058654785,
+        "quote_preflight_duration_sec": 7.711636066436768
+      },
+      "would_skip": true,
+      "pnl_lamports": -1264051,
+      "entry_cost_lamports": 6873361
+    },
+    {
+      "split": "VALIDATION",
+      "position_id": "8b430e7c-8bcb-48ae-ae42-1f71914941bf",
+      "inputs": {
+        "analysis_duration_sec": 3.1304829120635986,
+        "quote_preflight_duration_sec": 4.128507137298584
+      },
+      "would_skip": true,
+      "pnl_lamports": -788284,
+      "entry_cost_lamports": 6872413
+    },
+    {
+      "split": "VALIDATION",
+      "position_id": "f7891a04-fbbe-4f74-88c8-4d2844cd9f31",
+      "inputs": {
+        "analysis_duration_sec": 1.2252609729766846,
+        "quote_preflight_duration_sec": 4.674479961395264
+      },
+      "would_skip": false,
+      "pnl_lamports": -1000315,
+      "entry_cost_lamports": 6871822
+    },
+    {
+      "split": "VALIDATION",
+      "position_id": "f6b334ea-bc30-44fb-921d-d7cfa586e54a",
+      "inputs": {
+        "analysis_duration_sec": 1.8623769283294678,
+        "quote_preflight_duration_sec": 10.233327150344849
+      },
+      "would_skip": true,
+      "pnl_lamports": -971935,
+      "entry_cost_lamports": 6885649
+    },
+    {
+      "split": "VALIDATION",
+      "position_id": "49ed3d0b-ae95-4a73-baa2-291fad49a13c",
+      "inputs": {
+        "analysis_duration_sec": 1.2163689136505127,
+        "quote_preflight_duration_sec": 4.436625957489014
+      },
+      "would_skip": false,
+      "pnl_lamports": -815728,
+      "entry_cost_lamports": 6884920
+    },
+    {
+      "split": "VALIDATION",
+      "position_id": "9f3184ed-51c7-4c58-8909-3dedd4e3f964",
+      "inputs": {
+        "analysis_duration_sec": 4.398020029067993,
+        "quote_preflight_duration_sec": 3.1000571250915527
+      },
+      "would_skip": true,
+      "pnl_lamports": -712496,
+      "entry_cost_lamports": 6884308
+    },
+    {
+      "split": "VALIDATION",
+      "position_id": "674a51c7-a6fa-49b5-a577-3fa9ff0375f3",
+      "inputs": {
+        "analysis_duration_sec": 1.3904471397399902,
+        "quote_preflight_duration_sec": 7.448999881744385
+      },
+      "would_skip": false,
+      "pnl_lamports": 924697,
+      "entry_cost_lamports": 6883774
+    },
+    {
+      "split": "VALIDATION",
+      "position_id": "4c227d5a-14e6-4ad9-85e6-531d2899f298",
+      "inputs": {
+        "analysis_duration_sec": 1.040747880935669,
+        "quote_preflight_duration_sec": 4.20785117149353
+      },
+      "would_skip": false,
+      "pnl_lamports": -837711,
+      "entry_cost_lamports": 6884468
+    },
+    {
+      "split": "VALIDATION",
+      "position_id": "88f1080f-5f66-42f1-a855-e6bc4092b494",
+      "inputs": {
+        "analysis_duration_sec": 1.2252631187438965,
+        "quote_preflight_duration_sec": 6.681341886520386
+      },
+      "would_skip": false,
+      "pnl_lamports": -2545938,
+      "entry_cost_lamports": 6883839
+    },
+    {
+      "split": "VALIDATION",
+      "position_id": "7c0954ec-3ac4-4322-8fd3-28f219fd379b",
+      "inputs": {
+        "analysis_duration_sec": 1.3773558139801025,
+        "quote_preflight_duration_sec": 7.037949085235596
+      },
+      "would_skip": false,
+      "pnl_lamports": -756445,
+      "entry_cost_lamports": 6881930
+    },
+    {
+      "split": "VALIDATION",
+      "position_id": "b32f169e-bf1a-4486-a9bf-15b4506c17b9",
+      "inputs": {
+        "analysis_duration_sec": 1.099694013595581,
+        "quote_preflight_duration_sec": 4.102015018463135
+      },
+      "would_skip": false,
+      "pnl_lamports": -1072757,
+      "entry_cost_lamports": 6881363
+    },
+    {
+      "split": "VALIDATION",
+      "position_id": "b92537a8-b0df-4982-b5b5-b7340f13bf0d",
+      "inputs": {
+        "analysis_duration_sec": 1.0513091087341309,
+        "quote_preflight_duration_sec": 4.963855028152466
+      },
+      "would_skip": false,
+      "pnl_lamports": -1693366,
+      "entry_cost_lamports": 6880558
+    }
+  ]
+}
