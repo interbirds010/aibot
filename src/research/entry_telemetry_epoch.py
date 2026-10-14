@@ -51,6 +51,10 @@ def safe_runtime_config() -> dict:
 
 def n3_closed(root: Path) -> dict:
     """기존 N3 종료 증거를 읽으며 평가값은 반환하지 않는다."""
+    from src.research.alpha_transition import boundary_path, boundary_provenance
+    if boundary_path(root).exists():
+        # 명시적 feasibility 전환은 원래 CLOSED 증거와 구분해 epoch에 남긴다.
+        return boundary_provenance(root)
     side = Path(root) / "data" / "n3_shadow"
     manifest = read_immutable(side / "manifest.json")
     if not manifest:
@@ -104,6 +108,11 @@ def create_snapshot(root: Path, *, stopped_proof: dict) -> dict:
         ledger = read_json(path, {})
         if ledger.get("schema_version") != 2 or not isinstance(ledger.get("next_event_seq"), int) or isinstance(ledger["next_event_seq"], bool) or ledger["next_event_seq"] < 1:
             raise RuntimeError("Paper ledger schema/boundary invalid")
+        if closure.get("artifact_type") == "N3_FEASIBILITY_CUTOVER_BOUNDARY":
+            from src.research.alpha_transition import read_boundary
+            boundary = read_boundary(root)
+            if ledger["next_event_seq"] != boundary["start_event_seq"] or state_hashes(root) != boundary["target_state_hashes"]:
+                raise RuntimeError("Feasibility cutover boundary state/sequence changed before snapshot")
         marker = {"snapshot_id": str(uuid4()), "created_utc": datetime.now(timezone.utc).isoformat(),
                   "runtime_root": str(Path(root).resolve()), "next_event_seq": ledger["next_event_seq"],
                   "state_hashes": state_hashes(root), "n3_closure": closure, "stopped_proof": stopped_proof}

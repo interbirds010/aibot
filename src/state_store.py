@@ -7,8 +7,10 @@ processes from reading the same revision and silently overwriting each other.
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import os
+import stat
 import tempfile
 import time
 from contextlib import contextmanager
@@ -269,6 +271,88 @@ def atomic_write_json(
                 _observe_shadow_memory(path, "buffer_released", file_buffer_live=False)
         if temporary and os.path.exists(temporary):
             os.unlink(temporary)
+
+
+def _reject_linked_ancestors(path: Path) -> None:
+    """JSON 복제 경로의 symlink와 Windows junction/reparse 지점을 거부한다."""
+    path = Path(path).absolute()
+    for candidate in (path, *path.parents):
+        try:
+            metadata = candidate.lstat()
+        except FileNotFoundError:
+            continue
+        if (stat.S_ISLNK(metadata.st_mode)
+                or getattr(metadata, "st_file_attributes", 0) & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)):
+            raise RuntimeError("Atomic JSON clone refuses linked path ancestor")
+
+
+def atomic_clone_json(source: Path, destination: Path, *, expected_sha256: str) -> bool:
+    """정지된 상태를 byte 그대로 복제한다. 기존 다른 상태는 절대 교체하지 않는다."""
+    source, destination = Path(source), Path(destination)
+    _reject_linked_ancestors(source)
+    _reject_linked_ancestors(destination)
+    if (source.resolve() == destination.resolve() or source.is_symlink() or destination.is_symlink()
+            or source.suffix.lower() != ".json" or destination.suffix.lower() != ".json"
+            or not source.is_file() or source.stat().st_size > 256 * 1024 * 1024):
+        raise RuntimeError("Atomic JSON clone path/size invalid")
+    if (not isinstance(expected_sha256, str) or len(expected_sha256) != 64
+            or any(character not in "0123456789abcdef" for character in expected_sha256)):
+        raise RuntimeError("Atomic JSON clone expected hash invalid")
+
+    def checksum(path):
+        result = hashlib.sha256()
+        with path.open("rb") as file:
+            while block := file.read(1024 * 1024):
+                result.update(block)
+        return result.hexdigest()
+
+    def reject_nonfinite(value):
+        raise ValueError("Nonfinite JSON in atomic clone")
+
+    def unique_pairs(pairs):
+        document = {}
+        for key, value in pairs:
+            if key in document:
+                raise ValueError("Duplicate JSON key in atomic clone")
+            document[key] = value
+        return document
+
+    # JSON 손상을 binary 복제로 숨기지 않는다. 한 파일씩 검사해 버퍼를 해제한다.
+    with source.open(encoding="utf-8") as file:
+        json.load(file, parse_constant=reject_nonfinite, object_pairs_hook=unique_pairs)
+    if checksum(source) != expected_sha256:
+        raise RuntimeError("Atomic JSON clone source hash changed")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with exclusive_file_lock(destination, operation="isolated_cutover_state_clone"):
+        _reject_linked_ancestors(source)
+        _reject_linked_ancestors(destination)
+        if destination.exists():
+            if not destination.is_file() or checksum(destination) != expected_sha256:
+                raise RuntimeError("Atomic JSON clone refuses conflicting destination")
+            return False
+        temporary = None
+        try:
+            result = hashlib.sha256()
+            copied = 0
+            with tempfile.NamedTemporaryFile("wb", dir=destination.parent, delete=False) as file:
+                temporary = Path(file.name)
+                with source.open("rb") as input_file:
+                    while block := input_file.read(1024 * 1024):
+                        copied += len(block)
+                        if copied > 256 * 1024 * 1024:
+                            raise RuntimeError("Atomic JSON clone source grew beyond bound")
+                        result.update(block)
+                        file.write(block)
+                file.flush()
+                os.fsync(file.fileno())
+            if result.hexdigest() != expected_sha256 or checksum(source) != expected_sha256:
+                raise RuntimeError("Atomic JSON clone source changed during copy")
+            _reject_linked_ancestors(destination)
+            os.replace(temporary, destination)
+            return True
+        finally:
+            if temporary is not None and temporary.exists():
+                temporary.unlink()
 
 
 def update_json(

@@ -9,6 +9,7 @@ from pathlib import Path
 import sys
 import subprocess
 import time
+from datetime import datetime, timezone
 from uuid import uuid4
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -85,7 +86,7 @@ def stopped_proof(root: Path) -> dict:
     if rows:
         raise RuntimeError("Runtime processes still active; no snapshot/activation allowed")
     return {"runtime_root": str(Path(root).resolve()), "active_process_count": 0,
-            "verified_by_pid": os.getpid()}
+            "verified_by_pid": os.getpid(), "verified_at_utc": datetime.now(timezone.utc).isoformat()}
 
 
 def _paper_config(root: Path) -> dict:
@@ -157,6 +158,12 @@ def resume(root: Path, python: Path) -> dict:
     stopped_proof(root)
     epoch.validate_snapshot(root)
     marker = epoch.require_epoch(root, config=_paper_config(root))
+    if marker.get("n3_closure", {}).get("artifact_type") == "N3_FEASIBILITY_CUTOVER_BOUNDARY":
+        from src.research.alpha_transition import read_boundary, supervisor_maintenance
+        # 다른 root의 기존 BUY writer가 다시 시작된 경우 새 Control도 시작하지 않는다.
+        frozen = Path(read_boundary(root)["frozen_runtime"])
+        supervisor_maintenance(frozen)
+        stopped_proof(frozen)
     results = runner.manage(root, python, "start", runner.CORE_SERVICES)
     return {"telemetry_epoch_id": marker["telemetry_epoch_id"], "services": results,
             "acceptance": "PENDING natural predictor/reject/RPC_SKIP/BUY/completed events"}
@@ -164,18 +171,52 @@ def resume(root: Path, python: Path) -> dict:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=("plan", "status", "clean-stop", "snapshot", "create-epoch", "validate", "resume"))
+    parser.add_argument("action", choices=("plan", "status", "capture-before", "record-gap", "clone-state", "prepare-boundary", "clean-stop", "snapshot", "create-epoch", "validate", "resume"))
     parser.add_argument("--root", type=Path, default=ROOT)
     parser.add_argument("--python", type=Path, default=Path(sys.executable))
     parser.add_argument("--execute", action="store_true", help="N3 종료 후 명시적인 변경 작업에만 필요")
     parser.add_argument("--new-activation", action="store_true", help="이전 immutable epoch를 보존하며 새 UUID 생성")
+    parser.add_argument("--frozen-root", type=Path, help="변경하지 않는 기존 N3 root")
+    parser.add_argument("--checkpoint", type=Path, help="외부 immutable feasibility checkpoint")
+    parser.add_argument("--amendment", type=Path, help="외부 immutable feasibility amendment")
+    parser.add_argument("--before-evidence", type=Path, help="외부 immutable pre-stop 증거")
+    parser.add_argument("--evidence-output", type=Path, help="runtime 밖의 immutable 운영 경계 증거 경로")
     args = parser.parse_args()
     root = args.root.resolve()
     try:
+        from src.research.alpha_transition import PROTECTED_RUNTIME
+        if root == PROTECTED_RUNTIME and args.action not in ("plan", "status", "validate", "capture-before"):
+            raise RuntimeError("Protected frozen runtime cannot be modified by telemetry cutover tooling")
         if args.action == "plan":
             result = {"steps": ["N3 final report + closure", "owned Control shutdown; frozen build has no cooperative stop",
                                 "snapshot while all runtime Python PIDs stopped", "checkout reviewed telemetry build", "compile + full tests",
                                 "create-epoch", "resume", "five independent natural-event acceptance"], "activation_now": False}
+        elif args.action == "capture-before":
+            from src.research.alpha_transition import capture_before_stop
+            if not args.checkpoint or not args.evidence_output:
+                raise RuntimeError("capture-before requires --checkpoint --evidence-output")
+            result = capture_before_stop(root, args.checkpoint, args.evidence_output)
+        elif args.action == "record-gap":
+            from src.research.alpha_transition import record_cutover_gap
+            if not args.frozen_root or not args.before_evidence or not args.evidence_output:
+                raise RuntimeError("record-gap requires --frozen-root --before-evidence --evidence-output")
+            result = record_cutover_gap(args.frozen_root, root, args.before_evidence, args.evidence_output)
+        elif args.action == "clone-state":
+            from src.research.alpha_transition import clone_state
+            if not args.frozen_root or not args.execute:
+                raise RuntimeError("clone-state requires --frozen-root and explicit --execute")
+            result = clone_state(args.frozen_root, root, frozen_stopped_proof=stopped_proof(args.frozen_root),
+                                 target_stopped_proof=stopped_proof(root))
+        elif args.action == "prepare-boundary":
+            from src.research.alpha_transition import cutover_plan, prepare_boundary
+            if not args.frozen_root or not args.checkpoint or not args.amendment:
+                raise RuntimeError("prepare-boundary requires --frozen-root --checkpoint --amendment")
+            if not args.execute:
+                result = cutover_plan(args.checkpoint, frozen_runtime=args.frozen_root, telemetry_runtime=root)
+            else:
+                result = prepare_boundary(args.frozen_root, args.checkpoint, args.amendment, root,
+                                          frozen_stopped_proof=stopped_proof(args.frozen_root),
+                                          target_stopped_proof=stopped_proof(root))
         elif args.action == "status":
             result = {"runtime_process_count": len(_active_processes(root)),
                       "epoch_created": (epoch.directory(root) / "active.json").exists()}
